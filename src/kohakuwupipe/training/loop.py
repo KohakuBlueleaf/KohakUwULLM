@@ -9,8 +9,8 @@ See docs/kohakuwupipe/loop.md.
 
 import time
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field
-from typing import Any, Protocol
+from dataclasses import dataclass, field, fields, replace
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -19,7 +19,8 @@ from kohakuwupipe.parallel.streams import reduce_accumulator, split_streams
 from kohakuwupipe.training import hooks
 
 
-class MicrobatchStep(Protocol):
+@dataclass
+class MicrobatchStep:
     """One optimizer step's data, already split into microbatches.
 
     ``inputs`` is read on the first stage only and ``target`` on the last;
@@ -28,14 +29,41 @@ class MicrobatchStep(Protocol):
 
     Neither is examined here: ``inputs`` goes to the stage and ``target`` to
     ``loss``. A tuple ``inputs`` is the first stage's argument list, so a model
-    conditioned on more than one tensor passes them there. ``target`` must be a
-    single tensor or ``None``. See docs/kohakuwupipe/module.md.
+    conditioned on more than one tensor passes them there; ``target`` may be any
+    structure. Subclass to add fields. See docs/kohakuwupipe/module.md.
     """
 
     inputs: Any
-    target: Any
-    layout: Any
-    trained: int
+    target: Any = None
+    layout: Any = None
+    trained: int = 0
+
+    def map(self, fn):
+        """A copy with ``fn`` applied to every tensor, in every field.
+
+        Recurses through tuples, lists and dicts, so a subclass's own fields
+        are carried without overriding anything.
+        """
+        return replace(
+            self,
+            **{f.name: _map_tensors(getattr(self, f.name), fn) for f in fields(self)},
+        )
+
+    def to(self, device=None, dtype=None, non_blocking: bool = False):
+        """This step on ``device``, subclass fields included."""
+        return self.map(
+            lambda t: t.to(device=device, dtype=dtype, non_blocking=non_blocking)
+        )
+
+    def pin_memory(self):
+        """This step in pinned memory, for an overlapped host-to-device copy."""
+        return self.map(lambda t: t.pin_memory())
+
+    def tensors(self):
+        """Every tensor this step carries, in field order."""
+        found: list[torch.Tensor] = []
+        self.map(lambda t: (found.append(t), t)[1])
+        return found
 
 
 @dataclass
@@ -51,6 +79,17 @@ class StepOutput:
     seen: int
     trained: int
     extra: dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+def _map_tensors(value, fn):
+    """``fn`` over every tensor in a nested container, structure preserved."""
+    if torch.is_tensor(value):
+        return fn(value)
+    if isinstance(value, dict):
+        return {key: _map_tensors(item, fn) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return type(value)(_map_tensors(item, fn) for item in value)
+    return value
 
 
 Callback = hooks.Callback
@@ -119,25 +158,19 @@ class PipelineLoop:
     def step(self, batch: MicrobatchStep, batch_idx: int = 0) -> StepOutput:
         """One optimizer step. Collective: no rank may return early."""
         self.callbacks.call("on_train_batch_start", self, batch, batch_idx)
-        if self.module is not None:
-            self.module.training_step(batch, batch_idx)
         self.callbacks.call("on_before_zero_grad", self, self.optimizer)
         self.optimizer.zero_grad(set_to_none=True)
         if self._set_layout is not None:
             self._set_layout(batch.layout)
 
-        # The schedule runs forward and backward for every microbatch.
-        losses = [] if self.is_last else None
+        # The module decides what reaches the schedule, and when.
+        self._losses = [] if self.is_last else None
         self.callbacks.call("on_before_backward", self)
-        if self.is_first:
-            # A tuple is the stage's argument list, not one argument.
-            args = batch.inputs if isinstance(batch.inputs, tuple) else (batch.inputs,)
-            self.schedule.step(*args)
-        elif self.is_last:
-            self.target_pieces[:] = split_target(batch.target, self.num_microbatches)
-            self.schedule.step(target=self._target_index(), losses=losses)
+        if self.module is not None:
+            self.module.training_step(batch, batch_idx)
         else:
-            self.schedule.step()
+            self.forward_backward(batch.inputs, batch.target)
+        losses = self._losses
         self.callbacks.call("on_after_backward", self)
 
         # One host sync per step, and the only one: a scaler has to branch.
@@ -157,6 +190,8 @@ class PipelineLoop:
             self.callbacks.call("on_before_optimizer_step", self, self.optimizer)
             self.optimizer.step()
         extra = self.post_step(self.stage_module) if self.post_step else {}
+        if self.module is not None:
+            extra.update(self.module.pop_metrics())
         if grad_norm is not None:
             extra["grad_norm"] = grad_norm.detach()
         if self.scheduler is not None:
@@ -247,6 +282,45 @@ class PipelineLoop:
         self.callbacks.call("on_validation_epoch_end", self)
         self.callbacks.call("on_validation_end", self)
 
+    def forward_backward(self, inputs, target=None, layout=None):
+        """Run the whole model over one step: forward and backward, all stages.
+
+        The only part of a step this package owns. Call it once per step from
+        ``training_step``, with whatever the module computed. A tuple ``inputs``
+        is the first stage's argument list; ``target`` may be any structure and
+        arrives at ``loss`` one microbatch at a time.
+
+        Under ``torch.no_grad()`` this runs forward only -- the schedule's
+        ``step`` refuses a disabled-grad context, so ``eval`` is used instead.
+        That makes ``no_grad`` the knob, as it is everywhere else in torch.
+
+        Returns the step's loss on the last stage and ``None`` elsewhere -- a
+        device tensor, already normalized and unscaled, so logging it costs no
+        synchronization until something reads it.
+
+        Collective: every rank must call it the same number of times.
+        See docs/kohakuwupipe/module.md.
+        """
+        if layout is not None and self._set_layout is not None:
+            self._set_layout(layout)
+        run = self.schedule.step if torch.is_grad_enabled() else self.schedule.eval
+        if self._losses is None:
+            self._losses = [] if self.is_last else None
+        if self.is_first:
+            args = inputs if isinstance(inputs, tuple) else (inputs,)
+            run(*args)
+        elif self.is_last:
+            self.target_pieces[:] = split_target(target, self.num_microbatches)
+            run(target=self._target_index(), losses=self._losses)
+        else:
+            run()
+        if not self._losses:
+            return None
+        scale = 1.0
+        if self.scaler is not None and self.scaler.enabled:
+            scale = self.scaler.scale_value
+        return torch.stack([x.detach() for x in self._losses]).sum() / scale
+
     def _target_index(self) -> torch.Tensor:
         """``arange(num_microbatches)``, the handle the schedule splits for us."""
         if self._index is None:
@@ -306,6 +380,7 @@ def build_loss_fn(
     num_microbatches: int = 1,
     scaler=None,
     pieces: list | None = None,
+    objective: Callable | None = None,
 ) -> Callable:
     """A schedule ``loss_fn`` that normalizes by the step's trained tokens.
 
@@ -318,12 +393,14 @@ def build_loss_fn(
     ``num_microbatches`` rather than summed with them. See docs/kohakuwupipe/streams.md.
     """
     aux_scale = 1.0 / max(num_microbatches, 1)
+    objective = objective or stage_module.loss
 
     def loss_fn(output, target):
         streams = split_streams(output)
         # `target` is the microbatch index; the batch itself never left the rank.
         batch = target if pieces is None else pieces[int(target)]
-        loss, _ = stage_module.loss(streams[0], batch)
+        result = objective(streams[0], batch)
+        loss = result[0] if isinstance(result, tuple) else result
         loss = loss / max(denom(), 1)
         for stream in streams[1:]:
             if stream is not None and stream.shape[-1] == 1:

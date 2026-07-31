@@ -33,6 +33,7 @@ class PipelineModule(nn.Module):
         self.world = 1
         self.global_step = 0
         self._metrics: dict[str, Any] = {}
+        self._loop = None
 
     # -- construction ----------------------------------------------------- #
 
@@ -51,26 +52,41 @@ class PipelineModule(nn.Module):
     # -- the step --------------------------------------------------------- #
 
     def loss(self, hidden: torch.Tensor, target: Any):
-        """``(loss, logs)`` on the last stage. ``loss`` is a sum, not a mean.
+        """The step's objective on the last stage. A sum, not a mean.
 
-        ``target`` is whatever the step carried, unexamined by this package:
-        labels for a supervised objective, ``None`` for a self-supervised one.
-        It must be a tensor or ``None`` -- the schedule splits it along dim 0
-        and a tuple or dict raises. Pack several tensors into one, or stack them.
+        ``target`` is this microbatch's slice of whatever the step carried,
+        unexamined by this package and with its structure intact: a tensor, a
+        tuple, a dict, ``None``. Tensors split along dim 0; anything else is
+        passed whole. See docs/kohakuwupipe/module.md.
 
-        This is where a ``LightningModule.training_step`` body goes: the
-        schedule owns forward and backward across ranks, so a stage supplies
-        the objective rather than driving the pass. See docs/kohakuwupipe/module.md.
+        Anything differentiable that a ``LightningModule`` would do between the
+        model output and the loss belongs here, not in :meth:`training_step`.
+        Per-term breakdowns go through :meth:`log` here: this is the only place
+        a microbatch's internals exist. See docs/kohakuwupipe/module.md.
         """
         raise NotImplementedError
 
-    def training_step(self, batch, batch_idx: int):
-        """Extra per-step work, run before the schedule. Returns nothing.
+    def training_step(self, batch, batch_idx: int) -> None:
+        """One step, in the shape a ``LightningModule`` writes it.
 
-        Unlike ``LightningModule.training_step`` this does **not** compute the
-        loss or call backward -- :meth:`loss` does, once per microbatch, from
-        inside the schedule. Override for bookkeeping that needs the raw batch.
+        Preprocess, call :meth:`forward_backward` exactly once, then log or
+        post-process. The default is the plain case: hand the step's own
+        ``inputs`` and ``target`` straight to the model.
+
+        Returns nothing -- the loss is not available here. A 1F1B schedule
+        interleaves microbatch forwards and backwards across ranks, so there is
+        no point at which one rank holds "the output"; the objective arrives as
+        :meth:`loss`, once per microbatch. See docs/kohakuwupipe/module.md.
         """
+        self.forward_backward(batch.inputs, batch.target)
+
+    def forward_backward(self, inputs, target=None, layout=None):
+        """Run the model over one step. Collective; call it once per step.
+
+        Under ``torch.no_grad()`` it runs forward only. Returns the step's loss
+        on the last stage, ``None`` elsewhere.
+        """
+        return self._loop.forward_backward(inputs, target, layout)
 
     def validation_step(self, batch, batch_idx: int):
         """One validation batch. Whatever it returns reaches the callbacks."""
@@ -83,12 +99,20 @@ class PipelineModule(nn.Module):
         return {}
 
     def log(self, name: str, value) -> None:
-        """Record a metric for the current step, without reading the device."""
-        self._metrics[name] = value
+        """Record a metric for the current step, without reading the device.
+
+        Accumulates: :meth:`loss` runs once per microbatch, so assigning would
+        report the last microbatch rather than the step.
+        """
+        total, count = self._metrics.get(name, (0.0, 0))
+        self._metrics[name] = (total + value, count + 1)
 
     def pop_metrics(self) -> dict[str, Any]:
-        """Take and clear what :meth:`log` recorded."""
-        metrics, self._metrics = self._metrics, {}
+        """Take and clear what :meth:`log` recorded, averaged over its calls."""
+        metrics = {
+            name: total / count for name, (total, count) in self._metrics.items()
+        }
+        self._metrics = {}
         return metrics
 
     # -- checkpoint ------------------------------------------------------- #
@@ -114,8 +138,8 @@ class PipelineModule(nn.Module):
         log.info(
             "stage built",
             layers=f"{plan.start_layer}..{plan.end_layer - 1}",
-            embed=plan.has_embed,
-            head=plan.has_head,
+            first=plan.is_first,
+            last=plan.is_last,
             params=sum(p.numel() for p in self.stage_module.parameters()),
         )
         return self.stage_module

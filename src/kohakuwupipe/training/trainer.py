@@ -16,9 +16,18 @@ from kohakuwupipe.io import checkpoint
 from kohakuwupipe.parallel.distributed import PipelineRanks, warn_on_eager_init
 from kohakuwupipe.training.hooks import CallbackList
 from kohakuwupipe.training.loop import PipelineLoop, build_loss_fn
+from kohakuwupipe.training.module import PipelineModule
 from kohakuwupipe.utils.logging import configure, get_logger
 
 log = get_logger(__name__)
+
+
+def _objective(module):
+    """The module's own ``loss``, or ``None`` when it leaves it to the stage."""
+    if type(module).loss is PipelineModule.loss:
+        return None
+    return module.loss
+
 
 SCHEDULES = {
     "1f1b": Schedule1F1B,
@@ -93,6 +102,7 @@ class PipelineTrainer:
                 num_microbatches,
                 scaler,
                 pieces,
+                _objective(module),
             ),
             scale_grads=False,
         )
@@ -113,6 +123,7 @@ class PipelineTrainer:
         self.loop.target_pieces = pieces
         self.loop.trainer = self
         self.loop.module = module
+        module._loop = self.loop
         # One list, not two copies: a callback appended after construction has to
         # reach the loop, which is the thing that calls it.
         self.callbacks = self.loop.callbacks
