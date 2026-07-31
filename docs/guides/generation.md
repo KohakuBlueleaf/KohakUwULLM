@@ -155,3 +155,39 @@ without adding parallelism: one token must still traverse every stage in order, 
 the stages take turns rather than working at once. Pipelined generation exists so
 that a model too large for one card can be previewed **at all** — not to make
 generation faster. If the model fits on one card, use `LocalGenerator`.
+
+## The schedule's first step runs an extra forward
+
+`PipelineStage` supports two metadata modes. Given both `input_args` and
+`output_args` it is *static* and knows every boundary shape up front. Given
+`input_args` alone — which is what `build_stage` and `decode_stage` pass — it is
+*dynamic*: it infers each stage's **output** metadata by running that stage once,
+on the first `step()` of a freshly constructed schedule. On any stage past the
+first, the input to that inference forward is the receive buffer *before anything
+has been received into it*, i.e. uninitialized `torch.empty` memory.
+
+That forward is real. It runs the model, and during generation it therefore runs
+against whatever KV cache is attached: it stores one garbage key/value at
+position 0 and calls `advance`, so every real decode step afterwards attends over
+a poisoned prefix and sits one position too late. Roughly 1 in 32 random 16-bit
+words is a NaN pattern, so the garbage is usually merely wrong and occasionally
+NaN — and a NaN written into a cache is permanent, because the poisoned prefix is
+re-attended every step. The visible failure is `multinomial` asserting
+`probability tensor contains either inf, nan or element < 0` many tokens later,
+with the stage forward that surfaces the sticky CUDA error blamed for it.
+
+Two properties keep it out of the way:
+
+- `PipelineGenerator` builds its schedule **once** and holds it. A schedule
+  constructed per call resets `_stage_forward_initialized`, so the inference
+  forward re-runs for every prompt.
+- `PipelineGenerator.prepare` takes that first step against throwaway caches
+  before `generate` attaches the ones it decodes from.
+
+`tests/test_generation.py::test_decode_absorbs_the_schedules_first_extra_forward`
+pins both, by asserting the decode cache advanced exactly once per decode step.
+
+The same inference forward happens once per run on the training path, where
+there is no cache to poison. It does add one microbatch of garbage routing counts
+to `load_accum` before the first optimizer step, which the first `update_bias`
+then clears.

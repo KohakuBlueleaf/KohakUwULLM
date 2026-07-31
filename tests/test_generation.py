@@ -12,7 +12,9 @@ from model_fixtures import tiny_config
 
 from kohakuwullm import LMBackbone, SeqInfo
 from kohakuwullm.bench.core.timing import rel_error
+from kohakuwullm.generation import engine
 from kohakuwullm.models.cache import KVCache
+from kohakuwullm.training import LMStage, plan_for
 from kohakuwullm.training.loop.sampling import PreviewSampler
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -226,3 +228,59 @@ def test_cached_generation_matches_the_cache_free_path_on_cuda(arch):
     )
     assert torch.equal(cached, plain)
     _assert_the_comparison_can_fail(cached[:, prompt.shape[1] :])
+
+
+class _FirstStepRunsTwice:
+    """A schedule that forwards once for metadata before its first real step."""
+
+    def __init__(self, module) -> None:
+        self.module = module
+        self.pending = True
+
+    def step(self, tokens=None):
+        if self.pending:
+            self.pending = False
+            self.module(torch.zeros_like(tokens))
+        return self.module(tokens)
+
+
+def test_decode_absorbs_the_schedules_first_extra_forward(monkeypatch):
+    """The extra forward a schedule makes on its first step must miss the cache.
+
+    A ``PipelineStage`` declared with ``input_args`` alone infers its output
+    metadata by running the stage once on an uninitialized receive buffer.
+    Reaching the generation cache, that forward stores one garbage key/value and
+    shifts every position after it; rebuilding the schedule per call repeats it.
+    """
+    torch.manual_seed(0)
+    config = tiny_config(init_std=CHAOTIC_INIT, attn="sdpa")
+    stage = LMStage(LMBackbone(config), plan_for(config, 1)[0]).eval()
+
+    built = []
+
+    def build(module, chunks, loss_fn=None, kind="gpipe"):
+        built.append(chunks)
+        return _FirstStepRunsTwice(module)
+
+    monkeypatch.setattr(engine, "build_schedule", build)
+
+    attached = []
+    set_cache = stage.set_cache
+
+    def record(cache):
+        if cache is not None:
+            attached.append(cache)
+        set_cache(cache)
+
+    monkeypatch.setattr(stage, "set_cache", record)
+
+    # A cache dtype an uncast CPU attention can take.
+    stage.boundary_dtype = torch.float32
+    generator = engine.PipelineGenerator(stage, stage, rank=0, world=1, microbatches=1)
+    prompt = torch.zeros(2, 3, dtype=torch.long)
+    for _ in range(2):
+        generator.generate(prompt, max_new_tokens=4, temperature=0.0)
+
+    steps = prompt.shape[1] + 4 - 1
+    assert attached[-1][0].length == steps
+    assert built == [1], "the schedule was rebuilt, so the extra forward ran again"

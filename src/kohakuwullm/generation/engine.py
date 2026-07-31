@@ -13,6 +13,7 @@ from kohakuwullm.models.cache import KVCache
 from kohakuwullm.training.parallel.pipeline_lightning import build_schedule
 
 SAMPLE_SEED = 20090220
+WARMUP_STEPS = 4
 
 
 def filter_top_k(logits: torch.Tensor, top_k: int) -> torch.Tensor:
@@ -55,9 +56,18 @@ def sample(
     """
     if temperature <= 0:
         return logits.argmax(-1, keepdim=True)
+    # fp32: top-p sums the whole vocabulary, and 65536 fp16 terms lose percent-
+    # level accuracy. See docs/guides/generation.md.
+    logits = logits.float()
     probs = torch.softmax(filter_top_k(logits, top_k) / temperature, dim=-1)
     probs = filter_min_p(filter_top_p(probs, top_p), min_p)
     probs = probs / probs.sum(-1, keepdim=True).clamp_min(1e-12)
+    # multinomial asserts on the device; a finite check here names the cause.
+    if not torch.isfinite(probs).all():
+        raise RuntimeError(
+            "sampling probabilities are not finite; logits carried inf/nan "
+            f"(temperature={temperature}, top_p={top_p}, top_k={top_k})"
+        )
     return torch.multinomial(probs, 1, generator=generator)
 
 
@@ -161,11 +171,55 @@ class PipelineGenerator(Generator):
         self.head_module = head_module
         self.rank = rank
         self.world = world
+        self.autocast_dtype = autocast_dtype
         self.head_context = (
             nullcontext
             if autocast_dtype is None
             else partial(torch.autocast, "cuda", dtype=autocast_dtype)
         )
+        self.schedule = None
+        self._chunks = 0
+
+    def cache_dtype(self) -> torch.dtype:
+        """Dtype the key/value buffers are stored in."""
+        return self.head_module.boundary_dtype or self.autocast_dtype or torch.bfloat16
+
+    def _caches(self, chunks: int, rows: int, length: int, device):
+        """One :class:`KVCache` per microbatch, sized for ``length`` positions."""
+        return [
+            KVCache.from_config(
+                self.head_module.config,
+                batch_size=rows,
+                max_length=length,
+                device=device,
+                dtype=self.cache_dtype(),
+            )
+            for _ in range(chunks)
+        ]
+
+    @torch.no_grad()
+    def prepare(self, chunks: int, rows: int, device) -> None:
+        """Build the schedule for ``chunks`` microbatches and take its first step.
+
+        The step runs against throwaway caches, so the extra forward a schedule
+        makes when it first runs never reaches the caches :meth:`generate`
+        decodes from. Collective, and a no-op once built.
+        See docs/guides/generation.md.
+        """
+        if self.schedule is not None and self._chunks == chunks:
+            return
+        self.schedule = build_schedule(self.stage, chunks, loss_fn=None, kind="gpipe")
+        self._chunks = chunks
+        self.head_module.set_cache(self._caches(chunks, rows, WARMUP_STEPS, device))
+        try:
+            if self.rank == 0:
+                self.schedule.step(
+                    torch.zeros(rows * chunks, 1, dtype=torch.long, device=device)
+                )
+            else:
+                self.schedule.step()
+        finally:
+            self.head_module.set_cache(None)
 
     @torch.no_grad()
     def generate(
@@ -197,19 +251,10 @@ class PipelineGenerator(Generator):
         if rows % chunks:
             raise ValueError(f"{rows} rows do not split into {chunks} microbatches")
         per_chunk = rows // chunks
-        caches = [
-            KVCache.from_config(
-                self.head_module.config,
-                batch_size=per_chunk,
-                max_length=total,
-                device=device,
-                dtype=self.head_module.boundary_dtype or torch.bfloat16,
-            )
-            for _ in range(chunks)
-        ]
-        self.head_module.set_cache(caches)
-        schedule = build_schedule(self.stage, chunks, loss_fn=None, kind="gpipe")
         try:
+            self.prepare(chunks, per_chunk, device)
+            schedule = self.schedule
+            self.head_module.set_cache(self._caches(chunks, per_chunk, total, device))
             tokens = prompt_ids.clone()
             for pos in range(total - 1):
                 # `clone`, not `contiguous`: a one-element slice reports itself
