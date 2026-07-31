@@ -5,12 +5,7 @@ stage, stage before the schedule -- which is what a caller most often gets
 wrong. See docs/kohakuwupipe/module.md.
 """
 
-from torch.distributed.pipelining import (
-    PipelineStage,
-    Schedule1F1B,
-    ScheduleGPipe,
-    ScheduleInterleaved1F1B,
-)
+from torch.distributed.pipelining import PipelineStage, Schedule1F1B, ScheduleGPipe
 
 from kohakuwupipe.io import checkpoint
 from kohakuwupipe.parallel.distributed import PipelineRanks, warn_on_eager_init
@@ -29,11 +24,9 @@ def _objective(module):
     return module.loss
 
 
-SCHEDULES = {
-    "1f1b": Schedule1F1B,
-    "gpipe": ScheduleGPipe,
-    "interleaved1f1b": ScheduleInterleaved1F1B,
-}
+# Interleaved schedules want several stage chunks per rank; this trainer
+# builds one. See docs/internals/pipeline.md.
+SCHEDULES = {"1f1b": Schedule1F1B, "gpipe": ScheduleGPipe}
 
 
 class PipelineTrainer:

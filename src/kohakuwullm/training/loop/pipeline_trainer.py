@@ -29,7 +29,7 @@ class PipelinedLMTrainer(LMTrainer):
             boundary shape ``PipelineStage`` freezes at construction.
         num_microbatches: microbatches per optimizer step; this is the gradient
             accumulation, so ``accumulate_grad_batches`` must stay 1.
-        schedule: ``1f1b`` / ``gpipe`` / ``interleaved1f1b``.
+        schedule: ``1f1b`` or ``gpipe``.
         param_dtype / autocast_dtype: stage parameter storage and forward autocast.
     """
 

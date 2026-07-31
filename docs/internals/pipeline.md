@@ -370,6 +370,14 @@ Schedule choice, cheapest first in bubble terms:
 | `ScheduleInterleaved1F1B` | smaller bubble, needs >1 stage chunk per rank. |
 | `ScheduleZBVZeroBubble` | near-zero bubble; splits the backward into dW/dX. |
 
+Only the first two are selectable. Both trainers build **one** stage per rank,
+and the bottom two schedules are multi-stage: they take a *list* of stage chunks
+and fail with `'PipelineStage' object is not subscriptable` when handed one.
+Offering them as a `SCHEDULE` value was advertising a knob that could only
+crash, so `SCHEDULES` now holds `1f1b` and `gpipe` and an unknown name raises
+with the pair it does have. Reinstating interleaving means assigning each rank
+several non-contiguous chunks, which `plan_stages` does not model.
+
 Each stage owns a disjoint parameter set, so its optimizer is genuinely local:
 there is no cross-rank reduction to arrange.
 

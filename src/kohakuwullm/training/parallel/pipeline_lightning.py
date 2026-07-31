@@ -9,12 +9,7 @@ import warnings
 
 import torch
 import torch.distributed as dist
-from torch.distributed.pipelining import (
-    PipelineStage,
-    Schedule1F1B,
-    ScheduleGPipe,
-    ScheduleInterleaved1F1B,
-)
+from torch.distributed.pipelining import PipelineStage, Schedule1F1B, ScheduleGPipe
 
 from kohakuwullm.models import LMBackbone
 from kohakuwullm.training.optim.build import build_optimizer
@@ -27,11 +22,8 @@ from kohakuwullm.training.parallel.pipeline import (
     plan_for,
 )
 
-SCHEDULES = {
-    "1f1b": Schedule1F1B,
-    "gpipe": ScheduleGPipe,
-    "interleaved1f1b": ScheduleInterleaved1F1B,
-}
+# See docs/internals/pipeline.md for why interleaved is not among these.
+SCHEDULES = {"1f1b": Schedule1F1B, "gpipe": ScheduleGPipe}
 
 
 def build_stage(
