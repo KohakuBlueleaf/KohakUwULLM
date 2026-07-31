@@ -19,6 +19,7 @@ import torch
 from kohakuwullm.bench import make_info, make_tokens
 from kohakuwullm.data import build_loader
 from kohakuwullm.models import get_preset
+from kohakuwullm.training.parallel.autotune import broadcast_costs, measure_costs
 from kohakuwullm.training.parallel.uwupipe import (
     LMPipelineModule,
     PipelineStep,
@@ -74,6 +75,10 @@ ROUTER_Z_LOSS_WEIGHT = 0.0
 MICRO_TOKENS = 16384
 NUM_MICROBATCHES = 16
 LAYERS: list = []
+# Measure per-layer cost at startup instead of predicting it. Ignored when
+# LAYERS pins the split. See docs/internals/pipeline.md.
+AUTOTUNE = True
+AUTOTUNE_DOC_LEN = 325
 SCHEDULE = "1f1b"
 PARAM_DTYPE = "bf16"
 AUTOCAST_DTYPE = "bf16"
@@ -198,7 +203,29 @@ def main() -> None:
 
     config = get_preset(PRESET, vocab_size=VOCAB_SIZE, **ARCH_OVERRIDES)
     config = with_router_losses(config, AUX_LOSS_WEIGHT, ROUTER_Z_LOSS_WEIGHT)
-    plans = plan_for(config, ranks.world, seq_len=MICRO_TOKENS, layers=LAYERS or None)
+    costs = None
+    if AUTOTUNE and not LAYERS:
+        costs = broadcast_costs(
+            measure_costs(
+                config,
+                ranks.device,
+                MICRO_TOKENS,
+                doc_len=AUTOTUNE_DOC_LEN,
+                param_dtype=PARAM_DTYPE,
+                autocast_dtype=AUTOCAST_DTYPE,
+                mxfp8=MXFP8,
+            ),
+            ranks.device,
+        )
+        if ranks.rank == 0:
+            log.info(costs.summary())
+    plans = plan_for(
+        config,
+        ranks.world,
+        seq_len=MICRO_TOKENS,
+        layers=LAYERS or None,
+        costs=costs,
+    )
     if ranks.rank == 0:
         log.info("stage split\n%s", describe(plans))
 

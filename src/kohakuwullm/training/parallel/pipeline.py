@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 
 from kohakuwullm.models.backbone import LMBackbone
-from kohakuwullm.models.components.mlp import resolve_hidden
 from kohakuwullm.models.components.seqinfo import SeqInfo
 from kohakuwullm.utils import count_active_parameters, count_parameters
 from kohakuwupipe.parallel.streams import accumulate, accumulator
@@ -36,15 +35,18 @@ class StagePlan:
         return self.end_layer - self.start_layer
 
 
-def _ffn_hidden(config) -> int:
-    """Feed-forward width as the *model* resolves it, through ``resolve_hidden``."""
-    if config.moe_every > 0:
-        return resolve_hidden(
-            config.dim, config.moe_ratio, config.moe_hidden, config.mlp_multiple_of
+def _ffn_hidden(config, index: int | None = None) -> int:
+    """Feed-forward width, read off a block the model builds on the meta device.
+
+    Not recomputed: ``resolve_hidden``'s GLU correction and its ``multiple_of``
+    ceiling both have to match what was constructed, and a second derivation
+    drifts. See docs/internals/pipeline.md.
+    """
+    with torch.device("meta"):
+        block = LMBackbone.build_block(
+            config, config.depth - 1 if index is None else index
         )
-    return resolve_hidden(
-        config.dim, config.mlp_ratio, config.mlp_hidden, config.mlp_multiple_of
-    )
+    return int(block.mlp.hidden)
 
 
 def _block_cost(config, seq_len: int) -> float:

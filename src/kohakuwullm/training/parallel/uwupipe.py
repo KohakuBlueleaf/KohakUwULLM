@@ -107,14 +107,18 @@ def plan_for(
     seq_len: int,
     head_scale: float | None = None,
     layers=None,
+    costs=None,
 ):
-    """The stage split for ``config``, using this model's own cost model.
+    """The stage split for ``config``.
 
-    ``layers`` pins an explicit per-stage layer count and skips the cost model.
-    See docs/internals/pipeline.md.
+    ``costs`` is a measured :class:`~kohakuwullm.training.parallel.autotune.LayerCosts`
+    and replaces the analytic model outright; ``layers`` pins an explicit
+    per-stage count and skips both. See docs/internals/pipeline.md.
     """
     scale = HEAD_INEFFICIENCY if head_scale is None else head_scale
     vocab_params = float(config.dim * config.vocab_size)
+    layer_cost = costs.layers if costs is not None else _block_cost(config, seq_len)
+    head_cost = costs.head if costs is not None else vocab_params * scale
     if layers is not None:
         if isinstance(layers, str) or not hasattr(layers, "__iter__"):
             raise TypeError(f"layers must be a sequence of ints, got {layers!r}")
@@ -125,19 +129,19 @@ def plan_for(
             )
         if len(counts) != num_stages:
             raise ValueError(f"layers {counts} is not {num_stages} stages")
-        return plan_from_layers(
-            counts,
-            layer_cost=_block_cost(config, seq_len),
-            head_cost=vocab_params * scale,
-        )
+        return plan_from_layers(counts, layer_cost=layer_cost, head_cost=head_cost)
     return plan_stages(
         depth=config.depth,
         num_stages=num_stages,
-        layer_cost=_block_cost(config, seq_len),
-        head_cost=vocab_params * scale,
-        layer_params=_block_params(config),
-        head_params=0.0 if config.tie_embeddings else vocab_params,
-        embed_params=vocab_params,
+        layer_cost=layer_cost,
+        head_cost=head_cost,
+        layer_params=(costs.params if costs is not None else _block_params(config)),
+        head_params=(
+            costs.head_params
+            if costs is not None
+            else (0.0 if config.tie_embeddings else vocab_params)
+        ),
+        embed_params=costs.embed_params if costs is not None else vocab_params,
     )
 
 

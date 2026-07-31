@@ -11,8 +11,9 @@ Ten steps, no network, one checkpoint at the end::
         scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py \
         --set MAX_STEPS=10 --set CKPT_INTERVAL=10 --set SAMPLE_INTERVAL=0
 
-The split and the micro-batch shape are the measured optimum for this rung on
-4x RTX 5090; see docs/internals/pipeline.md for how they were chosen.
+The split is measured at startup rather than pinned -- see
+docs/internals/pipeline.md. The micro-batch shape is the measured optimum for
+this rung on 4x RTX 5090.
 """
 
 DATA_KIND = "corpus"
@@ -50,7 +51,9 @@ ROUTER_Z_LOSS_WEIGHT = 0.0
 
 MICRO_TOKENS = 16384
 NUM_MICROBATCHES = 16
-LAYERS = [5, 4, 4, 3]
+# Left to the autotuner: the optimum moves with MICRO_TOKENS, and a pinned
+# [5,4,4,3] measured 13% slower here than the [5,5,5,1] measurement derives.
+LAYERS = []
 SCHEDULE = "1f1b"
 PARAM_DTYPE = "bf16"
 AUTOCAST_DTYPE = "bf16"

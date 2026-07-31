@@ -40,6 +40,7 @@ from kohakuwullm.training.loop.callbacks import SampleLogCallback, ThroughputCal
 from kohakuwullm.training.loop.resume import load_rng_state, rng_state
 from kohakuwullm.training.loop.tokens import TokenSnapshot
 from kohakuwullm.training.loop.trainer import LMTrainer
+from kohakuwullm.training.parallel.autotune import LayerCosts, layer_key
 from kohakuwullm.training.parallel.uwupipe import (
     PipelineStep,
     batch_signature,
@@ -48,6 +49,7 @@ from kohakuwullm.training.parallel.uwupipe import (
     plan_for,
     verify_same_batch,
 )
+from kohakuwupipe.parallel.plan import partition
 from kohakuwupipe.parallel.streams import reduce_accumulator
 from kohakuwupipe.training.callbacks import Throughput
 from kohakuwupipe.training.hooks import Callback as PipeCallback
@@ -481,6 +483,81 @@ def test_pinned_split_beats_the_cost_model_and_rejects_a_bad_one():
         plan_for(config, 4, seq_len=16384, layers=[5, 4, 4, 2])
     with pytest.raises(ValueError, match="not 4 stages"):
         plan_for(config, 4, seq_len=16384, layers=[8, 8])
+
+
+def test_the_split_follows_a_per_layer_cost_vector_not_an_average():
+    """Layers stop being interchangeable the moment some of them are sparse.
+
+    ``moe_first_dense`` makes layer 0 cheaper than the rest, and a scalar cost
+    cannot express that -- it puts an equal *count* on each stage and calls the
+    result balanced. Fed the real per-layer milliseconds this rung measures, the
+    partitioner has to reach the split that was verified end to end.
+    """
+    config = _moe_config(depth=16, moe_first_dense=1, tie_embeddings=False)
+    dense, moe, head = 5.16, 6.69, 12.84
+    costs = LayerCosts(
+        layers=[moe if m else dense for m in config.moe_layers],
+        head=head,
+        embed=0.4,
+        params=[1.0] * config.depth,
+        head_params=1.0,
+        embed_params=1.0,
+    )
+    assert [p.num_layers for p in plan_for(config, 4, 8192, costs=costs)] == [
+        5,
+        4,
+        4,
+        3,
+    ]
+
+    # The same head against cheaper layers moves the answer -- which is the whole
+    # point, and why a constant cannot be right at two micro-batch sizes.
+    faster = replace_costs(costs, head=25.7, layer=7.87, dense=5.78)
+    assert [p.num_layers for p in plan_for(config, 4, 16384, costs=faster)] == [
+        5,
+        5,
+        5,
+        1,
+    ]
+
+    # A vector and a scalar must agree when every layer really is the same.
+    flat = [3.0] * config.depth
+    assert partition(16, 4, flat, 3.0) == partition(16, 4, 3.0, 3.0)
+    with pytest.raises(ValueError, match="expected 16 per-layer values"):
+        partition(16, 4, [1.0, 2.0], 3.0)
+
+
+def replace_costs(costs, head, layer, dense):
+    return LayerCosts(
+        layers=[layer if c != costs.layers[0] else dense for c in costs.layers],
+        head=head,
+        embed=costs.embed,
+        params=costs.params,
+        head_params=costs.head_params,
+        embed_params=costs.embed_params,
+    )
+
+
+def test_the_probe_block_is_the_block_the_model_builds():
+    """The autotuner times a block it constructs itself, so it must be the same one.
+
+    Anything re-derived here -- the GLU width correction, the ``multiple_of``
+    ceiling, whether this index is sparse -- is a second definition that drifts
+    from the model silently, which is how the split ends up disagreeing with the
+    thing it is splitting.
+    """
+    config = _moe_config(depth=4, moe_first_dense=1, tie_embeddings=False)
+    model = LMBackbone(config, head_kwargs={"kernel": "torch"})
+    for index in range(config.depth):
+        probe = LMBackbone.build_block(config, index)
+        built = model.blocks[index]
+        assert type(probe.mlp) is type(built.mlp)
+        assert probe.mlp.hidden == built.mlp.hidden
+        assert [p.shape for p in probe.parameters()] == [
+            p.shape for p in built.parameters()
+        ]
+    # Layer 0 is dense and the rest are not, so a single key would be wrong.
+    assert len({layer_key(config, i) for i in range(config.depth)}) == 2
 
 
 def test_corpus_steps_gives_the_loop_the_shape_its_protocol_wants():

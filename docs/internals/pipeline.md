@@ -287,27 +287,52 @@ On 4x RTX 5090 at Kohaku-MoE-1B, one flag at a time, 32-step runs:
 
 | change | tok/s |
 |---|---|
-| baseline: cost-model split, 8192x32, bf16 | 182.0k |
+| baseline: analytic split, 8192x32, bf16 | 182.0k |
 | `MXFP8=True` | 247.4k |
-| `LAYERS=[5,4,4,3]` | 263.3k |
+| split `5/4/4/3` at 8192x32 | 263.3k |
 | `MICRO_TOKENS=16384, NUM_MICROBATCHES=16` | 277.2k |
-| all of the above, on the real corpus | 267-271k |
+| `AUTOTUNE=True` derives `5/5/5/1` at that shape | **313.9k** |
+| all of the above, on the real corpus | 307k |
 
-The split is the surprising one. In isolation 5/4/4/3 only moves the slowest
-stage 31.55 -> 30.67 ms (2.8%), but end to end it is worth **13%**: 1F1B pays for
-the *spread*, not just the maximum, and 5/5/5/1 leaves the head stage idling at
-18.37 ms against 31.55.
+Two things here are worth more than the numbers.
 
-The cost model charges the head 3.56 layers where the measurement says 1.37
-(MXFP8) / 1.88 (bf16), and it prices every layer as MoE even when `moe_first_dense`
-makes the first one dense. What it returns depends on the `seq_len` it is handed:
-`5/5/5/1` at 8192, `4/5/5/2` at 16384 — neither is the measured `5/4/4/3`.
+**The optimal split moves with the micro-batch size.** `5/4/4/3` is right at
+8192 tokens and `5/5/5/1` is right at 16384 — measured 277.7k vs 313.9k for the
+two at 16384, a 13% swing in the *opposite* direction to the one at 8192. The
+MoE layer is overhead-bound at 8192 (6.69 ms) and gets relatively cheaper at
+16384 (7.87 ms for twice the work) while the head scales linearly (12.84 ->
+25.69 ms), so the balance point moves. No constant can be right at both.
 
-Three errors compound: `HEAD_INEFFICIENCY = 1.55` overcharges the head; callers
-pass `micro_tokens` as `seq_len`, which in `_block_cost` is the *document* length,
-so a 50-600 token corpus overcharges attention roughly 25x; and `moe_first_dense`
-is ignored. Until all three are corrected, **pin `LAYERS`** — the shipped config
-does.
+**1F1B pays for the spread, not just the maximum.** In isolation `5/4/4/3` moved
+the slowest stage only 31.55 -> 30.67 ms (2.8%) at 8192, but end to end it was
+worth 13%. Rank a candidate with the measured model; do not quote its predicted
+speedup.
+
+## Autotuning the split
+
+`AUTOTUNE = True` (the default) measures instead of predicting. At startup it
+times one block of each **distinct layer type**, the head and the embedding, at
+the real micro-batch shape, dtype and fp8 setting, then partitions the measured
+milliseconds:
+
+```
+measured stage costs: head 25.67 ms, embed 0.47 ms, 1x layer 5.82 ms, 15x layer 7.89 ms
+```
+
+A layer type is `(is_moe, attention backend, window)` — at most a handful even
+at depth 33, so the whole measurement is seconds. `LMBackbone.build_block` is
+the single place a block is constructed, so the probe is the block the model
+builds and cannot drift from it. Costs are broadcast from rank 0: identical
+cards still time differently, and ranks that disagreed would build mismatched
+stages.
+
+The analytic model remains as the fallback and is wrong three ways, all of which
+measurement sidesteps: `HEAD_INEFFICIENCY = 1.55` overcharges the head; callers
+pass `micro_tokens` as `seq_len`, which in `_block_cost` is the *document*
+length, so a 50-600 token corpus overcharges attention roughly 25x; and every
+layer is priced as MoE even when `moe_first_dense` makes the first one dense.
+
+`LAYERS = [5, 4, 4, 3]` still pins a split explicitly and skips both.
 
 ## Wiring it up
 
