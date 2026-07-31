@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from kohakuwullm.registry import OPTIMIZER, resolve
+from kohakuwullm.training.optim.adamw16 import AdamW16
 from kohakuwullm.training.optim.fused_adamw import FusedAdamW
 from kohakuwullm.training.optim.muon import MuonW
 from kohakuwullm.training.optim.torchao_optim import QUANTIZED_ADAMW
@@ -17,6 +18,7 @@ OPTIMIZER.register("adamw")(optim.AdamW)
 OPTIMIZER.register("adam")(optim.Adam)
 OPTIMIZER.register("sgd")(optim.SGD)
 OPTIMIZER.register("fused_adamw")(FusedAdamW)
+OPTIMIZER.register("adamw16")(AdamW16)
 
 
 def _is_decay_param(name: str, param: nn.Parameter) -> bool:
