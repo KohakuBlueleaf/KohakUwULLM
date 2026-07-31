@@ -7,6 +7,7 @@ fp8 weight refresh, a router-bias update -- arrives as ``post_step``.
 See docs/kohakuwupipe/loop.md.
 """
 
+import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -100,6 +101,12 @@ class PipelineLoop:
         self.callbacks = hooks.CallbackList(callbacks)
         self.global_step = 0
         self.epoch = 0
+        self.max_steps = 0
+        # Python ints: a run passes 2^31 tokens in under an hour.
+        self.tokens_seen = 0
+        self.tokens_trained = 0
+        self._elapsed_offset = 0.0
+        self._clock_start: float | None = None
         self.is_first = rank == 0
         self.is_last = rank == world - 1
         self._set_layout = getattr(stage_module, "set_seq_info", None)
@@ -134,14 +141,17 @@ class PipelineLoop:
             found = self.scaler.unscale_(list(self.stage_module.parameters()))
             overflow = bool(self.scaler.agree(found).item())
             self.scaler.update(overflow)
+        grad_norm = None
         if not overflow:
             if self.grad_clip:
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.stage_module.parameters(), self.grad_clip
                 )
             self.callbacks.call("on_before_optimizer_step", self, self.optimizer)
             self.optimizer.step()
         extra = self.post_step(self.stage_module) if self.post_step else {}
+        if grad_norm is not None:
+            extra["grad_norm"] = grad_norm.detach()
         if self.scheduler is not None:
             self.scheduler.step()
 
@@ -149,10 +159,14 @@ class PipelineLoop:
             extra["scale"] = torch.tensor(scale)
             extra["overflow"] = torch.tensor(float(overflow))
         self.global_step += 1
+        # Every rank draws the identical batch, so these are already global.
+        seen = self.micro_tokens * self.num_microbatches
+        self.tokens_seen += seen
+        self.tokens_trained += int(batch.trained)
         out = StepOutput(
             index=self.global_step,
             loss=self.broadcast_loss(losses, scale),
-            seen=self.micro_tokens * self.num_microbatches,
+            seen=seen,
             trained=int(batch.trained),
             extra=extra,
         )
@@ -184,6 +198,8 @@ class PipelineLoop:
         ``on_exception`` fires on every rank before the error propagates, so a
         callback can tear its own state down.
         """
+        self.max_steps = max_steps
+        self._clock_start = time.perf_counter()
         self.callbacks.call("setup", self, "fit")
         self.callbacks.call("on_fit_start", self)
         self.callbacks.call("on_train_start", self)
@@ -223,6 +239,28 @@ class PipelineLoop:
                 )
         self.callbacks.call("on_validation_epoch_end", self)
         self.callbacks.call("on_validation_end", self)
+
+    def elapsed(self) -> float:
+        """Training wall-clock, excluding the gap between a crash and a restart."""
+        if self._clock_start is None:
+            return self._elapsed_offset
+        return self._elapsed_offset + (time.perf_counter() - self._clock_start)
+
+    def progress_state(self) -> dict:
+        """Cumulative token and time totals, for a checkpoint."""
+        return {
+            "tokens_seen": self.tokens_seen,
+            "tokens_trained": self.tokens_trained,
+            "elapsed": self.elapsed(),
+        }
+
+    def load_progress_state(self, state: dict | None) -> None:
+        """Continue a restored run's totals instead of restarting them at zero."""
+        if not state:
+            return
+        self.tokens_seen = int(state.get("tokens_seen", 0))
+        self.tokens_trained = int(state.get("tokens_trained", 0))
+        self._elapsed_offset = float(state.get("elapsed", 0.0))
 
     # Kept so an existing caller of the old name keeps working.
     run = fit

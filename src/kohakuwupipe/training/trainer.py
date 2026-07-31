@@ -154,6 +154,7 @@ class PipelineTrainer:
             strict=strict,
         )
         self.loop.global_step = int(payload.get("global_step", 0))
+        self.loop.load_progress_state(payload.get("progress"))
         self.callbacks.load_state_dict(payload.get("callbacks", {}))
         self.callbacks.call("on_load_checkpoint", self.loop, payload)
         self.module.on_load_checkpoint(payload)
