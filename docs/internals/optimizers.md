@@ -500,6 +500,70 @@ host synchronisation and the caller decides when to pay for the logged value.
 
 ---
 
+## AdamW16, and the fp16 denominator
+
+`FusedAdamW` raises on non-fp32 parameters and torch's `AdamW` accepts them and
+is wrong. Both failures have one cause: **Adam squares the gradient.**
+
+A gradient of `1e-4` is unremarkable in fp16. `g**2` is `1e-8`, and fp16's
+smallest subnormal is `5.96e-8`, so the second moment flushes to zero. Then
+`sqrt(v) + eps` with the usual `eps=1e-8` is *also* zero, because that eps is
+below the same floor and `add_` is a no-op. The update divides by zero:
+
+```python
+>>> v = torch.zeros(1, dtype=torch.float16, device="cuda")
+>>> v.mul_(0.95).addcmul_(g, g, value=0.05)        # g = 1e-4
+tensor([0.], dtype=torch.float16)
+>>> v.sqrt_().add_(1e-8)
+tensor([0.], dtype=torch.float16)
+```
+
+`AdamW16` wraps `kernels/optim/adamw16.py`, which loads state into fp32
+registers, does the whole update there, and narrows only on writeback. Two
+things follow from the kernel's layout:
+
+- **`exp_avg_rms` holds `sqrt(v)`, not `v`.** Storing the root halves the
+  exponent range the 16-bit slot has to span, which is what makes 16-bit second
+  moments viable at all. A caller converting from a torch optimizer's
+  `exp_avg_sq` must take the square root; the shapes match, so nothing warns.
+- **Stochastic writeback is bf16-only**, for the reason in *Two fixes* above.
+  The flag is silently dropped for fp16 rather than rejected, so a group holding
+  both dtypes needs no split.
+
+The Triton kernel is CUDA-only; `adamw16_step` falls back to an eager path,
+op-for-op equivalent, so CPU tests and CPU-side optimizers take the same update.
+`tests/test_kernels.py::test_eager_fallback_tracks_the_triton_kernel` pins the
+two together in all three dtypes.
+
+fp32 parameters take the same path, so a mixed model needs one optimizer.
+
+### Muon's AdamW side is this kernel
+
+`MuonW` applies the orthogonalized step to matrices and AdamW to everything
+else — norms, biases, the router's expert bias. That second group used to be a
+third hand-rolled AdamW inside `muon.py`, squaring in the parameter dtype, and
+it hit the failure above exactly: **every non-matrix parameter went to `-inf` on
+step 1 of any fp16 run.** It now calls `adamw16_step`.
+
+The symptom was not a crash. With a loss scaler in front of it, step 1 looked
+clean and the model diverged afterwards; without Muon, an fp16 run trained but
+the MoE load imbalance pinned at exactly `top_k` — the routing collapsed onto a
+fixed expert set because the bias that rebalances it is a non-matrix parameter
+and was no longer being updated. Measured on MoE-1B pp4 over 24 steps:
+
+| arm | loss @8 | loss @24 | imbalance @24 |
+|---|---|---|---|
+| bf16 + Muon | 6.43 | 3.15 | 4.69, falling |
+| fp16 + Muon | 7.16 | 3.26 | 5.74, falling |
+| bf16 + AdamW16 | 8.35 | 5.60 | 7.72, ~pinned |
+| fp16 + AdamW16 | 9.92 | 5.71 | 8.00, pinned |
+
+Read down the columns, not across: the precision is worth ~0.1 in loss, the
+optimizer ~2.4. An fp16 run that merely avoids NaN is not the same as one that
+trains.
+
+---
+
 ## Quantized optimizer state (torchao)
 
 `adamw8bit` / `adamw4bit` / `adamwfp8` quantize the Adam moments. That is only
