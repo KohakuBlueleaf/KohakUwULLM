@@ -1,4 +1,0 @@
-[model]
-    config="./config/model/titpop-500m.yaml"
-    ckpt_path="/Slim4TB-2/UwULLM/epoch=4-step=40951.ckpt"
-    name="500M_epoch5"

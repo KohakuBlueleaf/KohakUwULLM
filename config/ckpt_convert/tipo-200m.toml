@@ -1,4 +1,0 @@
-[model]
-    config="./config/model/tipo-200m.yaml"
-    ckpt_path="NanoLLaMA/11b82c1f/checkpoints/epoch=1-step=14334.ckpt"
-    name="TIPO-200M_ft2"
