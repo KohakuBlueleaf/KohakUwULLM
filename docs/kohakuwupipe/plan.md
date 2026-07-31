@@ -24,6 +24,17 @@ large vocabulary can want.
 
 ## Pinning a split you measured
 
+`layer_cost` and `layer_params` each take **either one number or a per-layer
+sequence**. Layers stop being interchangeable the moment some are sparse,
+windowed, or on a different attention backend, and a scalar cost cannot say so —
+it places an equal *count* on each stage and calls that balanced.
+
+```python
+plans = plan_stages(depth=16, num_stages=4,
+                    layer_cost=[5.8] + [7.9] * 15,   # one dense, fifteen sparse
+                    head_cost=25.7)
+```
+
 The cost model is a model. When you have measured the real thing, say so:
 
 ```python

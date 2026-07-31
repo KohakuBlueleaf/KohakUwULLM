@@ -24,17 +24,35 @@ class StagePlan:
         return self.end_layer - self.start_layer
 
 
+def _prefix(values, depth: int) -> list[float]:
+    """Running sum of a per-layer vector, or of a scalar broadcast over ``depth``."""
+    if isinstance(values, (int, float)):
+        values = [float(values)] * depth
+    values = [float(v) for v in values]
+    if len(values) != depth:
+        raise ValueError(f"expected {depth} per-layer values, got {len(values)}")
+    total, out = 0.0, [0.0]
+    for value in values:
+        total += value
+        out.append(total)
+    return out
+
+
 def partition(
     depth: int,
     num_stages: int,
-    layer_cost: float,
+    layer_cost,
     head_cost: float,
-    layer_params: float = 0.0,
+    layer_params=0.0,
     head_params: float = 0.0,
     embed_params: float = 0.0,
     allow_empty_last: bool = False,
 ) -> list[int]:
     """Contiguous cut points minimizing the slowest stage; ties break on memory.
+
+    ``layer_cost`` and ``layer_params`` are each either one number for every
+    layer or a per-layer sequence -- layers are not interchangeable once some
+    are sparse, windowed, or on a different attention backend.
 
     ``allow_empty_last`` lets the head-carrying stage hold no layers, which a
     large vocabulary can want. See docs/kohakuwupipe/plan.md.
@@ -44,22 +62,24 @@ def partition(
     if num_stages > depth:
         raise ValueError(f"cannot split {depth} layers across {num_stages} stages")
 
+    cost = _prefix(layer_cost, depth)
+    mem = _prefix(layer_params, depth)
     inf = (float("inf"), float("inf"))
     best = [[inf] * (depth + 1) for _ in range(num_stages + 1)]
     cut = [[0] * (depth + 1) for _ in range(num_stages + 1)]
     for i in range(depth + 1):
-        last = layer_cost * (depth - i) + head_cost
-        mem = layer_params * (depth - i) + head_params
-        best[1][i] = (last, mem * mem)
+        last = cost[depth] - cost[i] + head_cost
+        held = mem[depth] - mem[i] + head_params
+        best[1][i] = (last, held * held)
         cut[1][i] = depth
     for s in range(2, num_stages + 1):
         for i in range(depth + 1):
             upper = depth + 1 if (s == 2 and allow_empty_last) else depth - s + 2
             for j in range(i + 1, upper):
-                mine = layer_cost * (j - i)
-                mem = layer_params * (j - i) + (embed_params if i == 0 else 0.0)
+                mine = cost[j] - cost[i]
+                held = mem[j] - mem[i] + (embed_params if i == 0 else 0.0)
                 tail_max, tail_sq = best[s - 1][j]
-                key = (max(mine, tail_max), mem * mem + tail_sq)
+                key = (max(mine, tail_max), held * held + tail_sq)
                 if key < best[s][i]:
                     best[s][i] = key
                     cut[s][i] = j
@@ -74,9 +94,9 @@ def partition(
 def plan_stages(
     depth: int,
     num_stages: int,
-    layer_cost: float,
+    layer_cost,
     head_cost: float,
-    layer_params: float = 0.0,
+    layer_params=0.0,
     head_params: float = 0.0,
     embed_params: float = 0.0,
     allow_empty_last: bool = False,
@@ -92,6 +112,7 @@ def plan_stages(
         embed_params=embed_params,
         allow_empty_last=allow_empty_last,
     )
+    cost = _prefix(layer_cost, depth)
     plans = []
     for stage in range(num_stages):
         start, end = bounds[stage], bounds[stage + 1]
@@ -104,15 +125,13 @@ def plan_stages(
                 end_layer=end,
                 has_embed=stage == 0,
                 has_head=has_head,
-                cost=layer_cost * (end - start) + (head_cost if has_head else 0.0),
+                cost=cost[end] - cost[start] + (head_cost if has_head else 0.0),
             )
         )
     return plans
 
 
-def plan_from_layers(
-    layers, layer_cost: float = 1.0, head_cost: float = 0.0
-) -> list[StagePlan]:
+def plan_from_layers(layers, layer_cost=1.0, head_cost: float = 0.0) -> list[StagePlan]:
     """Stage plans from an explicit per-stage layer count, bypassing the cost model.
 
     ``layers`` has one entry per stage; the costs are carried for reporting only.
@@ -121,6 +140,7 @@ def plan_from_layers(
     counts = [int(n) for n in layers]
     if not counts or any(n < 0 for n in counts):
         raise ValueError(f"expected non-negative layer counts, got {counts}")
+    cost = _prefix(layer_cost, sum(counts))
     plans, start = [], 0
     for index, n in enumerate(counts):
         has_head = index == len(counts) - 1
@@ -132,7 +152,7 @@ def plan_from_layers(
                 end_layer=start + n,
                 has_embed=index == 0,
                 has_head=has_head,
-                cost=layer_cost * n + (head_cost if has_head else 0.0),
+                cost=cost[start + n] - cost[start] + (head_cost if has_head else 0.0),
             )
         )
         start += n
