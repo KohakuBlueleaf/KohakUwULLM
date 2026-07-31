@@ -9,19 +9,29 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class StagePlan:
-    """Which layers, and which endpoints, belong to one stage."""
+    """Which layers belong to one stage, and where it sits in the pipeline.
+
+    Architecture-free: a subclass names what its own ends are, which for an LM
+    is the embedding table and the head. See docs/kohakuwupipe/plan.md.
+    """
 
     index: int
     num_stages: int
     start_layer: int
     end_layer: int  # exclusive
-    has_embed: bool
-    has_head: bool
     cost: float
 
     @property
     def num_layers(self) -> int:
         return self.end_layer - self.start_layer
+
+    @property
+    def is_first(self) -> bool:
+        return self.index == 0
+
+    @property
+    def is_last(self) -> bool:
+        return self.index == self.num_stages - 1
 
 
 def _prefix(values, depth: int) -> list[float]:
@@ -100,8 +110,9 @@ def plan_stages(
     head_params: float = 0.0,
     embed_params: float = 0.0,
     allow_empty_last: bool = False,
+    plan_cls: type = StagePlan,
 ) -> list[StagePlan]:
-    """One :class:`StagePlan` per stage, in pipeline order."""
+    """One ``plan_cls`` per stage, in pipeline order."""
     bounds = partition(
         depth,
         num_stages,
@@ -118,20 +129,20 @@ def plan_stages(
         start, end = bounds[stage], bounds[stage + 1]
         has_head = stage == num_stages - 1
         plans.append(
-            StagePlan(
+            plan_cls(
                 index=stage,
                 num_stages=num_stages,
                 start_layer=start,
                 end_layer=end,
-                has_embed=stage == 0,
-                has_head=has_head,
                 cost=cost[end] - cost[start] + (head_cost if has_head else 0.0),
             )
         )
     return plans
 
 
-def plan_from_layers(layers, layer_cost=1.0, head_cost: float = 0.0) -> list[StagePlan]:
+def plan_from_layers(
+    layers, layer_cost=1.0, head_cost: float = 0.0, plan_cls: type = StagePlan
+) -> list[StagePlan]:
     """Stage plans from an explicit per-stage layer count, bypassing the cost model.
 
     ``layers`` has one entry per stage; the costs are carried for reporting only.
@@ -145,13 +156,11 @@ def plan_from_layers(layers, layer_cost=1.0, head_cost: float = 0.0) -> list[Sta
     for index, n in enumerate(counts):
         has_head = index == len(counts) - 1
         plans.append(
-            StagePlan(
+            plan_cls(
                 index=index,
                 num_stages=len(counts),
                 start_layer=start,
                 end_layer=start + n,
-                has_embed=index == 0,
-                has_head=has_head,
                 cost=cost[start + n] - cost[start] + (head_cost if has_head else 0.0),
             )
         )
@@ -165,15 +174,17 @@ def describe(plans: list[StagePlan]) -> str:
     depth = plans[-1].end_layer
     lines = [
         f"pipeline split: {len(plans)} stages over {depth} layers",
-        f"  {'stage':>5}  {'layers':>10}  {'n':>3}  {'extra':>11}  cost share",
+        f"  {'stage':>5}  {'layers':>10}  {'n':>3}  {'ends':>11}  cost share",
     ]
     for plan in plans:
-        extra = "embed" if plan.has_embed else ("head" if plan.has_head else "-")
-        if plan.has_embed and plan.has_head:
-            extra = "embed+head"
+        ends = "+".join(
+            name
+            for name, held in (("first", plan.is_first), ("last", plan.is_last))
+            if held
+        )
         span = f"{plan.start_layer}..{plan.end_layer - 1}"
         lines.append(
-            f"  {plan.index:>5}  {span:>10}  {plan.num_layers:>3}  {extra:>11}"
+            f"  {plan.index:>5}  {span:>10}  {plan.num_layers:>3}  {ends or '-':>11}"
             f"  {100 * plan.cost / total:>9.1f}%"
         )
     return "\n".join(lines)

@@ -7,7 +7,7 @@ SeqInfo from lengths set via :meth:`LMStage.set_seq_info`. See docs/internals/pi
 
 import time
 import warnings
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn as nn
@@ -21,6 +21,19 @@ from kohakuwupipe.parallel.plan import (
     plan_stages,
 )
 from kohakuwupipe.parallel.streams import accumulate, accumulator
+
+
+@dataclass(frozen=True)
+class LMStagePlan(StagePlan):
+    """A stage plan that names an LM's ends: the embedding table and the head."""
+
+    @property
+    def has_embed(self) -> bool:
+        return self.is_first
+
+    @property
+    def has_head(self) -> bool:
+        return self.is_last
 
 
 def _ffn_hidden(config, index: int | None = None) -> int:
@@ -157,7 +170,9 @@ def plan_for(
             )
         if len(counts) != num_stages:
             raise ValueError(f"layers {counts} is not {num_stages} stages")
-        return plan_from_layers(counts, layer_cost=layer_cost, head_cost=head_cost)
+        return plan_from_layers(
+            counts, layer_cost=layer_cost, head_cost=head_cost, plan_cls=LMStagePlan
+        )
     return plan_stages(
         depth=config.depth,
         num_stages=num_stages,
@@ -170,6 +185,7 @@ def plan_for(
             else (0.0 if config.tie_embeddings else vocab_params)
         ),
         embed_params=costs.embed_params if costs is not None else vocab_params,
+        plan_cls=LMStagePlan,
     )
 
 
