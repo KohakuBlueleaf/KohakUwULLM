@@ -10,6 +10,8 @@ neighbour; the user half and the BOS are context, not targets. Getting either
 wrong trains a model that works, on a slightly different objective than intended.
 """
 
+import random
+
 import pytest
 import torch
 from model_fixtures import tiny_config
@@ -129,3 +131,47 @@ def test_split_padded_preserves_rows():
     chunks = split_padded(batch, 3)
     assert sum(c.tokens.shape[0] for c in chunks) == 6
     assert sum(c.num_trained for c in chunks) == batch.num_trained
+
+
+def test_tags_are_emitted_with_spaces_but_emoticons_survive():
+    """Underscores are separators in tag text -- except where they are the tag.
+
+    A blanket ``replace("_", " ")`` silently destroys the emoticon tags
+    (``o_o``, ``^_^``), which is why the length guard is the behaviour pinned
+    here and not the replacement alone.
+    """
+    from kohakuwullm.data.renderers.tipo import (
+        TIPORenderer,
+        build_prompt,
+        normalize_tag,
+    )
+
+    assert normalize_tag("long_hair") == "long hair"
+    assert normalize_tag("school_uniform") == "school uniform"
+    # Exactly the negative case: short emoticon tags keep their underscores.
+    assert normalize_tag("o_o") == "o_o"
+    assert normalize_tag("^_^") == "^_^"
+    assert normalize_tag("1girl") == "1girl"
+
+    rec = {
+        "general": ["long_hair", "o_o", "school_uniform"],
+        "character": ["hatsune_miku"],
+        "copyright": ["vocaloid"],
+        "rating": ["general"],
+    }
+    renderer = TIPORenderer(
+        train_on_input_prob=0.0,
+        total_drop_prob=0.0,
+        info_drop_prob=0.0,
+        gen_meta_prob=0.0,
+    )
+    user, out = renderer(rec, rng=random.Random(0))
+    text = user + out
+    assert "long_hair" not in text and "long hair" in text
+    assert "school_uniform" not in text and "school uniform" in text
+    assert "hatsune_miku" not in text and "hatsune miku" in text
+    assert "o_o" in text, "emoticon tag was mangled"
+
+    # The preview path must agree with the training path, or previews are
+    # sampled off-distribution.
+    assert "long hair" in build_prompt(tags="1girl, long_hair")

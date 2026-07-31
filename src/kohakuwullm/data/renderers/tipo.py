@@ -37,6 +37,19 @@ SPECIAL_TOKENS = [
 ]
 
 
+def normalize_tag(tag: str) -> str:
+    """A tag in its text form: underscores become spaces above 3 characters.
+
+    See docs/internals/data.md.
+    """
+    return tag.replace("_", " ") if len(tag) >= 4 else tag
+
+
+def normalize_tags(tags) -> list[str]:
+    """:func:`normalize_tag` over a category's list, dropping empties."""
+    return [normalize_tag(tag) for tag in (tags or []) if tag]
+
+
 def _random_choose(items: list, n: int, rng) -> list:
     """``n`` items sampled without replacement, original order preserved."""
     idx = list(range(len(items)))
@@ -75,6 +88,43 @@ def _trim_paragraphs(text: str, budget: tuple[int, int], rng) -> str:
     return "\n".join(". ".join(p) + "." for p in paragraphs)
 
 
+def build_prompt(
+    tags: str = "",
+    meta: dict | None = None,
+    task: str | None = None,
+    target_len: str = "long",
+    text: str = "",
+) -> str:
+    """The user half of a TIPO example, for inference.
+
+    ``task`` is a name from :data:`TASKS`, ``tags`` seeds a tag-first task and
+    ``text`` a ``short``/``long``-first one. See docs/internals/data.md.
+    """
+    if task is not None and task not in TASKS:
+        raise ValueError(f"unknown TIPO task {task!r}; expected one of {TASKS}")
+    if target_len not in MIN_LEN:
+        raise ValueError(
+            f"unknown length {target_len!r}; expected one of {list(MIN_LEN)}"
+        )
+
+    before = ""
+    for key, value in (meta or {}).items():
+        if value:
+            before += f"{key}: {value}\n"
+
+    if task is None:
+        task_str = f"<|{target_len}|>"
+    else:
+        needs_length = task.startswith("tag_to") or "to_tag" in task
+        task_str = f"<|{target_len}|> <|{task}|>" if needs_length else f"<|{task}|>"
+
+    field = (task.split("_to_") if task else ["tag"])[0]
+    seeded = ", ".join(normalize_tags(t.strip() for t in tags.split(",")))
+    # A tag-first prompt ends mid-line: the model continues with ", <tag>".
+    after = f"tag: {seeded}" if field == "tag" else f"{field}: {text}\n"
+    return before + f"target: {task_str}\n" + after
+
+
 @RENDERER.register("tipo")
 class TIPORenderer:
     """Render a record as a TIPO training example.
@@ -109,7 +159,7 @@ class TIPORenderer:
         sep = self.separator
 
         def joined(category: str) -> str | None:
-            return sep.join(rec.get(category) or []) or None
+            return sep.join(normalize_tags(rec.get(category))) or None
 
         aspect = None
         if rec.get("width") and rec.get("height"):
@@ -135,7 +185,7 @@ class TIPORenderer:
         rng = rng or random
         sep = self.separator
 
-        general = list(rec.get("general") or [])
+        general = normalize_tags(rec.get("general"))
         total = len(general)
         rng.shuffle(general)
 
