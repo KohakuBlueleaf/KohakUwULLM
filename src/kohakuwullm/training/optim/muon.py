@@ -12,6 +12,7 @@ import torch
 import torch._dynamo
 
 from kohakuwullm.compile_utils import raise_recompile_limit
+from kohakuwullm.kernels.optim.adamw16 import adamw16_step
 from kohakuwullm.kernels.optim.stochastic_round import stochastic_round_update_
 from kohakuwullm.registry import OPTIMIZER
 
@@ -413,24 +414,29 @@ class MuonW(torch.optim.Optimizer):
         return max(1, self.ns_batch_elems // max(math.prod(shape), 1))
 
     def _adam_group(self, group: dict) -> None:
-        """Decoupled-decay AdamW, for everything Muon does not apply to."""
-        lr, decay = group["lr"], group["weight_decay"]
-        beta1, beta2 = group["betas"]
-        eps = group["eps"]
+        """Decoupled-decay AdamW, for everything Muon does not apply to.
+
+        State is held in the parameter dtype; the arithmetic is fp32.
+        """
         for param in group["params"]:
             if param.grad is None:
                 continue
             state = self.state[param]
             if "exp_avg" not in state:
                 state["exp_avg"] = torch.zeros_like(param)
-                state["exp_avg_sq"] = torch.zeros_like(param)
+                state["exp_avg_rms"] = torch.zeros_like(param)
                 state["step"] = 0
             state["step"] += 1
-            exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-            exp_avg.lerp_(param.grad, 1 - beta1)
-            exp_avg_sq.mul_(beta2).addcmul_(param.grad, param.grad, value=1 - beta2)
-            bias1 = 1 - beta1 ** state["step"]
-            bias2 = 1 - beta2 ** state["step"]
-            denom = exp_avg_sq.div(bias2).sqrt_().add_(eps)
-            param.mul_(1 - lr * decay)
-            param.addcdiv_(exp_avg, denom, value=-lr / bias1)
+            adamw16_step(
+                param,
+                param.grad.to(param.dtype),
+                state["exp_avg"],
+                state["exp_avg_rms"],
+                state["step"],
+                group["lr"],
+                betas=group["betas"],
+                eps=group["eps"],
+                weight_decay=group["weight_decay"],
+                stochastic=self._sr and param.dtype is torch.bfloat16,
+                seed=self._sr_seed,
+            )

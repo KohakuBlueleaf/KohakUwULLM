@@ -1053,3 +1053,21 @@ def test_build_optimizer_resolves_a_dotted_path_instead_of_calling_it():
 
     named = build_optimizer(model, name="adamw", lr=1e-3)
     assert type(named) is type(dotted)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_muon_adamw_side_survives_16bit_parameters(dtype):
+    """Muon's non-matrix group must step finitely in the dtype it is handed.
+
+    ``g**2`` for a 1e-4 gradient is 1e-8, below fp16's smallest subnormal, and
+    ``eps`` is too. Squaring in the parameter dtype makes the denominator zero.
+    """
+    param = torch.full((64,), 0.5, dtype=dtype, device="cuda", requires_grad=True)
+    param.grad = torch.full_like(param, 1e-4)
+    opt = MuonW([{"params": [param], "use_muon": False}], lr=1e-3, compile_ns=False)
+
+    before = param.detach().clone().float()
+    opt.step()
+
+    assert torch.isfinite(param).all(), f"{dtype} AdamW side produced non-finite"
+    assert not torch.allclose(param.detach().float(), before), "no update applied"
