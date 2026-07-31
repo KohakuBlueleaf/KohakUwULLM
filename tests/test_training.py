@@ -578,11 +578,18 @@ def test_corpus_steps_gives_the_loop_the_shape_its_protocol_wants():
     step = MicroBatchedStep.from_chunks(chunks, k)
     assert isinstance(step.trained, tuple)
 
-    out = next(corpus_steps([step], torch.device("cpu")))
+    stream = corpus_steps([step], torch.device("cpu"))
+    out = next(stream)
     assert isinstance(out, PipelineStep)
     assert out.inputs.shape == (k * micro,) and out.target.shape == (k * micro,)
     assert len(out.layout) == micro
     assert isinstance(out.trained, int) and out.trained == sum(step.trained)
+
+    # A one-pass loader must not end the fit: re-iterating reshuffles, and
+    # `max_steps` is the only thing that stops a run.
+    assert sum(1 for _, _ in zip(range(5), stream)) == 5
+    with pytest.raises(RuntimeError, match="no steps on a full pass"):
+        next(corpus_steps([], torch.device("cpu")))
 
 
 def test_a_callback_added_after_the_trainer_still_reaches_the_loop():

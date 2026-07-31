@@ -47,14 +47,30 @@ class PipelineStep:
 
 
 def corpus_steps(loader, device):
-    """Adapt a :class:`MicroBatchedStep` loader to :class:`PipelineStep`.
+    """Adapt a :class:`MicroBatchedStep` loader to :class:`PipelineStep`, endlessly.
 
     The loader names the layout ``seq_infos`` and reports ``trained`` per
     microbatch; the loop wants ``layout`` and one host int.
+
+    Re-iterated rather than consumed once: the dataset advances its own pass
+    counter and reshuffles, so a stream that runs out continues instead of
+    ending the fit early and silently. ``max_steps`` is what stops a run.
+    See docs/internals/data.md.
     """
-    for step in loader:
-        step = step.to(device)
-        yield PipelineStep(step.tokens, step.labels, step.seq_infos, step.num_trained)
+    while True:
+        emitted = 0
+        for step in loader:
+            step = step.to(device)
+            emitted += 1
+            yield PipelineStep(
+                step.tokens, step.labels, step.seq_infos, step.num_trained
+            )
+        if emitted == 0:
+            raise RuntimeError(
+                "the loader yielded no steps on a full pass; re-iterating would "
+                "spin forever. Check the sources, and that batches_per_epoch and "
+                "the token budget can produce at least one step per shard."
+            )
 
 
 def batch_signature(step: PipelineStep) -> torch.Tensor:
