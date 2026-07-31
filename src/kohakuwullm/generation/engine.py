@@ -1,0 +1,257 @@
+"""Generation engines: one for a whole model, one for a pipeline of stages.
+
+Both take ``(B, S)`` padded prompts and return ``(B, S + n)``. See docs/guides/generation.md.
+"""
+
+from contextlib import nullcontext
+from functools import partial
+
+import torch
+import torch.distributed as dist
+
+from kohakuwullm.models.cache import KVCache
+from kohakuwullm.training.parallel.pipeline_lightning import build_schedule
+
+SAMPLE_SEED = 20090220
+
+
+def filter_top_k(logits: torch.Tensor, top_k: int) -> torch.Tensor:
+    """Mask all but the ``top_k`` highest logits per row."""
+    if top_k <= 0 or top_k >= logits.shape[-1]:
+        return logits
+    kth = logits.topk(top_k, dim=-1).values[..., -1:]
+    return logits.masked_fill(logits < kth, float("-inf"))
+
+
+def filter_top_p(probs: torch.Tensor, top_p: float) -> torch.Tensor:
+    """Zero all but the smallest head of ``probs`` carrying mass ``top_p``."""
+    if top_p >= 1.0:
+        return probs
+    sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
+    keep = (sorted_probs.cumsum(-1) - sorted_probs) < top_p
+    return torch.zeros_like(probs).scatter_(-1, sorted_idx, sorted_probs * keep)
+
+
+def filter_min_p(probs: torch.Tensor, min_p: float) -> torch.Tensor:
+    """Zero tokens below ``min_p`` times the row's peak probability."""
+    if min_p <= 0.0:
+        return probs
+    floor = probs.max(dim=-1, keepdim=True).values * min_p
+    return probs * (probs >= floor)
+
+
+def sample(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    min_p: float = 0.0,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """One token per row. ``temperature <= 0`` is greedy and ignores every filter.
+
+    Filters compose in the order top-k, top-p, min-p: top-k bounds the candidate
+    count, top-p bounds their mass, min-p bounds their ratio to the peak.
+    """
+    if temperature <= 0:
+        return logits.argmax(-1, keepdim=True)
+    probs = torch.softmax(filter_top_k(logits, top_k) / temperature, dim=-1)
+    probs = filter_min_p(filter_top_p(probs, top_p), min_p)
+    probs = probs / probs.sum(-1, keepdim=True).clamp_min(1e-12)
+    return torch.multinomial(probs, 1, generator=generator)
+
+
+class Generator:
+    """Common sampling state: a private RNG stream and the token-choice rule."""
+
+    def __init__(self, seed: int = SAMPLE_SEED) -> None:
+        self.seed = seed
+        self._generators: dict[torch.device, torch.Generator] = {}
+
+    def generator(self, device: torch.device) -> torch.Generator:
+        """This device's generator, created on first use."""
+        gen = self._generators.get(device)
+        if gen is None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(self.seed)
+            self._generators[device] = gen
+        return gen
+
+    def _choose(self, logits, generator, **opts):
+        return sample(logits, generator=generator, **opts)
+
+    def generate(self, prompt_ids, **kwargs):
+        raise NotImplementedError
+
+
+class LocalGenerator(Generator):
+    """Every rank holds the whole model; generation is rank-local and collective-free.
+
+    Args:
+        backbone: an :class:`LMBackbone` with an ``LMHead``.
+    """
+
+    def __init__(self, backbone, seed: int = SAMPLE_SEED) -> None:
+        super().__init__(seed)
+        self.backbone = backbone
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt_ids: torch.Tensor,
+        max_new_tokens: int = 128,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        eos_token_id: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        was_training = self.backbone.training
+        generator = generator or self.generator(prompt_ids.device)
+        self.backbone.eval()
+        try:
+            tokens = prompt_ids.clone()
+            for _ in range(max_new_tokens):
+                hidden = self.backbone(tokens)
+                logits = self.backbone.head.logits(hidden[:, -1]).float()
+                nxt = self._choose(
+                    logits,
+                    generator,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                )
+                tokens = torch.cat([tokens, nxt], dim=1)
+                if eos_token_id is not None and (nxt == eos_token_id).all():
+                    break
+        finally:
+            self.backbone.train(was_training)
+        return tokens
+
+
+class PipelineGenerator(Generator):
+    """The model is split over ranks; one prompt row per microbatch.
+
+    Every rank must call :meth:`generate` the same number of times with the same
+    shapes; only stage 0 needs the prompt and only the last stage produces logits.
+
+    Args:
+        stage: this rank's ``PipelineStage``.
+        head_module: the stage module, for ``head.logits`` on the last rank.
+        rank / world: pipeline position and size.
+        autocast_dtype: the stage's own autocast dtype; the head runs under it
+            because it sits outside the stage forward the schedule wraps.
+    """
+
+    def __init__(
+        self,
+        stage,
+        head_module,
+        rank: int,
+        world: int,
+        seed: int = SAMPLE_SEED,
+        microbatches: int | None = None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__(seed)
+        self.microbatches = microbatches
+        self.stage = stage
+        self.head_module = head_module
+        self.rank = rank
+        self.world = world
+        self.head_context = (
+            nullcontext
+            if autocast_dtype is None
+            else partial(torch.autocast, "cuda", dtype=autocast_dtype)
+        )
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt_ids: torch.Tensor,
+        max_new_tokens: int = 128,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        eos_token_id: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Sample a continuation of ``prompt_ids`` ``(B, S)`` across the stages.
+
+        Cached decode: one token per step, so the pipeline boundary shape is
+        constant, which is what ``PipelineStage`` freezes. Every rank must call
+        this the same number of times with the same shapes.
+        """
+        device = prompt_ids.device
+        last = self.world - 1
+        rows, prompt_len = prompt_ids.shape
+        total = prompt_len + max_new_tokens
+        was_training = self.head_module.training
+        self.head_module.eval()
+        generator = generator or self.generator(device)
+
+        chunks = self.microbatches or rows
+        if rows % chunks:
+            raise ValueError(f"{rows} rows do not split into {chunks} microbatches")
+        per_chunk = rows // chunks
+        caches = [
+            KVCache.from_config(
+                self.head_module.config,
+                batch_size=per_chunk,
+                max_length=total,
+                device=device,
+                dtype=self.head_module.boundary_dtype or torch.bfloat16,
+            )
+            for _ in range(chunks)
+        ]
+        self.head_module.set_cache(caches)
+        schedule = build_schedule(self.stage, chunks, loss_fn=None, kind="gpipe")
+        try:
+            tokens = prompt_ids.clone()
+            for pos in range(total - 1):
+                # `clone`, not `contiguous`: a one-element slice reports itself
+                # contiguous while keeping the source row stride.
+                step = tokens[:, pos : pos + 1].clone(
+                    memory_format=torch.contiguous_format
+                )
+                hidden = schedule.step(step) if self.rank == 0 else schedule.step()
+                if pos < prompt_len - 1:
+                    continue
+                nxt = torch.zeros(rows, 1, dtype=torch.long, device=device)
+                if self.rank == last and hidden is not None:
+                    # The head sits outside the stage forward the schedule wraps.
+                    with self.head_context():
+                        logits = self.head_module.head.logits(hidden[:, -1]).float()
+                    nxt = self._choose(
+                        logits,
+                        generator,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        min_p=min_p,
+                    )
+                if dist.is_available() and dist.is_initialized():
+                    dist.broadcast(nxt, src=last)
+                tokens = torch.cat([tokens, nxt], dim=1)
+                if eos_token_id is not None and (nxt == eos_token_id).all():
+                    break
+        finally:
+            self.head_module.set_cache(None)
+            self.head_module.train(was_training)
+        return tokens
+
+
+def build_generator(
+    backbone=None, stage=None, head_module=None, rank: int = 0, world: int = 1, **kwargs
+) -> Generator:
+    """Select the engine once, at build time, from whether a stage was given."""
+    if stage is None:
+        if backbone is None:
+            raise ValueError("a whole-model generator needs `backbone`")
+        return LocalGenerator(backbone, **kwargs)
+    if head_module is None:
+        raise ValueError("a pipeline generator needs `head_module`")
+    return PipelineGenerator(stage, head_module, rank, world, **kwargs)
