@@ -30,6 +30,7 @@ from kohakuwullm.kernels.moe.moe_dispatch import (
     combine_routed_reference,
 )
 from kohakuwullm.kernels.moe.router import fused_router
+from kohakuwullm.kernels.optim.adamw16 import adamw16_step
 from kohakuwullm.models.components.moe import TopKRouter
 
 pytestmark = pytest.mark.skipif(
@@ -444,3 +445,27 @@ def test_fused_router_auxiliary_losses_match_eager(dtype, score_func, kwargs):
     fused.aux_loss_weight = fused.z_loss_weight = 0.0
     _, _, plain_gw = _router_backward(fused, x0, grad)
     assert rel_error(got_gw, plain_gw) > 0.2, "the auxiliary term changed nothing"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_eager_fallback_tracks_the_triton_kernel(dtype):
+    """The CPU path is the same update, not a second optimizer."""
+    torch.manual_seed(0)
+    p0 = torch.randn(4096, dtype=dtype)
+    g0 = torch.randn(4096, dtype=dtype) * 1e-3
+
+    def run(device):
+        state = [
+            p0.to(device).clone(),
+            g0.to(device).clone(),
+            torch.zeros(4096, dtype=dtype, device=device),
+            torch.zeros(4096, dtype=dtype, device=device),
+        ]
+        for step in range(1, 6):
+            adamw16_step(*state, step, 1e-3, weight_decay=0.1)
+        return state[0].cpu().float()
+
+    gpu, cpu = run("cuda"), run("cpu")
+    # One ULP of the 16-bit state, compounded over five steps.
+    tol = 1e-6 if dtype is torch.float32 else 4e-3
+    assert (gpu - cpu).abs().max() < tol

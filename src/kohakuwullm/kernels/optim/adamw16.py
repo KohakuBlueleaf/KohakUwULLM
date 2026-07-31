@@ -69,6 +69,32 @@ def _adamw16_kernel(
     tl.store(r_ptr + offs, r_new.to(r_ptr.dtype.element_ty), mask=mask)
 
 
+def _adamw16_eager(
+    param: torch.Tensor,
+    grad: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_rms: torch.Tensor,
+    step: int,
+    lr: float,
+    betas: tuple[float, float],
+    eps: float,
+    weight_decay: float,
+) -> None:
+    """The same update in torch ops, for devices Triton does not serve."""
+    beta1, beta2 = betas
+    g = grad.float()
+    p = param.float()
+    m = exp_avg.float().lerp_(g, 1.0 - beta1)
+    r_new = (
+        exp_avg_rms.float().square_().mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
+    ).sqrt_()
+    denom = r_new.mul(1.0 / (1.0 - beta2**step) ** 0.5).add_(eps)
+    update = m.div(1.0 - beta1**step).div_(denom)
+    param.copy_(p.sub_(update.add_(p, alpha=weight_decay), alpha=lr))
+    exp_avg.copy_(m)
+    exp_avg_rms.copy_(r_new)
+
+
 def adamw16_step(
     param: torch.Tensor,
     grad: torch.Tensor,
@@ -95,6 +121,11 @@ def adamw16_step(
             raise ValueError(f"{name} shape {t.shape} != param {param.shape}")
 
     beta1, beta2 = betas
+    if not param.is_cuda:
+        _adamw16_eager(
+            param, grad, exp_avg, exp_avg_rms, step, lr, betas, eps, weight_decay
+        )
+        return
     n = param.numel()
     grid = lambda meta: (triton.cdiv(n, meta["BLOCK"]),)  # noqa: E731
     _adamw16_kernel[grid](
