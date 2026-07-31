@@ -45,31 +45,8 @@ class LMBackbone(nn.Module):
             original_context=config.max_position,
         )
 
-        attn_kwargs = {
-            "qk_norm": config.qk_norm,
-            "qk_norm_affine": config.qk_norm_affine,
-            "bias": config.attn_bias,
-            "sink": config.attn_sink,
-        }
-        moe_flags = config.moe_layers
         self.blocks = nn.ModuleList(
-            DecoderBlock(
-                config.dim,
-                config.heads,
-                kv_heads=config.kv_heads,
-                head_dim=config.head_dim,
-                norm=config.norm,
-                mlp=self._mlp_spec(config, moe_flags[i]),
-                attn=config.attn_for(i),
-                mlp_ratio=config.moe_ratio if moe_flags[i] else config.mlp_ratio,
-                mlp_kwargs=self._mlp_kwargs(config, moe_flags[i]),
-                attn_kwargs=attn_kwargs,
-                sliding_window=config.window_for(i),
-                post_norm=config.post_norm,
-                residual_scale=config.residual_scale,
-                norm_eps=config.norm_eps,
-            )
-            for i in range(config.depth)
+            self.build_block(config, i) for i in range(config.depth)
         )
         self.final_norm = build(config.norm, NORM, dim=config.dim, eps=config.norm_eps)
         self.head = LMHead(
@@ -81,7 +58,9 @@ class LMBackbone(nn.Module):
             soft_cap=config.logit_soft_cap,
             **(head_kwargs or {}),
         )
-        self.moe_blocks = [b for b, is_moe in zip(self.blocks, moe_flags) if is_moe]
+        self.moe_blocks = [
+            b for b, is_moe in zip(self.blocks, config.moe_layers) if is_moe
+        ]
         self.initialize_weights()
         # After `initialize_weights`, never before: the swap copies what the
         # scaled init produced.
@@ -90,6 +69,37 @@ class LMBackbone(nn.Module):
         self.mxfp8_modules: tuple[str, ...] = ()
         if config.mxfp8:
             self._swap_to_mxfp8()
+
+    @staticmethod
+    def build_block(config: LMArchConfig, index: int) -> DecoderBlock:
+        """One decoder block with layer ``index``'s properties.
+
+        The single place a block is constructed, so anything that needs one in
+        isolation -- the split autotuner, a probe -- builds what the model does.
+        See docs/internals/pipeline.md.
+        """
+        is_moe = config.moe_layers[index]
+        return DecoderBlock(
+            config.dim,
+            config.heads,
+            kv_heads=config.kv_heads,
+            head_dim=config.head_dim,
+            norm=config.norm,
+            mlp=LMBackbone._mlp_spec(config, is_moe),
+            attn=config.attn_for(index),
+            mlp_ratio=config.moe_ratio if is_moe else config.mlp_ratio,
+            mlp_kwargs=LMBackbone._mlp_kwargs(config, is_moe),
+            attn_kwargs={
+                "qk_norm": config.qk_norm,
+                "qk_norm_affine": config.qk_norm_affine,
+                "bias": config.attn_bias,
+                "sink": config.attn_sink,
+            },
+            sliding_window=config.window_for(index),
+            post_norm=config.post_norm,
+            residual_scale=config.residual_scale,
+            norm_eps=config.norm_eps,
+        )
 
     @staticmethod
     def _mlp_spec(config: LMArchConfig, is_moe: bool):
