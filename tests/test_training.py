@@ -1479,3 +1479,38 @@ def test_scaler_state_survives_a_round_trip():
     assert restored.scale_value == scaler.scale_value == 32768.0
     assert restored.clean_steps == 1
     assert restored.overflows == 1
+
+
+def test_target_reaches_loss_with_its_structure_intact():
+    """``loss(hidden, batch)``: the batch is whatever the step carried.
+
+    torch's schedule splits a target with ``tensor_split``, so a tuple or dict
+    raises ``AttributeError: 'tuple' object has no attribute 'size'``. The batch
+    never crosses a rank -- only the last stage reads it -- so it is split here
+    and the schedule is handed an index instead.
+    """
+    from kohakuwupipe.training.loop import split_target
+
+    batch = {
+        "velocity": torch.arange(8.0).view(8, 1),
+        "weight": torch.ones(8),
+        "scheme": "flow",
+    }
+    pieces = split_target(batch, 4)
+    assert len(pieces) == 4
+    assert [tuple(p["velocity"].shape) for p in pieces] == [(2, 1)] * 4
+    assert torch.equal(pieces[2]["velocity"].flatten(), torch.tensor([4.0, 5.0]))
+    # A non-tensor leaf is config, not data: every microbatch gets it whole.
+    assert all(p["scheme"] == "flow" for p in pieces)
+
+    nested = (torch.arange(4.0), [torch.arange(4.0), None])
+    parts = split_target(nested, 2)
+    assert isinstance(parts[0], tuple) and isinstance(parts[0][1], list)
+    assert torch.equal(parts[1][0], torch.tensor([2.0, 3.0]))
+    assert parts[0][1][1] is None
+
+    # The control: this is what the schedule would have done, and why it can't.
+    from torch.distributed.pipelining.microbatch import TensorChunkSpec, _split_tensor
+
+    with pytest.raises(AttributeError):
+        _split_tensor(batch, TensorChunkSpec(0), 4)

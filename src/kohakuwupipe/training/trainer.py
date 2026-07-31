@@ -82,11 +82,17 @@ class PipelineTrainer:
             optimizers if isinstance(optimizers, tuple) else (optimizers, None)
         )
         self.optimizer = optimizer
+        # One list, shared with the loop, which refills it every step.
+        pieces: list = [None] * num_microbatches
         self.schedule = SCHEDULES[schedule](
             stage,
             n_microbatches=num_microbatches,
             loss_fn=build_loss_fn(
-                stage_module, lambda: self._denom, num_microbatches, scaler
+                stage_module,
+                lambda: self._denom,
+                num_microbatches,
+                scaler,
+                pieces,
             ),
             scale_grads=False,
         )
@@ -104,6 +110,7 @@ class PipelineTrainer:
             post_step=module.post_step,
             callbacks=self.callbacks.callbacks,
         )
+        self.loop.target_pieces = pieces
         self.loop.trainer = self
         self.loop.module = module
         # One list, not two copies: a callback appended after construction has to

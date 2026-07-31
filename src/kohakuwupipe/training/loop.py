@@ -27,8 +27,9 @@ class MicrobatchStep(Protocol):
     ``trained`` is what the loss is normalized by.
 
     Neither is examined here: ``inputs`` goes to the stage and ``target`` to
-    ``loss``. ``target`` need not be labels, but it must be a tensor or ``None``
-    -- the schedule splits it along dim 0. See docs/kohakuwupipe/module.md.
+    ``loss``. A tuple ``inputs`` is the first stage's argument list, so a model
+    conditioned on more than one tensor passes them there. ``target`` must be a
+    single tensor or ``None``. See docs/kohakuwupipe/module.md.
     """
 
     inputs: Any
@@ -102,6 +103,9 @@ class PipelineLoop:
         self.global_step = 0
         self.epoch = 0
         self.max_steps = 0
+        # This step's target, one entry per microbatch. Held, never sent.
+        self.target_pieces: list = [None] * num_microbatches
+        self._index = None
         # Python ints: a run passes 2^31 tokens in under an hour.
         self.tokens_seen = 0
         self.tokens_trained = 0
@@ -126,9 +130,12 @@ class PipelineLoop:
         losses = [] if self.is_last else None
         self.callbacks.call("on_before_backward", self)
         if self.is_first:
-            self.schedule.step(batch.inputs)
+            # A tuple is the stage's argument list, not one argument.
+            args = batch.inputs if isinstance(batch.inputs, tuple) else (batch.inputs,)
+            self.schedule.step(*args)
         elif self.is_last:
-            self.schedule.step(target=batch.target, losses=losses)
+            self.target_pieces[:] = split_target(batch.target, self.num_microbatches)
+            self.schedule.step(target=self._target_index(), losses=losses)
         else:
             self.schedule.step()
         self.callbacks.call("on_after_backward", self)
@@ -240,6 +247,13 @@ class PipelineLoop:
         self.callbacks.call("on_validation_epoch_end", self)
         self.callbacks.call("on_validation_end", self)
 
+    def _target_index(self) -> torch.Tensor:
+        """``arange(num_microbatches)``, the handle the schedule splits for us."""
+        if self._index is None:
+            device = next(self.stage_module.parameters()).device
+            self._index = torch.arange(self.num_microbatches, device=device)
+        return self._index
+
     def elapsed(self) -> float:
         """Training wall-clock, excluding the gap between a crash and a restart."""
         if self._clock_start is None:
@@ -266,11 +280,32 @@ class PipelineLoop:
     run = fit
 
 
+def split_target(target, chunks: int) -> list:
+    """``target`` split into ``chunks`` microbatch pieces, whatever its structure.
+
+    Tensors split along dim 0; tuples, lists and dicts split element-wise and
+    keep their type; anything else rides along whole, once per microbatch.
+    See docs/kohakuwupipe/module.md.
+    """
+    if target is None:
+        return [None] * chunks
+    if torch.is_tensor(target):
+        return list(torch.tensor_split(target, chunks))
+    if isinstance(target, dict):
+        parts = {key: split_target(value, chunks) for key, value in target.items()}
+        return [{key: value[i] for key, value in parts.items()} for i in range(chunks)]
+    if isinstance(target, (tuple, list)):
+        parts = [split_target(value, chunks) for value in target]
+        return [type(target)(part[i] for part in parts) for i in range(chunks)]
+    return [target] * chunks
+
+
 def build_loss_fn(
     stage_module,
     denom: Callable[[], int],
     num_microbatches: int = 1,
     scaler=None,
+    pieces: list | None = None,
 ) -> Callable:
     """A schedule ``loss_fn`` that normalizes by the step's trained tokens.
 
@@ -286,7 +321,9 @@ def build_loss_fn(
 
     def loss_fn(output, target):
         streams = split_streams(output)
-        loss, _ = stage_module.loss(streams[0], target)
+        # `target` is the microbatch index; the batch itself never left the rank.
+        batch = target if pieces is None else pieces[int(target)]
+        loss, _ = stage_module.loss(streams[0], batch)
         loss = loss / max(denom(), 1)
         for stream in streams[1:]:
             if stream is not None and stream.shape[-1] == 1:
