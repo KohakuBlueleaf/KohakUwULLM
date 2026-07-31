@@ -1,6 +1,11 @@
 """The module, the trainer, the loop, its hooks, and the stock callbacks."""
 
-from kohakuwupipe.training.callbacks import Checkpoint, LossLog, Throughput
+from kohakuwupipe.training.callbacks import (
+    Checkpoint,
+    LossLog,
+    ProgressBar,
+    Throughput,
+)
 from kohakuwupipe.training.hooks import Callback, CallbackList
 from kohakuwupipe.training.loop import (
     MicrobatchStep,
@@ -18,6 +23,7 @@ __all__ = [
     "CallbackList",
     "Checkpoint",
     "LossLog",
+    "ProgressBar",
     "MicrobatchStep",
     "PipelineLoop",
     "PipelineModule",

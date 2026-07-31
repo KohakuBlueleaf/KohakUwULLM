@@ -18,7 +18,12 @@ from kohakuwupipe.parallel.plan import (
     plan_from_layers,
     plan_stages,
 )
-from kohakuwupipe.training.callbacks import Checkpoint, LossLog, Throughput
+from kohakuwupipe.training.callbacks import (
+    Checkpoint,
+    LossLog,
+    ProgressBar,
+    Throughput,
+)
 from kohakuwupipe.training.hooks import Callback, CallbackList
 from kohakuwupipe.training.loop import PipelineLoop, StepOutput, build_loss_fn
 from kohakuwupipe.training.module import PipelineModule
@@ -34,6 +39,7 @@ __all__ = [
     "CallbackList",
     "Checkpoint",
     "LossLog",
+    "ProgressBar",
     "PipelineLoop",
     "PipelineModule",
     "PipelineRanks",

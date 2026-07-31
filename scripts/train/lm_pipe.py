@@ -34,6 +34,7 @@ from kohakuwupipe import (
     LossLog,
     PipelineGradScaler,
     PipelineTrainer,
+    ProgressBar,
     Throughput,
     describe,
     get_logger,
@@ -112,8 +113,12 @@ CKPT_INTERVAL = 5000
 NAME = "lm-pipe"
 WANDB_PROJECT = ""
 WANDB_OFFLINE = True
-LOG_INTERVAL = 10
-THROUGHPUT_INTERVAL = 50
+# Metric cadence, in steps. 1 sends every step to W&B; the progress bar owns
+# stdout, and CONSOLE_INTERVAL is how often a full line reaches the log file.
+LOG_INTERVAL = 1
+THROUGHPUT_INTERVAL = 1
+CONSOLE_INTERVAL = 200
+PROGRESS_BAR = True
 SAMPLE_INTERVAL = 0
 SAMPLE_PROMPTS: list | None = None
 
@@ -178,7 +183,11 @@ def build_stream(ranks, tokenizer):
 
 
 def build_reporter(name: str):
-    """A metrics sink for the interval callbacks: the log, plus W&B on rank 0."""
+    """A metrics sink for rank 0: W&B every call, the log on ``CONSOLE_INTERVAL``.
+
+    The progress bar owns stdout, so the log line is what survives in the file
+    and is deliberately rarer than the W&B point.
+    """
     run = None
     if WANDB_PROJECT:
         import wandb
@@ -190,9 +199,11 @@ def build_reporter(name: str):
         )
 
     def report(row: dict) -> None:
-        log.info("metrics", **row)
+        step = int(row.get("step", 0))
         if run is not None:
-            run.log({k: v for k, v in row.items() if k != "step"}, step=row["step"])
+            run.log({k: v for k, v in row.items() if k != "step"}, step=step)
+        if CONSOLE_INTERVAL > 0 and step % CONSOLE_INTERVAL == 0:
+            log.info("metrics", **row)
 
     return report
 
@@ -260,6 +271,8 @@ def main() -> None:
         Throughput(every_n_steps=THROUGHPUT_INTERVAL, warmup_steps=8, report=report),
         LossLog(every_n_steps=LOG_INTERVAL, report=report),
     ]
+    if PROGRESS_BAR:
+        callbacks.append(ProgressBar())
     if CKPT_DIR:
         callbacks.append(
             Checkpoint(

@@ -4,11 +4,13 @@ Every one is interval-gated, because reading a device tensor costs a
 synchronization and the loop deliberately leaves them unread. See docs/kohakuwupipe/loop.md.
 """
 
+import math
 import os
 import time
 
 import torch
 import torch.distributed as dist
+from tqdm.auto import tqdm
 
 from kohakuwupipe.io import checkpoint
 from kohakuwupipe.training.hooks import Callback
@@ -54,13 +56,25 @@ class Throughput(Callback):
         _sync()
         elapsed = time.perf_counter() - self._start
         steps = max(self._steps, 1)
+        run = max(loop.elapsed(), 1e-9)
         if loop.rank == 0:
+            rate = self._seen / max(elapsed, 1e-9)
+            trained_rate = self._trained / max(elapsed, 1e-9)
             self.report(
                 {
                     "step": out.index,
-                    "tokens_per_s": self._seen / max(elapsed, 1e-9),
-                    "trained_tokens_per_s": self._trained / max(elapsed, 1e-9),
+                    "tokens_per_s": rate,
+                    "trained_tokens_per_s": trained_rate,
                     "ms_per_step": 1e3 * elapsed / steps,
+                    "tokens_seen": loop.tokens_seen,
+                    "tokens_trained": loop.tokens_trained,
+                    "b_tokens_seen": loop.tokens_seen / 1e9,
+                    "b_tokens_trained": loop.tokens_trained / 1e9,
+                    "trained_frac": loop.tokens_trained / max(loop.tokens_seen, 1),
+                    "tokens_per_s_avg": loop.tokens_seen / run,
+                    "trained_tokens_per_s_avg": loop.tokens_trained / run,
+                    "b_tokens_per_day": rate * 86400 / 1e9,
+                    "b_trained_tokens_per_day": trained_rate * 86400 / 1e9,
                 }
             )
         self._reset()
@@ -94,10 +108,106 @@ class LossLog(Callback):
             if self.ema is None
             else (self.ema_decay * self.ema + (1 - self.ema_decay) * loss)
         )
-        row = {"step": out.index, "loss": loss, "loss_ema": self.ema}
+        row = {
+            "step": out.index,
+            "loss": loss,
+            "loss_ema": self.ema,
+            "ppl": math.exp(min(loss, 20.0)),
+        }
+        lrs = [group["lr"] for group in loop.optimizer.param_groups]
+        if lrs:
+            row["lr"] = max(lrs)
+            row["lr_min"] = min(lrs)
         row.update({k: float(v) for k, v in out.extra.items()})
         if loop.rank == 0:
             self.report(row)
+
+
+class ProgressBar(Callback):
+    """A tqdm bar on rank 0, updated every step, closed on exit.
+
+    Owns stdout for the run: metrics go to the postfix rather than to a new
+    line, so per-step logging costs one line total. Anything that must print
+    while it is open should go through :meth:`write`.
+
+    Args:
+        postfix: ``StepOutput.extra`` keys to show, beyond loss and tokens.
+        report: also called with each row, for a metrics sink.
+    """
+
+    def __init__(
+        self,
+        postfix: tuple[str, ...] = ("moe/load_imbalance_max", "scale"),
+        report=None,
+        ema: float = 0.9,
+    ):
+        self.postfix = postfix
+        self.report = report
+        self.ema_decay = ema
+        self.ema = None
+        self.bar = None
+
+    def on_train_start(self, loop: PipelineLoop) -> None:
+        if loop.rank:
+            return
+        self.bar = tqdm(
+            total=loop.max_steps or None,
+            initial=loop.global_step,
+            unit="step",
+            desc="train",
+            dynamic_ncols=True,
+            # Redirected to a file, every step's redraw would be a line in it.
+            disable=None,
+        )
+
+    def on_train_batch_end(
+        self, loop: PipelineLoop, out: StepOutput, batch=None, batch_idx=0
+    ) -> None:
+        if self.bar is None:
+            return
+        self.bar.n = min(out.index, self.bar.total or out.index)
+        fields = {"tok": _human(loop.tokens_trained)}
+        if out.loss is not None:
+            loss = float(out.loss)
+            self.ema = (
+                loss
+                if self.ema is None
+                else self.ema_decay * self.ema + (1 - self.ema_decay) * loss
+            )
+            fields["loss"] = f"{loss:.4f}"
+            fields["ema"] = f"{self.ema:.4f}"
+        for key in self.postfix:
+            if key in out.extra:
+                fields[key.rsplit("/", 1)[-1]] = f"{float(out.extra[key]):.3g}"
+        self.bar.set_postfix(fields, refresh=True)
+        if self.report is not None:
+            self.report(dict(fields, step=out.index))
+
+    def write(self, message: str) -> None:
+        """Print without breaking the bar."""
+        if self.bar is None:
+            print(message)
+        else:
+            self.bar.write(message)
+
+    def on_train_end(self, loop: PipelineLoop) -> None:
+        self._close()
+
+    def on_exception(self, loop: PipelineLoop, exception: BaseException) -> None:
+        self._close()
+
+    def _close(self) -> None:
+        if self.bar is not None:
+            self.bar.close()
+            self.bar = None
+
+
+def _human(count: int) -> str:
+    """A token count as a short human string."""
+    for limit, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if count >= limit:
+            return f"{count / limit:.2f}{suffix}"
+    return str(count)
 
 
 class Checkpoint(Callback):
@@ -136,6 +246,7 @@ class Checkpoint(Callback):
             loop.global_step,
             loop.rank,
             block_attr=self.block_attr,
+            extra={"progress": loop.progress_state()},
         )
 
 

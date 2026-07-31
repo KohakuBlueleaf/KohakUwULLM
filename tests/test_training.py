@@ -619,16 +619,29 @@ def test_throughput_window_is_trailing_so_one_slow_step_does_not_persist():
     # reset@0, report@1 over 10 s, reset, report@2 over 1 s, reset.
     clock = iter([0.0, 10.0, 10.0, 11.0, 11.0])
     callback = Throughput(every_n_steps=1, warmup_steps=0, report=rows.append)
-    loop = types.SimpleNamespace(rank=0)
+    # The run clock is separate from the window clock, and must not consume it.
+    loop = types.SimpleNamespace(
+        rank=0, tokens_seen=0, tokens_trained=0, elapsed=lambda: 20.0
+    )
 
     with mock.patch.object(time, "perf_counter", lambda: next(clock)):
-        callback.on_train_batch_end(loop, _throughput_step(0))
-        callback.on_train_batch_end(loop, _throughput_step(1))
-        callback.on_train_batch_end(loop, _throughput_step(2))
+        for index in range(3):
+            loop.tokens_seen += 1000
+            loop.tokens_trained += 800
+            callback.on_train_batch_end(loop, _throughput_step(index))
 
     # 1000 tokens over 10 s, then 1000 over 1 s: the slow window must not bleed.
     assert rows[0]["tokens_per_s"] == pytest.approx(100.0)
     assert rows[1]["tokens_per_s"] == pytest.approx(1000.0)
+
+    # Cumulative counts are totals, not per-window, so they must keep climbing
+    # while the trailing rate above swings 10x.
+    assert rows[0]["tokens_seen"] == 2000
+    assert rows[1]["tokens_seen"] == 3000
+    assert rows[1]["tokens_trained"] == 2400
+    assert rows[1]["trained_frac"] == pytest.approx(0.8)
+    assert rows[1]["tokens_per_s_avg"] == pytest.approx(3000 / 20.0)
+    assert rows[1]["b_tokens_per_day"] == pytest.approx(1000.0 * 86400 / 1e9)
 
 
 def _throughput_step(index: int):
