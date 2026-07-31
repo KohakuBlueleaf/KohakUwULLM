@@ -261,13 +261,18 @@ class LMPipelineModule(PipelineModule):
             return optimizer
         return optimizer, AnySchedule(optimizer, config=self.scheduler_config)
 
+    def loss(self, hidden: torch.Tensor, target):
+        """The head's objective. Lives here so the module owns the whole step."""
+        return self.stage_module.loss(hidden, target)
+
     def set_seq_info(self, layout) -> None:
         self.stage_module.set_seq_info(layout)
 
     def training_step(self, batch, batch_idx: int) -> None:
-        """Check once that every rank drew the same step."""
+        """Check once that every rank drew the same step, then run the model."""
         if batch_idx == 0 and self.verify_data:
             verify_same_batch(batch)
+        self.forward_backward(batch.inputs, batch.target)
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:
         """Add the loader's stream position. Collective: every rank must call."""
