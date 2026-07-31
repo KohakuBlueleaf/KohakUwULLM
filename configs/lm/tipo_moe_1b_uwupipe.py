@@ -55,10 +55,12 @@ NUM_MICROBATCHES = 16
 # [5,4,4,3] measured 13% slower here than the [5,5,5,1] measurement derives.
 LAYERS = []
 SCHEDULE = "1f1b"
-PARAM_DTYPE = "bf16"
-AUTOCAST_DTYPE = "bf16"
+PARAM_DTYPE = "fp16"
+AUTOCAST_DTYPE = "fp16"
 MXFP8 = True
 
+# Muon on the hidden matrices; its non-matrix group is AdamW over the 16-bit
+# kernel, which is what makes it fp16-safe. See docs/internals/optimizers.md.
 OPTIMIZER = "muon"
 OPTIMIZER_KWARGS = {"muon_lr": 2e-3, "embed_lr": 2e-3}
 LR = 5e-4

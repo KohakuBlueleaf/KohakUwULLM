@@ -32,6 +32,7 @@ from kohakuwullm.utils import autofill_schedule_steps
 from kohakuwupipe import (
     Checkpoint,
     LossLog,
+    PipelineGradScaler,
     PipelineTrainer,
     Throughput,
     describe,
@@ -93,6 +94,10 @@ OPTIMIZER = "muon"
 OPTIMIZER_KWARGS: dict = {"muon_lr": 2e-3, "embed_lr": 2e-3}
 LR = 5e-4
 GRAD_CLIP = 1.0
+# fp16 gradients underflow without it. Auto: on for fp16 params or autocast.
+# See docs/kohakuwupipe/scaler.md.
+GRAD_SCALER = "auto"
+GRAD_SCALER_INIT = 65536.0
 SCHEDULER_CONFIG: dict = {"lr": {"mode": "cosine", "min_value": 0.1, "end": -1}}
 SCHED_WARMUP_RATIO = 0.02
 MAX_STEPS = 32
@@ -274,6 +279,13 @@ def main() -> None:
                 every_n_steps=SAMPLE_INTERVAL,
             )
         )
+    scaling = (
+        "fp16" in (PARAM_DTYPE, AUTOCAST_DTYPE)
+        if GRAD_SCALER == "auto"
+        else bool(GRAD_SCALER)
+    )
+    if ranks.rank == 0 and scaling:
+        log.info("loss scaling on", init_scale=GRAD_SCALER_INIT)
     trainer = PipelineTrainer(
         module,
         ranks,
@@ -282,6 +294,7 @@ def main() -> None:
         num_microbatches=NUM_MICROBATCHES,
         schedule=SCHEDULE,
         grad_clip=GRAD_CLIP,
+        scaler=PipelineGradScaler(enabled=scaling, init_scale=GRAD_SCALER_INIT),
         callbacks=callbacks,
     )
     if CHECKPOINT_PATH:
