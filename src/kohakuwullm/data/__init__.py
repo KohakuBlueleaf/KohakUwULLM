@@ -1,0 +1,231 @@
+"""Data package: record sources, prompt rendering, and varlen packing.
+
+``sources`` -> ``renderers`` -> ``packing``, over the ``loader`` plumbing that
+registers ``map`` / ``iterative`` / ``ddp`` / ``pipeline``. :func:`build_dataset`
+and :func:`build_loader` wire them from a config-shaped spec. See docs/internals/data.md.
+"""
+
+import bisect
+
+from kohakuwullm.data.loader.fast_loader import (
+    BatchRenderedDataset,
+    GroupSampler,
+    build_fast_loader,
+)
+from kohakuwullm.data.loader.iterative import (
+    TokenBudgetIterableDataset,
+    build_iterative_loader,
+    pack_to_budget,
+    shard_indices,
+)
+from kohakuwullm.data.loader.microbatch import (
+    MicroBatchedDataset,
+    MicroBatchedStep,
+    build_pipeline_loader,
+)
+from kohakuwullm.data.loader.padded import (
+    collate_padded,
+    padding_fraction,
+    split_padded,
+)
+from kohakuwullm.data.loader.resume import (
+    ResumableLoader,
+    ResumablePackedDataset,
+    build_ddp_loader,
+    resolve_rank_world,
+)
+from kohakuwullm.data.packing import (
+    IGNORE_INDEX,
+    PackedBatch,
+    RenderedDataset,
+    WeightedConcatDataset,
+    collate_packed,
+    encode_sample,
+    split_packed,
+)
+from kohakuwullm.data.renderers.tipo import SPECIAL_TOKENS, TIPORenderer
+from kohakuwullm.data.sources.vault import (
+    DEFAULT_ROOT,
+    PATH_KEYED,
+    DanbooruRecords,
+    PathKeyedRecords,
+    load_records,
+)
+from kohakuwullm.registry import LOADER, RENDERER, build
+
+
+def build_dataset(
+    sources: list[dict],
+    tokenizer,
+    renderer="tipo",
+    root: str = DEFAULT_ROOT,
+    max_length: int = 2048,
+    seed: int = 0,
+):
+    """Build the training dataset from a list of source specs.
+
+    Each entry is ``{"name": "danbooru", "repeat": 3, **source_kwargs}``, where
+    the repeat is a re-render rather than a duplicate.
+    """
+    render_fn = build(renderer, RENDERER)
+    datasets, repeats = [], []
+    for spec in sources:
+        opts = dict(spec)
+        name = opts.pop("name")
+        repeat = int(opts.pop("repeat", 1))
+        records = load_records(name, root=root, **opts)
+        datasets.append(
+            RenderedDataset(
+                records, render_fn, tokenizer, max_length=max_length, seed=seed
+            )
+        )
+        repeats.append(repeat)
+    if len(datasets) == 1 and repeats[0] == 1:
+        return datasets[0]
+    return WeightedConcatDataset(datasets, repeats)
+
+
+class _ConcatRepeated:
+    """Indexable view over several record sources with per-source repeats.
+
+    A view, not a list: the sources are lazy and must stay that way. A repeat
+    lists the source again rather than duplicating its records. See docs/internals/data.md.
+    """
+
+    def __init__(self, sources: list[dict], root: str) -> None:
+        self.parts = []
+        bounds = [0]
+        for spec in sources:
+            opts = dict(spec)
+            name = opts.pop("name")
+            repeat = int(opts.pop("repeat", 1))
+            source = load_records(name, root=root, **opts)
+            for _ in range(repeat):
+                self.parts.append(source)
+                bounds.append(bounds[-1] + len(source))
+        self.bounds = bounds
+
+    def __len__(self) -> int:
+        return self.bounds[-1]
+
+    def __getitem__(self, index: int):
+        if index < 0:
+            index += len(self)
+        part = bisect.bisect_right(self.bounds, index) - 1
+        return self.parts[part][index - self.bounds[part]]
+
+
+def build_records(sources: list[dict], root: str = DEFAULT_ROOT):
+    """Indexable record view for the iterative loader, honouring repeats."""
+    return _ConcatRepeated(sources, root)
+
+
+def build_loader(
+    kind,
+    sources: list[dict],
+    tokenizer,
+    renderer="tipo",
+    root: str = DEFAULT_ROOT,
+    **kwargs,
+):
+    """Resolve a loader by name and build it against ``sources``.
+
+    ``kind`` may be a registered name or a callable. Not ``build``: these are
+    factories to call, not components to instantiate from a spec.
+    """
+    factory = LOADER.get(kind) if isinstance(kind, str) else kind
+    return factory(sources, tokenizer, renderer=renderer, root=root, **kwargs)
+
+
+@LOADER.register("iterative")
+def _iterative_loader(sources, tokenizer, renderer="tipo", root=DEFAULT_ROOT, **kwargs):
+    """Token-budget varlen batches, single process."""
+    return build_iterative_loader(
+        build_records(sources, root=root),
+        build(renderer, RENDERER),
+        tokenizer,
+        **kwargs,
+    )
+
+
+@LOADER.register("ddp")
+def _ddp_loader(sources, tokenizer, renderer="tipo", root=DEFAULT_ROOT, **kwargs):
+    """Token-budget varlen batches, one disjoint shard per rank, resumable."""
+    return build_ddp_loader(
+        build_records(sources, root=root),
+        build(renderer, RENDERER),
+        tokenizer,
+        **kwargs,
+    )
+
+
+@LOADER.register("pipeline")
+def _pipeline_loader(sources, tokenizer, renderer="tipo", root=DEFAULT_ROOT, **kwargs):
+    """Fixed-size microbatch steps for a pipeline schedule, resumable."""
+    return build_pipeline_loader(
+        build_records(sources, root=root),
+        build(renderer, RENDERER),
+        tokenizer,
+        **kwargs,
+    )
+
+
+@LOADER.register("map")
+def _map_loader(
+    sources,
+    tokenizer,
+    renderer="tipo",
+    root=DEFAULT_ROOT,
+    max_length: int = 2048,
+    seed: int = 0,
+    layout: str = "packed",
+    **kwargs,
+):
+    """Map-style, fixed sample count per batch; the measured-best online loader."""
+    return build_fast_loader(
+        build_records(sources, root=root),
+        build(renderer, RENDERER),
+        tokenizer,
+        max_length=max_length,
+        seed=seed,
+        layout=layout,
+        **kwargs,
+    )
+
+
+__all__ = [
+    "build_dataset",
+    "build_loader",
+    "build_records",
+    "load_records",
+    "DanbooruRecords",
+    "PathKeyedRecords",
+    "PATH_KEYED",
+    "DEFAULT_ROOT",
+    "TIPORenderer",
+    "SPECIAL_TOKENS",
+    "RenderedDataset",
+    "WeightedConcatDataset",
+    "PackedBatch",
+    "collate_packed",
+    "collate_padded",
+    "build_fast_loader",
+    "build_iterative_loader",
+    "build_ddp_loader",
+    "build_pipeline_loader",
+    "ResumableLoader",
+    "ResumablePackedDataset",
+    "resolve_rank_world",
+    "MicroBatchedDataset",
+    "MicroBatchedStep",
+    "TokenBudgetIterableDataset",
+    "pack_to_budget",
+    "shard_indices",
+    "BatchRenderedDataset",
+    "GroupSampler",
+    "split_padded",
+    "padding_fraction",
+    "encode_sample",
+    "split_packed",
+    "IGNORE_INDEX",
+]
