@@ -1,34 +1,64 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "uwul"
-version = "0.1.0"
-description = "UwU LLM training codebase."
+name = "kohakuwullm"
+version = "0.2.0"
+description = "KohakUwULLM -- an extensible decoder-only LLM training framework."
+authors = [
+    { name = "Shih-Ying Yeh(KohakuBlueLeaf)", email = "apolloyeh0123@gmail.com" },
+]
+license = { file = "LICENSE.md" }
 readme = "README.md"
-license = { file="LICENSE" }
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
-    "torch",
-    "torchdata", # For stateful dataloader
-    "datasets",  # For datasets framework from HF
+    # torch>=2.13 is required: this package calls F.linear_cross_entropy and
+    # torch.nn.attention.varlen.varlen_attn directly, both new in 2.13.
+    "torch>=2.13",
+    "triton>=3.7",
+    "numpy",
+    "safetensors",
+    # training stack (same as KohakuLatentMaid)
     "lightning",
-    "wandb",  # For Wandb logger
+    "anyschedule",
+    "optimfactory",
+    "kohaku-engine",
+    "wandb",
+    # tokenizer + data
     "transformers",
-    "warmup_scheduler",
-    "omegaconf",
-    "matplotlib",
-    "sentencepiece",
-    "einops",
+    "tokenizers",
+    "kohakuvault",
+    "tqdm",
 ]
+urls = { "Homepage" = "https://github.com/KohakuBlueleaf/KohakUwULLM" }
 
 [project.optional-dependencies]
-
+dev = ["pytest", "black", "ruff"]
+bench = ["matplotlib"]
 
 [tool.setuptools]
-package-dir = {"" = "src"}
-include-package-data = true
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 88
+target-version = ["py313"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

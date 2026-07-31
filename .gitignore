@@ -1,11 +1,17 @@
 # dataset
 *.parquet
+*_cache/
 
 # Logs
 wandb/
 temp/
 logs/
 models/
+!src/**/models
+out/
+ref/
+.claude/
+KohakUwULLM/
 
 # checkpoints
 *.pt
@@ -30,12 +36,12 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
+/build/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
+/.eggs/
 lib/
 lib64/
 parts/
