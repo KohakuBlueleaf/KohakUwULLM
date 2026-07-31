@@ -50,9 +50,9 @@ from kohakuwullm.models import LMBackbone, get_preset
 from kohakuwullm.models.components.seqinfo import SeqInfo
 from kohakuwullm.training.optim.build import build_optimizer
 from kohakuwullm.training.parallel.pipeline import (
-    describe_plan,
-    plan_stages,
+    plan_for,
 )
+from kohakuwupipe import describe
 
 BYTES_PER_PARAM_ADAMW = 4 + 4 + 4 + 2  # fp32 master + 2 moments + bf16 copy
 
@@ -194,9 +194,9 @@ def run_pipeline(config, args, device, rank, world, grad_ckpt=False):
     )
 
     config.grad_ckpt = grad_ckpt
-    plans = plan_stages(config, world, seq_len=args.mean_len)
+    plans = plan_for(config, world, seq_len=args.mean_len)
     if rank == 0:
-        print(describe_plan(plans, config), flush=True)
+        print(describe(plans), flush=True)
 
     n_micro = args.microbatches
     per_micro = args.tokens_per_step // n_micro

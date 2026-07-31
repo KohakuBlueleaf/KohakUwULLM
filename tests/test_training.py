@@ -34,7 +34,7 @@ from kohakuwullm.kernels.mxfp8.linear import MXFP8Linear
 from kohakuwullm.kernels.mxfp8.moe import MXFP8ExpertWeights
 from kohakuwullm.models.flops import FlopCounter, attended_pairs, document_lengths
 from kohakuwullm.models.mxfp8_swap import swap_mxfp8
-from kohakuwullm.training import LMStage, plan_stages
+from kohakuwullm.training import LMStage, plan_for
 from kohakuwullm.training.loop import trainer as trainer_module
 from kohakuwullm.training.loop.callbacks import SampleLogCallback, ThroughputCallback
 from kohakuwullm.training.loop.resume import load_rng_state, rng_state
@@ -46,7 +46,6 @@ from kohakuwullm.training.parallel.uwupipe import (
     batch_signature,
     corpus_steps,
     first_mismatch,
-    plan_for,
     verify_same_batch,
 )
 from kohakuwupipe.parallel.plan import partition
@@ -325,7 +324,7 @@ def test_stage_emits_the_declared_boundary_dtype_whatever_its_blocks_return():
     not a rank boundary, and casting it there would change the loss.
     """
     config = _cpu_config(tie_embeddings=False)
-    plans = plan_stages(config, 2)
+    plans = plan_for(config, 2)
     backbone = LMBackbone(config)
     tokens = torch.zeros(CTX, dtype=torch.long)
 
@@ -352,7 +351,7 @@ def _router_loss_stages(num_stages=2, **overrides):
     )
     config = _moe_config(**{**base, **overrides})
     backbone = LMBackbone(config, head_kwargs={"kernel": "torch"})
-    plans = plan_stages(config, num_stages)
+    plans = plan_for(config, num_stages)
     return config, backbone, [LMStage(backbone, plan) for plan in plans]
 
 
@@ -670,7 +669,7 @@ def _signature_step(tokens, labels):
 def test_preview_skips_a_pipeline_split_model():
     """No rank can generate when the model is split; say so once, don't emit garbage."""
     config = _cpu_config(tie_embeddings=False)
-    plans = plan_stages(config, 2)
+    plans = plan_for(config, 2)
     backbone = LMBackbone(config)
     module = types.SimpleNamespace(
         backbone=LMStage(backbone, plans[-1]),
@@ -698,7 +697,7 @@ def test_preview_runs_on_every_rank_when_generate_is_collective():
     pipeline: the other ranks never reach the schedule the printing rank is inside.
     """
     config = _cpu_config(tie_embeddings=False)
-    plans = plan_stages(config, 2)
+    plans = plan_for(config, 2)
     backbone = LMBackbone(config)
     calls = []
 
@@ -749,7 +748,7 @@ def test_stage_state_dicts_reassemble_the_whole_backbone():
     """
     config = _cpu_config(tie_embeddings=False)
     backbone = LMBackbone(config)
-    plans = plan_stages(config, 2)
+    plans = plan_for(config, 2)
     stages = [LMStage(backbone, plan) for plan in plans]
 
     merged = {}
@@ -782,7 +781,7 @@ def test_stage_flops_split_the_whole_model_across_stages():
     config = _cpu_config(tie_embeddings=False)
     backbone = LMBackbone(config)
     counter = FlopCounter(backbone)
-    plans = plan_stages(config, 2)
+    plans = plan_for(config, 2)
     lengths = torch.tensor([float(CTX)], dtype=torch.float64)
 
     whole = counter.batch_flops(CTX, lengths)

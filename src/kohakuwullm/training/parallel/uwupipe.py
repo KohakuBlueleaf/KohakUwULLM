@@ -19,13 +19,24 @@ from kohakuwullm.models.mxfp8_swap import refresh_mxfp8_weights, swap_mxfp8
 from kohakuwullm.training.optim.build import build_optimizer
 from kohakuwullm.training.optim.lowbit import cast_parameters_
 from kohakuwullm.training.parallel.pipeline import (
-    HEAD_INEFFICIENCY,
     AutocastStage,
     LMStage,
-    _block_cost,
-    _block_params,
+    plan_for,
 )
-from kohakuwupipe import PipelineModule, plan_from_layers, plan_stages
+from kohakuwupipe import PipelineModule
+
+# The adapter's public surface. `plan_for` is re-exported rather than defined
+# here: it needs the cost model, which lives beside `LMStage`.
+__all__ = [
+    "LMPipelineModule",
+    "PipelineStep",
+    "batch_signature",
+    "corpus_steps",
+    "first_mismatch",
+    "plan_for",
+    "verify_same_batch",
+    "with_router_losses",
+]
 
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
@@ -115,50 +126,6 @@ def verify_same_batch(step: PipelineStep) -> None:
             f"({gathered[rank].tolist()} vs {gathered[0].tolist()}); every rank "
             "must iterate an identical stream or the stages train on mismatched data"
         )
-
-
-def plan_for(
-    config,
-    num_stages: int,
-    seq_len: int,
-    head_scale: float | None = None,
-    layers=None,
-    costs=None,
-):
-    """The stage split for ``config``.
-
-    ``costs`` is a measured :class:`~kohakuwullm.training.parallel.autotune.LayerCosts`
-    and replaces the analytic model outright; ``layers`` pins an explicit
-    per-stage count and skips both. See docs/internals/pipeline.md.
-    """
-    scale = HEAD_INEFFICIENCY if head_scale is None else head_scale
-    vocab_params = float(config.dim * config.vocab_size)
-    layer_cost = costs.layers if costs is not None else _block_cost(config, seq_len)
-    head_cost = costs.head if costs is not None else vocab_params * scale
-    if layers is not None:
-        if isinstance(layers, str) or not hasattr(layers, "__iter__"):
-            raise TypeError(f"layers must be a sequence of ints, got {layers!r}")
-        counts = [int(n) for n in layers]
-        if sum(counts) != config.depth:
-            raise ValueError(
-                f"layers {counts} sum to {sum(counts)}, not depth {config.depth}"
-            )
-        if len(counts) != num_stages:
-            raise ValueError(f"layers {counts} is not {num_stages} stages")
-        return plan_from_layers(counts, layer_cost=layer_cost, head_cost=head_cost)
-    return plan_stages(
-        depth=config.depth,
-        num_stages=num_stages,
-        layer_cost=layer_cost,
-        head_cost=head_cost,
-        layer_params=(costs.params if costs is not None else _block_params(config)),
-        head_params=(
-            costs.head_params
-            if costs is not None
-            else (0.0 if config.tie_embeddings else vocab_params)
-        ),
-        embed_params=costs.embed_params if costs is not None else vocab_params,
-    )
 
 
 def with_router_losses(

@@ -1,5 +1,9 @@
 # Splitting a layer stack
 
+This is the **only** partitioner in the repo. `kohakuwullm` holds the cost
+model (`plan_for`, `_block_cost`, the autotuner) and calls in here; it does
+not carry its own copy of `StagePlan`, the DP, or the table.
+
 `plan_stages` cuts `depth` layers into `num_stages` contiguous ranges,
 minimizing the slowest stage. Ties break on parameter count, so two splits with
 the same predicted runtime pick the one that balances memory.

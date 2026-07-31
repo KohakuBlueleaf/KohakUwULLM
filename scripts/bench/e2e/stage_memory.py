@@ -23,7 +23,7 @@ from kohakuwullm.models import LMBackbone, get_preset
 from kohakuwullm.models.components.seqinfo import SeqInfo
 from kohakuwullm.training.optim.build import build_optimizer
 from kohakuwullm.training.optim.lowbit import cast_parameters_
-from kohakuwullm.training.parallel.pipeline import LMStage, plan_stages
+from kohakuwullm.training.parallel.pipeline import LMStage, plan_for
 
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -120,7 +120,7 @@ def main():
     device = torch.device("cuda")
     cfg = get_preset(args.preset, vocab_size=args.vocab, tie_embeddings=False)
     cfg.max_position = max(cfg.max_position, args.micro_tokens)
-    plans = plan_stages(cfg, args.stages, seq_len=args.micro_tokens)
+    plans = plan_for(cfg, args.stages, seq_len=args.micro_tokens)
 
     print(
         f"{device_name()} | {args.preset} | params {args.param_dtype} | "

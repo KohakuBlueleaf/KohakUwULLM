@@ -1,6 +1,6 @@
 """Per-stage runtime of a pipeline split, measured on one GPU.
 
-Each stage is built exactly as ``plan_stages`` would place it, then timed in
+Each stage is built exactly as ``plan_for`` would place it, then timed in
 isolation for forward and backward on one microbatch. A 4-stage split is only
 as fast as its slowest stage, so the spread reported here is the pipeline's
 efficiency ceiling before any communication cost.
@@ -27,7 +27,7 @@ from kohakuwullm.bench import (
 )
 from kohakuwullm.models import LMBackbone, get_preset
 from kohakuwullm.training.optim.lowbit import cast_parameters_
-from kohakuwullm.training.parallel.pipeline import LMStage, plan_stages
+from kohakuwullm.training.parallel.pipeline import LMStage, plan_for
 
 PARAM_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -102,9 +102,7 @@ def run(args, device):
     cfg = get_preset(args.preset, vocab_size=args.vocab, tie_embeddings=False)
     cfg.max_position = max(cfg.max_position, args.micro_tokens, args.len_max)
     backbone = LMBackbone(cfg)
-    plans = plan_stages(
-        cfg, args.stages, seq_len=args.plan_seq_len or args.micro_tokens
-    )
+    plans = plan_for(cfg, args.stages, seq_len=args.plan_seq_len or args.micro_tokens)
     info = make_info(args.micro_tokens, args.len_min, args.len_max, device, args.seed)
 
     rows = []

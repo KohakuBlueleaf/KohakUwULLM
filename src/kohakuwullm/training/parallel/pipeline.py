@@ -7,7 +7,7 @@ SeqInfo from lengths set via :meth:`LMStage.set_seq_info`. See docs/internals/pi
 
 import time
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 import torch
 import torch.nn as nn
@@ -15,24 +15,12 @@ import torch.nn as nn
 from kohakuwullm.models.backbone import LMBackbone
 from kohakuwullm.models.components.seqinfo import SeqInfo
 from kohakuwullm.utils import count_active_parameters, count_parameters
+from kohakuwupipe.parallel.plan import (
+    StagePlan,
+    plan_from_layers,
+    plan_stages,
+)
 from kohakuwupipe.parallel.streams import accumulate, accumulator
-
-
-@dataclass
-class StagePlan:
-    """Which layers, embedding and head belong to one pipeline stage."""
-
-    index: int
-    num_stages: int
-    start_layer: int
-    end_layer: int  # exclusive
-    has_embed: bool
-    has_head: bool
-    cost: float
-
-    @property
-    def num_layers(self) -> int:
-        return self.end_layer - self.start_layer
 
 
 def _ffn_hidden(config, index: int | None = None) -> int:
@@ -141,95 +129,48 @@ def _block_params(config) -> float:
     return float(attn + ffn + 2 * dim)
 
 
-def _partition(
-    depth: int,
-    num_stages: int,
-    per_block: float,
-    head: float,
-    block_params: float = 0.0,
-    head_params: float = 0.0,
-    embed_params: float = 0.0,
-):
-    """Contiguous split of ``depth`` blocks minimizing the slowest stage.
-
-    Ties break on parameter count. See docs/internals/pipeline.md.
-    """
-    inf = (float("inf"), float("inf"))
-    best = [[inf] * (depth + 1) for _ in range(num_stages + 1)]
-    cut = [[0] * (depth + 1) for _ in range(num_stages + 1)]
-    for i in range(depth + 1):
-        last = per_block * (depth - i) + head
-        mem = block_params * (depth - i) + head_params
-        best[1][i] = (last, mem * mem)
-        cut[1][i] = depth
-    for s in range(2, num_stages + 1):
-        for i in range(depth + 1):
-            # Every remaining stage needs at least one block.
-            for j in range(i + 1, depth - s + 2):
-                mine = per_block * (j - i)
-                mem = block_params * (j - i) + (embed_params if i == 0 else 0.0)
-                tail_max, tail_sq = best[s - 1][j]
-                key = (max(mine, tail_max), mem * mem + tail_sq)
-                if key < best[s][i]:
-                    best[s][i] = key
-                    cut[s][i] = j
-    bounds, at = [0], 0
-    for s in range(num_stages, 1, -1):
-        at = cut[s][at]
-        bounds.append(at)
-    bounds.append(depth)
-    return bounds
-
-
-def plan_stages(
+def plan_for(
     config,
     num_stages: int,
     seq_len: int = 2048,
-    head_scale: float = HEAD_INEFFICIENCY,
-) -> list[StagePlan]:
-    """Split ``config.depth`` layers across ``num_stages``, balancing runtime.
+    head_scale: float | None = None,
+    layers=None,
+    costs=None,
+):
+    """The stage split for ``config``.
 
-    The embedding is charged ~0 compute; the head its ``dim * vocab`` GEMM times
-    ``head_scale``, which :func:`measure_head_scale` recalibrates. See
-    docs/internals/pipeline.md.
+    ``costs`` is a measured :class:`~kohakuwullm.training.parallel.autotune.LayerCosts`
+    and replaces the analytic model outright; ``layers`` pins an explicit
+    per-stage count and skips both. See docs/internals/pipeline.md.
     """
-    if num_stages < 1:
-        raise ValueError("num_stages must be >= 1")
-    if num_stages > config.depth:
-        raise ValueError(
-            f"cannot split {config.depth} layers across {num_stages} stages"
-        )
-
-    per_block = _block_cost(config, seq_len)
-    head_cost = float(config.dim * config.vocab_size) * head_scale
+    scale = HEAD_INEFFICIENCY if head_scale is None else head_scale
     vocab_params = float(config.dim * config.vocab_size)
-    bounds = _partition(
-        config.depth,
-        num_stages,
-        per_block,
-        head_cost,
-        block_params=_block_params(config),
-        head_params=0.0 if config.tie_embeddings else vocab_params,
-        embed_params=vocab_params,
-    )
-
-    plans: list[StagePlan] = []
-    for stage in range(num_stages):
-        start, end = bounds[stage], bounds[stage + 1]
-        has_head = stage == num_stages - 1
-        cost = per_block * (end - start) + (head_cost if has_head else 0.0)
-        plans.append(
-            StagePlan(
-                index=stage,
-                num_stages=num_stages,
-                start_layer=start,
-                end_layer=end,
-                has_embed=stage == 0,
-                has_head=has_head,
-                cost=cost,
+    layer_cost = costs.layers if costs is not None else _block_cost(config, seq_len)
+    head_cost = costs.head if costs is not None else vocab_params * scale
+    if layers is not None:
+        if isinstance(layers, str) or not hasattr(layers, "__iter__"):
+            raise TypeError(f"layers must be a sequence of ints, got {layers!r}")
+        counts = [int(n) for n in layers]
+        if sum(counts) != config.depth:
+            raise ValueError(
+                f"layers {counts} sum to {sum(counts)}, not depth {config.depth}"
             )
-        )
-    return plans
+        if len(counts) != num_stages:
+            raise ValueError(f"layers {counts} is not {num_stages} stages")
+        return plan_from_layers(counts, layer_cost=layer_cost, head_cost=head_cost)
+    return plan_stages(
+        depth=config.depth,
+        num_stages=num_stages,
+        layer_cost=layer_cost,
+        head_cost=head_cost,
+        layer_params=(costs.params if costs is not None else _block_params(config)),
+        head_params=(
+            costs.head_params
+            if costs is not None
+            else (0.0 if config.tie_embeddings else vocab_params)
+        ),
+        embed_params=costs.embed_params if costs is not None else vocab_params,
+    )
 
 
 def router_stream_enabled(blocks) -> bool:
@@ -466,32 +407,6 @@ class LMStage(nn.Module):
         if self.head is None:
             raise RuntimeError("loss() called on a stage that does not own the head")
         return self.head.loss(hidden, labels, reduction="sum")
-
-
-def describe_plan(plans: list[StagePlan], config) -> str:
-    """A table for the startup log: layers, parameters and cost share per stage."""
-    total_cost = sum(p.cost for p in plans)
-    lines = [
-        f"pipeline split: {len(plans)} stages over {config.depth} layers",
-        f"  {'stage':>5}  {'layers':>9}  {'n':>3}  {'extra':>11}  {'cost share':>10}",
-    ]
-    for plan in plans:
-        extra = (
-            ",".join(
-                part
-                for part, present in (
-                    ("embed", plan.has_embed),
-                    ("head", plan.has_head),
-                )
-                if present
-            )
-            or "-"
-        )
-        lines.append(
-            f"  {plan.index:>5}  {plan.start_layer:>4}..{plan.end_layer - 1:<4}"
-            f"  {plan.num_layers:>3}  {extra:>11}  {100 * plan.cost / total_cost:>9.1f}%"
-        )
-    return "\n".join(lines)
 
 
 class AutocastStage(nn.Module):

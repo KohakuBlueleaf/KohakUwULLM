@@ -14,7 +14,7 @@ import torch.distributed as dist
 
 from kohakuwullm.models import LMBackbone, get_preset
 from kohakuwullm.models.components.seqinfo import SeqInfo
-from kohakuwullm.training.parallel.pipeline import AutocastStage, LMStage, plan_stages
+from kohakuwullm.training.parallel.pipeline import AutocastStage, LMStage, plan_for
 
 
 def main() -> None:
@@ -29,7 +29,7 @@ def main() -> None:
     per = int(os.environ.get("PP_PER_MICRO", "1024"))
     cfg = get_preset(preset, vocab_size=65536, tie_embeddings=False)
     backbone = LMBackbone(cfg)
-    plans = plan_stages(cfg, world, seq_len=per)
+    plans = plan_for(cfg, world, seq_len=per)
     plan = plans[rank]
     stage = AutocastStage(
         LMStage(backbone, plan).to(device=device, dtype=torch.float32)

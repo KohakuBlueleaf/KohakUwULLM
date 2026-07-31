@@ -24,7 +24,7 @@ from kohakuwullm.training.parallel.pipeline import (
     AutocastStage,
     LMStage,
     measure_head_scale,
-    plan_stages,
+    plan_for,
 )
 
 SCHEDULES = {
@@ -74,7 +74,7 @@ def build_stage(
             head_scale = float(scale.item())
 
     backbone = LMBackbone(config, head_kwargs=head_kwargs)
-    plans = plan_stages(config, world, seq_len=seq_len, head_scale=head_scale)
+    plans = plan_for(config, world, seq_len=seq_len, head_scale=head_scale)
     plan = plans[rank]
 
     module = LMStage(backbone, plan, boundary_dtype=param_dtype).to(

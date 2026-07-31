@@ -8,9 +8,7 @@ from kohakuwullm.training.loop.tokens import TokenSnapshot
 from kohakuwullm.training.optim.build import build_optimizer, group_parameters
 from kohakuwullm.training.parallel.pipeline import (
     LMStage,
-    StagePlan,
-    describe_plan,
-    plan_stages,
+    plan_for,
 )
 
 __all__ = [
@@ -23,10 +21,8 @@ __all__ = [
     "TokenSnapshot",
     "build_optimizer",
     "group_parameters",
-    "plan_stages",
-    "describe_plan",
+    "plan_for",
     "LMStage",
-    "StagePlan",
 ]
 
 _LAZY = {
