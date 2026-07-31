@@ -22,6 +22,7 @@ from kohakuwupipe.training.callbacks import Checkpoint, LossLog, Throughput
 from kohakuwupipe.training.hooks import Callback, CallbackList
 from kohakuwupipe.training.loop import PipelineLoop, StepOutput, build_loss_fn
 from kohakuwupipe.training.module import PipelineModule
+from kohakuwupipe.training.scaler import PipelineGradScaler
 from kohakuwupipe.training.trainer import SCHEDULES, PipelineTrainer
 from kohakuwupipe.utils.logging import configure, get_logger
 
@@ -40,6 +41,7 @@ __all__ = [
     "StagePlan",
     "StepOutput",
     "Throughput",
+    "PipelineGradScaler",
     "build_loss_fn",
     "configure",
     "describe",

@@ -9,6 +9,7 @@ from kohakuwupipe.training.loop import (
     build_loss_fn,
 )
 from kohakuwupipe.training.module import PipelineModule
+from kohakuwupipe.training.scaler import PipelineGradScaler
 from kohakuwupipe.training.trainer import SCHEDULES, PipelineTrainer
 
 __all__ = [
@@ -23,5 +24,6 @@ __all__ = [
     "PipelineTrainer",
     "StepOutput",
     "Throughput",
+    "PipelineGradScaler",
     "build_loss_fn",
 ]

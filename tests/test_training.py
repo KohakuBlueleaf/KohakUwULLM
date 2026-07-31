@@ -48,6 +48,7 @@ from kohakuwullm.training.parallel.uwupipe import (
     first_mismatch,
     verify_same_batch,
 )
+from kohakuwupipe import PipelineGradScaler
 from kohakuwupipe.parallel.plan import partition
 from kohakuwupipe.parallel.streams import reduce_accumulator
 from kohakuwupipe.training.callbacks import Throughput
@@ -1409,3 +1410,59 @@ def test_composer_warmup_lands_on_the_first_phase_not_the_composer():
         {"mode": "cosine", "min_value": 0.05, "end": -1}, total, warmup_ratio=0.05
     )
     assert plain["warmup"] == 5000 and plain["end"] == total
+
+
+def test_scaler_unscales_then_reports_a_finite_flag():
+    """``unscale_`` divides in place and returns 1 only when a gradient is not finite."""
+    scaler = PipelineGradScaler(init_scale=1024.0)
+    clean = torch.nn.Parameter(torch.zeros(8))
+    clean.grad = torch.full((8,), 2048.0)
+
+    assert scaler.unscale_([clean]).item() == 0.0
+    assert torch.equal(clean.grad, torch.full((8,), 2.0)), "gradient not unscaled"
+
+    dirty = torch.nn.Parameter(torch.zeros(8))
+    dirty.grad = torch.full((8,), float("inf"))
+    assert scaler.unscale_([dirty]).item() == 1.0
+
+
+def test_scaler_backs_off_and_holds_a_floor():
+    scaler = PipelineGradScaler(init_scale=8.0, growth_interval=2, min_scale=2.0)
+    scaler.update(overflow=True)
+    assert scaler.scale_value == 4.0
+    scaler.update(overflow=True)
+    assert scaler.scale_value == 2.0
+    # A run that keeps halving has a real inf; decaying to zero would hide it.
+    scaler.update(overflow=True)
+    assert scaler.scale_value == 2.0
+
+    scaler.update(overflow=False)
+    assert scaler.scale_value == 2.0, "grew before the interval elapsed"
+    scaler.update(overflow=False)
+    assert scaler.scale_value == 4.0
+    assert scaler.overflows == 3
+
+
+def test_disabled_scaler_is_a_pass_through():
+    """A bf16 run must pay nothing and, crucially, must not divide gradients."""
+    scaler = PipelineGradScaler(enabled=False, init_scale=1024.0)
+    loss = torch.tensor(3.0)
+    assert scaler.scale(loss) is loss
+
+    param = torch.nn.Parameter(torch.zeros(8))
+    param.grad = torch.full((8,), 2048.0)
+    assert scaler.unscale_([param]).item() == 0.0
+    assert torch.equal(param.grad, torch.full((8,), 2048.0))
+
+
+def test_scaler_state_survives_a_round_trip():
+    """A resume that lost the scale would re-run the initial backoff."""
+    scaler = PipelineGradScaler(init_scale=65536.0)
+    scaler.update(overflow=True)
+    scaler.update(overflow=False)
+
+    restored = PipelineGradScaler(init_scale=65536.0)
+    restored.load_state_dict(scaler.state_dict())
+    assert restored.scale_value == scaler.scale_value == 32768.0
+    assert restored.clean_steps == 1
+    assert restored.overflows == 1

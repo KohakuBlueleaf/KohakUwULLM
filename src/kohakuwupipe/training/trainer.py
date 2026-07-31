@@ -49,6 +49,7 @@ class PipelineTrainer:
         num_microbatches: int,
         schedule: str = "1f1b",
         grad_clip: float = 0.0,
+        scaler=None,
         callbacks=(),
     ) -> None:
         configure(rank=ranks.rank)
@@ -64,6 +65,7 @@ class PipelineTrainer:
         self.micro_tokens = micro_tokens
         self.num_microbatches = num_microbatches
         self.callbacks = CallbackList(callbacks)
+        self.scaler = scaler
         self._denom = 1
         # Where the blocks sit in the stage's state dict, wrapper included.
         self.block_attr = getattr(module, "block_prefix", "blocks")
@@ -83,7 +85,9 @@ class PipelineTrainer:
         self.schedule = SCHEDULES[schedule](
             stage,
             n_microbatches=num_microbatches,
-            loss_fn=build_loss_fn(stage_module, lambda: self._denom, num_microbatches),
+            loss_fn=build_loss_fn(
+                stage_module, lambda: self._denom, num_microbatches, scaler
+            ),
             scale_grads=False,
         )
         self.loop = PipelineLoop(
@@ -95,6 +99,7 @@ class PipelineTrainer:
             micro_tokens=micro_tokens,
             num_microbatches=num_microbatches,
             scheduler=scheduler,
+            scaler=scaler,
             grad_clip=grad_clip,
             post_step=module.post_step,
             callbacks=self.callbacks.callbacks,

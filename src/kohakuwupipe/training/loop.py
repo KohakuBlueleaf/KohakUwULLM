@@ -81,6 +81,7 @@ class PipelineLoop:
         micro_tokens: int,
         num_microbatches: int,
         scheduler=None,
+        scaler=None,
         grad_clip: float = 0.0,
         post_step: Callable[[Any], dict[str, torch.Tensor]] | None = None,
         callbacks: Iterable[Callback] = (),
@@ -89,6 +90,7 @@ class PipelineLoop:
         self.schedule = schedule
         self.optimizer = optimizer
         self.scheduler = scheduler
+        self.scaler = scaler
         self.rank = rank
         self.world = world
         self.micro_tokens = micro_tokens
@@ -124,20 +126,32 @@ class PipelineLoop:
             self.schedule.step()
         self.callbacks.call("on_after_backward", self)
 
-        if self.grad_clip:
-            torch.nn.utils.clip_grad_norm_(
-                self.stage_module.parameters(), self.grad_clip
-            )
-        self.callbacks.call("on_before_optimizer_step", self, self.optimizer)
-        self.optimizer.step()
+        # One host sync per step, and the only one: a scaler has to branch.
+        overflow = False
+        scale = 1.0
+        if self.scaler is not None and self.scaler.enabled:
+            scale = self.scaler.scale_value
+            found = self.scaler.unscale_(list(self.stage_module.parameters()))
+            overflow = bool(self.scaler.agree(found).item())
+            self.scaler.update(overflow)
+        if not overflow:
+            if self.grad_clip:
+                torch.nn.utils.clip_grad_norm_(
+                    self.stage_module.parameters(), self.grad_clip
+                )
+            self.callbacks.call("on_before_optimizer_step", self, self.optimizer)
+            self.optimizer.step()
         extra = self.post_step(self.stage_module) if self.post_step else {}
         if self.scheduler is not None:
             self.scheduler.step()
 
+        if self.scaler is not None and self.scaler.enabled:
+            extra["scale"] = torch.tensor(scale)
+            extra["overflow"] = torch.tensor(float(overflow))
         self.global_step += 1
         out = StepOutput(
             index=self.global_step,
-            loss=self.broadcast_loss(losses),
+            loss=self.broadcast_loss(losses, scale),
             seen=self.micro_tokens * self.num_microbatches,
             trained=int(batch.trained),
             extra=extra,
@@ -145,20 +159,22 @@ class PipelineLoop:
         self.callbacks.call("on_train_batch_end", self, out, batch, batch_idx)
         return out
 
-    def broadcast_loss(self, losses) -> torch.Tensor | None:
+    def broadcast_loss(self, losses, scale: float = 1.0) -> torch.Tensor | None:
         """The step's loss, from the last stage to every rank, as a device tensor.
 
         Microbatch losses **sum**: ``loss_fn`` already divided each one by the
-        step's token count. See docs/kohakuwupipe/loop.md.
+        step's token count. ``scale`` divides the loss scaler back out, so what
+        is reported is the loss the model actually has.
+        See docs/kohakuwupipe/loop.md.
         """
         if losses is not None and not dist.is_initialized():
-            return torch.stack(losses).sum().detach() if losses else None
+            return torch.stack(losses).sum().detach() / scale if losses else None
         if not dist.is_initialized():
             return None
         device = next(self.stage_module.parameters()).device
         buf = torch.zeros(1, device=device)
         if losses:
-            buf[0] = torch.stack([x.detach().float() for x in losses]).sum()
+            buf[0] = torch.stack([x.detach().float() for x in losses]).sum() / scale
         dist.broadcast(buf, src=self.world - 1)
         return buf[0]
 
@@ -213,7 +229,10 @@ class PipelineLoop:
 
 
 def build_loss_fn(
-    stage_module, denom: Callable[[], int], num_microbatches: int = 1
+    stage_module,
+    denom: Callable[[], int],
+    num_microbatches: int = 1,
+    scaler=None,
 ) -> Callable:
     """A schedule ``loss_fn`` that normalizes by the step's trained tokens.
 
@@ -234,6 +253,6 @@ def build_loss_fn(
         for stream in streams[1:]:
             if stream is not None and stream.shape[-1] == 1:
                 loss = loss + aux_scale * reduce_accumulator(stream)
-        return loss
+        return loss if scaler is None else scaler.scale(loss)
 
     return loss_fn
