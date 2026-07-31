@@ -5,12 +5,11 @@ a tokenizer or a sampler lives here. See docs/internals/pipeline.md.
 """
 
 import torch
+from tqdm.auto import tqdm
 
 from kohakuwullm.generation import build_generator
 from kohakuwullm.training.parallel.pipeline_lightning import decode_stage
-from kohakuwupipe import Callback, get_logger
-
-log = get_logger(__name__)
+from kohakuwupipe import Callback
 
 
 class SamplePreview(Callback):
@@ -24,8 +23,11 @@ class SamplePreview(Callback):
         module: the :class:`LMPipelineModule` being trained.
         tokenizer: anything with ``__call__`` and ``decode``.
         ranks: from :func:`kohakuwupipe.init_pipeline`.
-        prompts: strings to continue; one row each.
+        prompts: ``(name, text)`` pairs; each is sampled ``samples`` times.
+        samples: rows generated per prompt, and the decode batch width.
         every_n_steps: cadence; 0 disables.
+        report: ``(step, rows) -> None`` on rank 0, where a row is
+            ``(name, prompt, index, text)``. The text is never logged.
         max_new_tokens / temperature / top_p: sampling controls.
     """
 
@@ -36,15 +38,21 @@ class SamplePreview(Callback):
         ranks,
         prompts=None,
         every_n_steps: int = 1000,
-        max_new_tokens: int = 64,
-        temperature: float = 0.8,
+        samples: int = 16,
+        report=None,
+        max_new_tokens: int = 128,
+        temperature: float = 0.35,
         top_p: float = 0.95,
     ) -> None:
         self.module = module
         self.tokenizer = tokenizer
         self.ranks = ranks
-        self.prompts = list(prompts) if prompts else ["1girl"]
+        self.prompts = (
+            list(prompts) if prompts else [("default", "target: <|long|>\ntag: 1girl")]
+        )
         self.every_n_steps = every_n_steps
+        self.samples = samples
+        self.report = report
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
@@ -56,49 +64,51 @@ class SamplePreview(Callback):
         self.preview(loop, out.index)
 
     def preview(self, loop, step: int) -> None:
-        """One collective round of sampling. Every rank must reach this."""
-        prompt_ids = self._encode()
+        """One collective round per prompt. Every rank must reach every round."""
         was_training = loop.stage_module.training
         loop.stage_module.eval()
-        try:
-            tokens = self._build(prompt_ids).generate(
-                prompt_ids.to(self.ranks.device),
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-                top_p=self.top_p,
-            )
-        finally:
-            loop.stage_module.train(was_training)
-        if self.ranks.rank:
-            return
-        for prompt, row in zip(self.prompts, tokens):
-            log.info(
-                "preview",
-                step=step,
-                prompt=prompt,
-                text=self.tokenizer.decode(row.tolist(), skip_special_tokens=True),
-            )
-
-    def _encode(self) -> torch.Tensor:
-        """Left-padded prompt ids, one row per prompt, all the same length."""
-        rows = [
-            self.tokenizer(text, return_tensors="pt")["input_ids"][0]
-            for text in self.prompts
-        ]
-        width = max(row.shape[0] for row in rows)
-        pad = self.tokenizer.pad_token_id or 0
-        return torch.stack(
-            [
-                torch.cat(
-                    [torch.full((width - row.shape[0],), pad, dtype=row.dtype), row]
-                )
-                for row in rows
-            ]
+        rows = []
+        bar = tqdm(
+            self.prompts,
+            desc=f"preview@{step}",
+            unit="prompt",
+            leave=False,
+            disable=None if self.ranks.rank == 0 else True,
         )
+        try:
+            for name, text in bar:
+                prompt_ids = self._encode(text)
+                tokens = self._build().generate(
+                    prompt_ids.to(self.ranks.device),
+                    max_new_tokens=self.max_new_tokens,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                )
+                if self.ranks.rank:
+                    continue
+                rows += [
+                    (
+                        name,
+                        text,
+                        index,
+                        self.tokenizer.decode(row.tolist(), skip_special_tokens=True),
+                    )
+                    for index, row in enumerate(tokens)
+                ]
+        finally:
+            bar.close()
+            loop.stage_module.train(was_training)
+        if self.ranks.rank == 0 and self.report is not None:
+            self.report(step, rows)
 
-    def _build(self, prompt_ids: torch.Tensor):
-        """The decode-shaped generator, built once per row count."""
-        rows = prompt_ids.shape[0]
+    def _encode(self, text: str) -> torch.Tensor:
+        """One prompt repeated ``samples`` times, the decode batch's shape."""
+        ids = self.tokenizer(text, return_tensors="pt")["input_ids"][0]
+        return ids.unsqueeze(0).expand(self.samples, -1).contiguous()
+
+    def _build(self):
+        """The decode-shaped generator, built once."""
+        rows = self.samples
         if self._generator is None:
             stage = decode_stage(
                 self.module.stage_module,

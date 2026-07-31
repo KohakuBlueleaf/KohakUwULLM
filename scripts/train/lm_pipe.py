@@ -1,23 +1,29 @@
 """Pipeline training on kohakuwupipe, over the KohakuVault corpus.
 
-Launched by torchrun, configured by KohakuEngine::
+Launched and configured by KohakuEngine; the script spawns its own ranks::
 
-    torchrun --standalone --nproc_per_node=4 $(which kogine) run \
-        scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_pp4.py
+    kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py
 
-    torchrun --standalone --nproc_per_node=4 $(which kogine) run \
-        scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_pp4.py \
+    kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py \
         --set MAX_STEPS=10 --set DATA_KIND=synthetic
+
+``GPUS`` sets the rank count. Running under ``torchrun`` still works: the
+launcher stands down when ``RANK`` is already set.
 
 Every UPPER_CASE global is a knob a config may override; the defaults form a
 runnable synthetic smoke test. ``scripts/train/lm.py`` is the Lightning path and
 is unchanged. See docs/internals/pipeline.md and docs/guides/writing-configs.md.
 """
 
+import os
+import sys
+
 import torch
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwullm.bench import make_info, make_tokens
 from kohakuwullm.data import build_loader
+from kohakuwullm.data.renderers.tipo import build_prompt
 from kohakuwullm.models import get_preset
 from kohakuwullm.training.parallel.autotune import broadcast_costs, measure_costs
 from kohakuwullm.training.parallel.uwupipe import (
@@ -120,7 +126,13 @@ THROUGHPUT_INTERVAL = 1
 CONSOLE_INTERVAL = 200
 PROGRESS_BAR = True
 SAMPLE_INTERVAL = 0
+# Each is kwargs for `tipo.build_prompt`; a bare tag string is off-distribution.
 SAMPLE_PROMPTS: list | None = None
+SAMPLE_COUNT = 16
+SAMPLE_TOKENS = 128
+SAMPLE_TEMPERATURE = 0.35
+# Ranks to launch when the script is run outside torchrun. 0 uses every GPU.
+GPUS = 0
 
 
 def synthetic_stream(vocab, micro, num_micro, lo, hi, device, seed=0, fresh=False):
@@ -205,7 +217,77 @@ def build_reporter(name: str):
         if CONSOLE_INTERVAL > 0 and step % CONSOLE_INTERVAL == 0:
             log.info("metrics", **row)
 
-    return report
+    def report_samples(step: int, rows: list) -> None:
+        """Generated text goes to a W&B table only; it never reaches the log."""
+        if run is None:
+            return
+        import wandb
+
+        table = wandb.Table(columns=["step", "name", "prompt", "sample", "text"])
+        for name, prompt, index, text in rows:
+            table.add_data(step, name, prompt, index, text)
+        run.log({"samples": table}, step=step)
+
+    return report, report_samples
+
+
+def build_sample_prompts() -> list[tuple[str, str]]:
+    """``(name, text)`` for each entry of ``SAMPLE_PROMPTS``.
+
+    Each entry is kwargs for :func:`kohakuwullm.data.renderers.tipo.build_prompt`,
+    plus an optional ``name``. See docs/internals/data.md.
+    """
+    specs = SAMPLE_PROMPTS or [{"tags": "1girl"}]
+    prompts = []
+    for index, spec in enumerate(specs):
+        spec = dict(spec)
+        name = spec.pop("name", None) or f"prompt{index}"
+        prompts.append((name, build_prompt(**spec)))
+    return prompts
+
+
+def launch() -> None:
+    """Run ``main`` under torchrun when the caller did not.
+
+    ``kogine run`` starts one process; the Lightning path gets its ranks from
+    the Trainer, and this path has no Trainer. See docs/internals/pipeline.md.
+    """
+    if os.environ.get("RANK") is not None:
+        main()
+        return
+    nproc = GPUS or torch.cuda.device_count()
+    if nproc <= 1:
+        main()
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=nproc,
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="lm_pipe",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, _worker)(_config_globals())
+
+
+def _config_globals() -> dict:
+    """The resolved UPPER_CASE config, to re-apply inside each spawned rank."""
+    module = sys.modules[__name__]
+    return {
+        key: value
+        for key, value in vars(module).items()
+        if key.isupper() and not key.startswith("_")
+    }
+
+
+def _worker(overrides: dict) -> None:
+    """A spawned rank: re-apply the parent's config, then train."""
+    module = sys.modules[__name__]
+    for key, value in overrides.items():
+        setattr(module, key, value)
+    main()
 
 
 def main() -> None:
@@ -266,7 +348,7 @@ def main() -> None:
         loader=loader,
     )
 
-    report = build_reporter(NAME) if ranks.rank == 0 else None
+    report, report_samples = build_reporter(NAME) if ranks.rank == 0 else (None, None)
     callbacks = [
         Throughput(every_n_steps=THROUGHPUT_INTERVAL, warmup_steps=8, report=report),
         LossLog(every_n_steps=LOG_INTERVAL, report=report),
@@ -288,8 +370,12 @@ def main() -> None:
                 module,
                 tokenizer,
                 ranks,
-                prompts=SAMPLE_PROMPTS,
+                prompts=build_sample_prompts(),
                 every_n_steps=SAMPLE_INTERVAL,
+                samples=SAMPLE_COUNT,
+                report=report_samples,
+                max_new_tokens=SAMPLE_TOKENS,
+                temperature=SAMPLE_TEMPERATURE,
             )
         )
     scaling = (
@@ -325,4 +411,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    launch()

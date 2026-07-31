@@ -89,4 +89,36 @@ THROUGHPUT_INTERVAL = 1
 CONSOLE_INTERVAL = 200
 PROGRESS_BAR = True
 SAMPLE_INTERVAL = 2000
-SAMPLE_PROMPTS = ["1girl", "scenery, no humans"]
+SAMPLE_COUNT = 16
+SAMPLE_TOKENS = 128
+# TIPO's own inference setting; see ref/KGen executor/tipo.py.
+SAMPLE_TEMPERATURE = 0.35
+# kwargs for tipo.build_prompt: the format the renderer trains on, not a bare
+# tag string. See docs/internals/data.md.
+SAMPLE_PROMPTS = [
+    {
+        "name": "tags-short",
+        "tags": "1girl",
+        "meta": {"quality": "masterpiece", "rating": "general"},
+        "target_len": "short",
+    },
+    {
+        "name": "tags-long",
+        "tags": "1girl, solo, long_hair, school_uniform",
+        "meta": {"quality": "masterpiece", "rating": "general", "aspect ratio": "0.7"},
+        "target_len": "long",
+    },
+    {
+        "name": "scenery",
+        "tags": "scenery, no_humans",
+        "meta": {"quality": "best quality", "rating": "general"},
+        "target_len": "long",
+    },
+    {
+        "name": "tag-to-long",
+        "tags": "1girl, cherry_blossoms, outdoors",
+        "meta": {"quality": "masterpiece", "rating": "general"},
+        "task": "tag_to_long",
+        "target_len": "long",
+    },
+]
