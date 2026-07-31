@@ -26,6 +26,7 @@ class SamplePreview(Callback):
         prompts: ``(name, text)`` pairs; each is sampled ``samples`` times.
         samples: rows generated per prompt, and the decode batch width.
         every_n_steps: cadence; 0 disables.
+        at_start: also preview on the first step, before any training.
         report: ``(step, rows) -> None`` on rank 0, where a row is
             ``(name, prompt, index, text)``. The text is never logged.
         max_new_tokens / temperature / top_p: sampling controls.
@@ -38,6 +39,7 @@ class SamplePreview(Callback):
         ranks,
         prompts=None,
         every_n_steps: int = 1000,
+        at_start: bool = True,
         samples: int = 16,
         report=None,
         max_new_tokens: int = 128,
@@ -51,6 +53,7 @@ class SamplePreview(Callback):
             list(prompts) if prompts else [("default", "target: <|long|>\ntag: 1girl")]
         )
         self.every_n_steps = every_n_steps
+        self.at_start = at_start
         self.samples = samples
         self.report = report
         self.max_new_tokens = max_new_tokens
@@ -59,7 +62,8 @@ class SamplePreview(Callback):
         self._generator = None
 
     def on_train_batch_end(self, loop, out, batch=None, batch_idx=0) -> None:
-        if self.every_n_steps <= 0 or out.index % self.every_n_steps:
+        first = self.at_start and batch_idx == 0
+        if not first and (self.every_n_steps <= 0 or out.index % self.every_n_steps):
             return
         self.preview(loop, out.index)
 
