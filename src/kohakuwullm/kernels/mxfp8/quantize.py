@@ -264,12 +264,27 @@ def _mxfp8_matmul_pq(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_SUB: tl.constexpr,
+    GROUP_M: tl.constexpr,
 ):
-    """``C = A @ B.T`` from operands already in e4m3 + ue8m0."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    """``C = A @ B.T`` from operands already in e4m3 + ue8m0.
+
+    The grid is flat and rasterized in groups of ``GROUP_M`` row tiles.
+    See docs/internals/kernels.md.
+    """
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    width = GROUP_M * grid_n
+    group = pid // width
+    rows = min(grid_m - group * GROUP_M, GROUP_M)
+    pid_m = group * GROUP_M + (pid % rows)
+    pid_n = (pid % width) // rows
+    # True offsets drive the masks and the store; the wrapped copies drive the
+    # pointers, so a tail tile reads in range and is masked off anyway.
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_mp = tl.max_contiguous(tl.multiple_of(offs_m % M, BLOCK_M), BLOCK_M)
+    offs_np = tl.max_contiguous(tl.multiple_of(offs_n % N, BLOCK_N), BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
     groups: tl.constexpr = BLOCK_K // BLOCK_SUB
     offs_g = tl.arange(0, groups)
@@ -286,20 +301,20 @@ def _mxfp8_matmul_pq(
         # zero, so an over-read here would be silent.
         mask_g = g < scale_cols
         aq = tl.load(
-            a_ptr + offs_m[:, None] * stride_am + k[None, :] * stride_ak,
+            a_ptr + offs_mp[:, None] * stride_am + k[None, :] * stride_ak,
             mask=mask_m[:, None] & mask_k[None, :],
         )
         bq = tl.load(
-            b_ptr + offs_n[:, None] * stride_bn + k[None, :] * stride_bk,
+            b_ptr + offs_np[:, None] * stride_bn + k[None, :] * stride_bk,
             mask=mask_n[:, None] & mask_k[None, :],
         )
         a_scale = tl.load(
-            as_ptr + offs_m[:, None] * stride_asm + g[None, :] * stride_ask,
+            as_ptr + offs_mp[:, None] * stride_asm + g[None, :] * stride_ask,
             mask=mask_m[:, None] & mask_g[None, :],
             other=0,
         )
         b_scale = tl.load(
-            bs_ptr + offs_n[:, None] * stride_bsn + g[None, :] * stride_bsk,
+            bs_ptr + offs_np[:, None] * stride_bsn + g[None, :] * stride_bsk,
             mask=mask_n[:, None] & mask_g[None, :],
             other=0,
         )
@@ -329,8 +344,7 @@ def mxfp8_matmul_pq(
     n = bq.shape[0]
     out = torch.empty(m, n, device=aq.device, dtype=out_dtype)
     grid = lambda meta: (  # noqa: E731
-        triton.cdiv(m, meta["BLOCK_M"]),
-        triton.cdiv(n, meta["BLOCK_N"]),
+        triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),
     )
     _mxfp8_matmul_pq[grid](
         aq,
@@ -352,6 +366,7 @@ def mxfp8_matmul_pq(
         out.stride(0),
         out.stride(1),
         BLOCK_SUB=BLOCK_SCALE,
+        GROUP_M=8,
     )
     return out
 
