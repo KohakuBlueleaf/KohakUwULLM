@@ -265,6 +265,7 @@ def _mxfp8_matmul_pq(
     BLOCK_K: tl.constexpr,
     BLOCK_SUB: tl.constexpr,
     GROUP_M: tl.constexpr,
+    EVEN: tl.constexpr,
 ):
     """``C = A @ B.T`` from operands already in e4m3 + ue8m0.
 
@@ -300,24 +301,20 @@ def _mxfp8_matmul_pq(
         # The scale needs its own column mask; the paired value load is masked to
         # zero, so an over-read here would be silent.
         mask_g = g < scale_cols
-        aq = tl.load(
-            a_ptr + offs_mp[:, None] * stride_am + k[None, :] * stride_ak,
-            mask=mask_m[:, None] & mask_k[None, :],
-        )
-        bq = tl.load(
-            b_ptr + offs_np[:, None] * stride_bn + k[None, :] * stride_bk,
-            mask=mask_n[:, None] & mask_k[None, :],
-        )
-        a_scale = tl.load(
-            as_ptr + offs_mp[:, None] * stride_asm + g[None, :] * stride_ask,
-            mask=mask_m[:, None] & mask_g[None, :],
-            other=0,
-        )
-        b_scale = tl.load(
-            bs_ptr + offs_np[:, None] * stride_bsn + g[None, :] * stride_bsk,
-            mask=mask_n[:, None] & mask_g[None, :],
-            other=0,
-        )
+        ap = a_ptr + offs_mp[:, None] * stride_am + k[None, :] * stride_ak
+        bp = b_ptr + offs_np[:, None] * stride_bn + k[None, :] * stride_bk
+        asp = as_ptr + offs_mp[:, None] * stride_asm + g[None, :] * stride_ask
+        bsp = bs_ptr + offs_np[:, None] * stride_bsn + g[None, :] * stride_bsk
+        if EVEN:
+            aq = tl.load(ap)
+            bq = tl.load(bp)
+            a_scale = tl.load(asp)
+            b_scale = tl.load(bsp)
+        else:
+            aq = tl.load(ap, mask=mask_m[:, None] & mask_k[None, :])
+            bq = tl.load(bp, mask=mask_n[:, None] & mask_k[None, :])
+            a_scale = tl.load(asp, mask=mask_m[:, None] & mask_g[None, :], other=0)
+            b_scale = tl.load(bsp, mask=mask_n[:, None] & mask_g[None, :], other=0)
         # The weight is stored (N, K) and transposed in registers here.
         acc = tl.dot_scaled(aq, a_scale, "e4m3", tl.trans(bq), b_scale, "e4m3", acc=acc)
 
@@ -367,6 +364,7 @@ def mxfp8_matmul_pq(
         out.stride(1),
         BLOCK_SUB=BLOCK_SCALE,
         GROUP_M=8,
+        EVEN=(m % 256 == 0) and (n % 256 == 0) and (k % 256 == 0),
     )
     return out
 
