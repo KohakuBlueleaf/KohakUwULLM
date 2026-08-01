@@ -150,7 +150,7 @@ class DiffusionStage(nn.Module):
 
     def __init__(
         self,
-        plan: StagePlan,
+        plan: DiffusionStagePlan,
         dim: int,
         data_dim: int,
         autocast_dtype: torch.dtype | None = None,
@@ -188,12 +188,12 @@ class DiffusionStage(nn.Module):
         )
         with context:
             out = self._blocks(x, t)
-        if self.boundary_dtype is None or self.plan.has_out_proj:
+        if self.boundary_dtype is None or self.out_proj is not None:
             return out
         return tuple(stream.to(self.boundary_dtype) for stream in out)
 
     def _blocks(self, x: torch.Tensor, t: torch.Tensor | None):
-        if self.plan.has_time_embed:
+        if self.time_embed is not None:
             cond = self.time_embed(t)
             x = self.in_proj(x)
         else:
@@ -202,7 +202,7 @@ class DiffusionStage(nn.Module):
             x = block(x, cond)
             if self.dropout_p:
                 x = nn.functional.dropout(x, self.dropout_p, self.training)
-        if not self.plan.has_out_proj:
+        if self.out_proj is None:
             return x, cond
         return self.out_proj(self.out_norm(x))
 
