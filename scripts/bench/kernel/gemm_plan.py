@@ -58,6 +58,35 @@ def mamf(fn, warmup=15, iters=40):
     return min(s.elapsed_time(e) for s, e in zip(beg, end))
 
 
+def measure(m, n, k, dev, dtype, args):
+    """Time one shape against cuBLAS; returns (plan, {arm: TFLOP/s}, rel err)."""
+    torch.manual_seed(0)
+    a = torch.randn(m, k, device="cuda", dtype=dtype)
+    b = torch.randn(k, n, device="cuda", dtype=dtype)
+    c = torch.empty((m, n), device="cuda", dtype=dtype)
+    if args.tune:
+        g = TunedGemm(m, n, k, dev, a.element_size(), shortlist=args.tune, dtype=dtype)
+        p = g.plan
+    else:
+        p = plan(m, n, k, dev, a.element_size())
+        g = StreamKGemm(m, n, k, dev, a.element_size(), p=p)
+    g(a, b, c)
+    ref = a.double() @ b.double()
+    err = (c.double() - ref).abs().max().item() / ref.abs().max().item()
+    del ref
+
+    arms = {"ours": lambda: g(a, b, c), "cub": lambda: torch.matmul(a, b, out=c)}
+    for fn in arms.values():
+        fn()
+    torch.cuda.synchronize()
+    best = {nm: 1e30 for nm in arms}
+    for _ in range(args.rounds):
+        for nm, fn in arms.items():
+            best[nm] = min(best[nm], mamf(fn))
+    flops = 2.0 * m * n * k
+    return p, {nm: flops / t * 1e-9 for nm, t in best.items()}, err
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16"])
@@ -78,37 +107,11 @@ def main() -> None:
     )
     rows = []
     for m, n, k in SHAPES:
-        torch.manual_seed(0)
-        a = torch.randn(m, k, device="cuda", dtype=dtype)
-        b = torch.randn(k, n, device="cuda", dtype=dtype)
-        c = torch.empty((m, n), device="cuda", dtype=dtype)
-        flops = 2.0 * m * n * k
-        p = plan(m, n, k, dev, a.element_size())
         try:
-            if args.tune:
-                g = TunedGemm(
-                    m, n, k, dev, a.element_size(), shortlist=args.tune, dtype=dtype
-                )
-                p = g.plan
-            else:
-                g = StreamKGemm(m, n, k, dev, a.element_size(), p=p)
-            g(a, b, c)
+            p, tf, err = measure(m, n, k, dev, dtype, args)
         except Exception as exc:
             print(f"{str((m, n, k)):>22} {type(exc).__name__}: {str(exc)[:40]}")
             continue
-        ref = a.double() @ b.double()
-        err = (c.double() - ref).abs().max().item() / ref.abs().max().item()
-        del ref
-
-        arms = {"ours": lambda: g(a, b, c), "cub": lambda: torch.matmul(a, b, out=c)}
-        for fn in arms.values():
-            fn()
-        torch.cuda.synchronize()
-        best = {nm: 1e30 for nm in arms}
-        for _ in range(args.rounds):
-            for nm, fn in arms.items():
-                best[nm] = min(best[nm], mamf(fn))
-        tf = {nm: flops / t * 1e-9 for nm, t in best.items()}
         print(
             f"{str((m, n, k)):>22} {str(p.tile):>14} {p.warps:>2} "
             f"{p.cta_per_sm:>2} {p.sk_ctas:>5} {p.predicted_tflops:>7.1f} "
@@ -132,7 +135,6 @@ def main() -> None:
                 "limiter": p.limiter,
             }
         )
-        del a, b, c
         torch.cuda.empty_cache()
 
     if rows:
