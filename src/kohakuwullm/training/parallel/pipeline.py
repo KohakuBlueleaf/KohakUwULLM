@@ -287,6 +287,17 @@ class LMStage(nn.Module):
             "moe/load_imbalance_mean": stacked.mean(),
         }
 
+    def bias_update_rate(self) -> float | None:
+        """The balancing step size this stage's routers currently hold.
+
+        ``None`` when the stage owns no router. See docs/internals/moe-router-loss.md.
+        """
+        for block in self.blocks:
+            router = getattr(block.mlp, "router", None)
+            if router is not None:
+                return router.bias_update_rate
+        return None
+
     def set_bias_update_rate(self, rate: float) -> None:
         """Set every router's balancing step size. Zero freezes the bias.
 

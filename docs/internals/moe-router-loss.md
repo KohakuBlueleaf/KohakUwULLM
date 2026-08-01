@@ -334,3 +334,59 @@ The kernel test runs the terms at `aux_loss_weight=50.0`, far above any training
 value. At a shipping coefficient the term is a ~1e-3 correction to the gate
 gradient, and no comparison against eager could separate it from GEMM noise — so
 the test would pass with the dense contribution deleted.
+
+---
+
+## Scheduling the balancing bias
+
+`bias_update_rate` is fixed when the router is built, and for most of a run that
+is what you want. DeepSeek-V3 did not leave it fixed to the end: it ran γ=0.001
+for the first 14.3T tokens of 14.8T and then set it to **0.0** for the last 500B,
+so the router specializes freely once the experts are trained.
+
+`RouterBiasSchedule` does that, as a curve rather than a switch. It multiplies
+the built rate by an AnySchedule factor every step:
+
+```python
+BIAS_SCHEDULE = {
+    "mode": "composer",
+    "end": -1,
+    "schedules": [
+        {"mode": "constant", "end": 0.9},
+        {"mode": "cosine", "end": 1.0, "min_value": 0.0},
+    ],
+}
+```
+
+That holds the rate flat for 90% of the run and anneals it to zero over the last
+10%. A plain `{"mode": "cosine", "end": -1, "min_value": 0.0}` decays from the
+first step instead, which balances least where balance matters most, so prefer
+the composer. `end: -1` is filled from `MAX_STEPS` by `autofill_schedule_steps`,
+the same way the learning rate is. The config is read through
+`anyschedule.utils.get_scheduler`, which takes a config and returns a callable
+without an optimizer to wrap.
+
+Two properties worth knowing:
+
+- **A zero rate freezes the bias but not the reporting.** `update_bias` still
+  runs, so `load_accum` still fills and `moe/load_imbalance_max` still reports.
+  Freezing by skipping the call would have gone blind exactly when the routing
+  stops being steered.
+- **The factor multiplies the built rate, not the current one.** The callback
+  reads the base once at train start. Re-reading it each step would compound the
+  factor into a geometric decay that no config describes, and a resume would land
+  somewhere off the curve. `tests/test_training.py::test_router_bias_schedule_scales_the_built_rate_without_compounding`
+  pins both halves.
+
+### What to watch while it anneals
+
+`moe/load_imbalance_max` alone cannot tell you whether annealing was safe,
+because the same value means two different things. A router that genuinely wants
+near-uniform load and one that is being forced there by a large bias both report
+about 1.1.
+
+The distinguishing quantity is the **magnitude of `expert_bias`**, which is not
+logged today. If the spread is small compared with the gap between adjacent
+expert ranks, roughly `1/E` for sigmoid scores, the router is doing the balancing
+and annealing is safe. If the spread is large and still growing, the balancer is
+carrying the load and removing it will move the routing.

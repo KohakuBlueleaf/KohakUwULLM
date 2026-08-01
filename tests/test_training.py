@@ -48,6 +48,7 @@ from kohakuwullm.training.parallel.uwupipe import (
     first_mismatch,
     verify_same_batch,
 )
+from kohakuwullm.training.parallel.uwupipe_callbacks import RouterBiasSchedule
 from kohakuwupipe import PipelineGradScaler
 from kohakuwupipe.parallel.plan import partition
 from kohakuwupipe.parallel.streams import reduce_accumulator
@@ -1514,3 +1515,30 @@ def test_target_reaches_loss_with_its_structure_intact():
 
     with pytest.raises(AttributeError):
         _split_tensor(batch, TensorChunkSpec(0), 4)
+
+
+def test_router_bias_schedule_scales_the_built_rate_without_compounding():
+    """The factor multiplies the rate the routers were built with, every step.
+
+    Re-reading the current rate instead would compound the factor, so the bias
+    would decay geometrically rather than follow the curve, and a resume would
+    land somewhere no config describes.
+    """
+    written = []
+    inner = types.SimpleNamespace(
+        bias_update_rate=lambda: 1e-3, set_bias_update_rate=written.append
+    )
+    module = types.SimpleNamespace(inner=inner)
+    callback = RouterBiasSchedule(
+        module, {"mode": "cosine", "end": 100, "min_value": 0.0}
+    )
+
+    # A resume lands mid-curve rather than restarting the anneal.
+    callback.on_train_start(types.SimpleNamespace(global_step=50))
+    assert written[-1] == pytest.approx(5e-4, rel=1e-2)
+
+    callback.on_train_batch_end(None, types.SimpleNamespace(index=100))
+    assert written[-1] == pytest.approx(0.0, abs=1e-9)
+
+    callback.on_train_batch_end(None, types.SimpleNamespace(index=0))
+    assert written[-1] == pytest.approx(1e-3), "the factor compounded"

@@ -5,6 +5,7 @@ a tokenizer or a sampler lives here. See docs/internals/pipeline.md.
 """
 
 import torch
+from anyschedule.utils import get_scheduler
 from tqdm.auto import tqdm
 
 from kohakuwullm.generation import build_generator
@@ -12,34 +13,35 @@ from kohakuwullm.training.parallel.pipeline_lightning import decode_stage
 from kohakuwupipe import Callback
 
 
-class RouterBiasFreeze(Callback):
-    """Zero every router's bias update rate from ``step`` onward.
+class RouterBiasSchedule(Callback):
+    """Scale every router's bias update rate by an AnySchedule factor each step.
 
-    The balancing bias stops moving and the imbalance metric keeps reporting, so
-    the freeze is visible in the logs. Applied on resume too, when the restored
-    step is already past ``step``. See docs/internals/moe-router-loss.md.
+    The factor multiplies the rate the routers were built with, so a factor of
+    zero freezes the bias while the load counter and the imbalance metric keep
+    reporting. Resuming re-applies the factor for the restored step.
+    See docs/internals/moe-router-loss.md.
 
     Args:
         module: the :class:`LMPipelineModule` being trained.
-        step: global step at which to freeze; 0 never freezes.
+        config: one AnySchedule scheduler config, shaped as ``SCHEDULER_CONFIG``'s
+            entries are. Read standalone, without an optimizer.
     """
 
-    def __init__(self, module, step: int) -> None:
+    def __init__(self, module, config: dict) -> None:
         self.module = module
-        self.step = step
-        self.frozen = False
+        self.schedule = get_scheduler(dict(config))
+        self.base: float | None = None
 
-    def freeze(self, loop) -> None:
-        self.module.inner.set_bias_update_rate(0.0)
-        self.frozen = True
+    def apply(self, step: int) -> None:
+        if self.base is not None:
+            self.module.inner.set_bias_update_rate(self.base * self.schedule(step))
 
     def on_train_start(self, loop) -> None:
-        if not self.frozen and 0 < self.step <= loop.global_step:
-            self.freeze(loop)
+        self.base = self.module.inner.bias_update_rate()
+        self.apply(loop.global_step)
 
     def on_train_batch_end(self, loop, out, batch=None, batch_idx=0) -> None:
-        if not self.frozen and 0 < self.step <= out.index:
-            self.freeze(loop)
+        self.apply(out.index)
 
 
 class SamplePreview(Callback):
