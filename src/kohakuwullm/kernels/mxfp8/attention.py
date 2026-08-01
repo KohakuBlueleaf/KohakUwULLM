@@ -1,0 +1,128 @@
+"""MXFP8 flash attention forward for sm_120.
+
+`QK^T` runs in block-scaled e4m3; the probabilities feed `PV` in bf16, because
+that product's error survives the softmax backward's cancellation. Scales run
+along the contraction axis in both cases.
+
+See docs/internals/mxfp8-attention.md.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+from kohakuwullm.kernels.mxfp8.quantize import BLOCK_SCALE, _quantize_block
+
+
+@triton.jit
+def _fwd_kernel(
+    q_ptr, qs_ptr, k_ptr, ks_ptr, v_ptr, o_ptr, lse_ptr,
+    sm_scale, T, HEAD: tl.constexpr,
+    sq_t, sq_d, sqs_t, sqs_g, sk_t, sk_d, sks_t, sks_g,
+    sv_t, sv_d, so_t, so_d,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_SUB: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
+    """One BLOCK_M row-block of output; K and V are streamed in BLOCK_N chunks."""
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD)
+    groups: tl.constexpr = HEAD // BLOCK_SUB
+    offs_g = tl.arange(0, groups)
+
+    qm = offs_m < T
+    q = tl.load(q_ptr + offs_m[:, None] * sq_t + offs_d[None, :] * sq_d,
+                mask=qm[:, None], other=0.0)
+    qs = tl.load(qs_ptr + offs_m[:, None] * sqs_t + offs_g[None, :] * sqs_g,
+                 mask=qm[:, None], other=0)
+
+    acc = tl.zeros((BLOCK_M, HEAD), dtype=tl.float32)
+    m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    hi = (pid + 1) * BLOCK_M if CAUSAL else T
+    for start in range(0, hi, BLOCK_N):
+        offs_n = start + tl.arange(0, BLOCK_N)
+        km = offs_n < T
+        k = tl.load(k_ptr + offs_n[:, None] * sk_t + offs_d[None, :] * sk_d,
+                    mask=km[:, None], other=0.0)
+        ks = tl.load(ks_ptr + offs_n[:, None] * sks_t + offs_g[None, :] * sks_g,
+                     mask=km[:, None], other=0)
+        # Contraction is head_dim, so both scale sets are already on the right axis.
+        s = tl.dot_scaled(q, qs, "e4m3", tl.trans(k), ks, "e4m3",
+                          acc=tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32))
+        s = s * sm_scale
+        s = tl.where(km[None, :], s, float("-inf"))
+        if CAUSAL:
+            s = tl.where(offs_m[:, None] >= offs_n[None, :], s, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        alpha = tl.exp2((m_i - m_new) * 1.4426950408889634)
+        p = tl.exp2((s - m_new[:, None]) * 1.4426950408889634)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+
+        v = tl.load(v_ptr + offs_n[:, None] * sv_t + offs_d[None, :] * sv_d,
+                    mask=km[:, None], other=0.0)
+        acc = tl.dot(p.to(v.dtype), v, acc)
+        m_i = m_new
+
+    acc = acc / l_i[:, None]
+    tl.store(o_ptr + offs_m[:, None] * so_t + offs_d[None, :] * so_d,
+             acc.to(o_ptr.dtype.element_ty), mask=qm[:, None])
+    tl.store(lse_ptr + offs_m, m_i + tl.log(l_i), mask=qm)
+
+
+@triton.jit
+def _quant_rows_kernel(x_ptr, q_ptr, s_ptr, T, HEAD: tl.constexpr,
+                       sx_t, sx_d, sq_t, sq_d, ss_t, ss_g,
+                       BLOCK_M: tl.constexpr, BLOCK_SUB: tl.constexpr):
+    """Quantize a ``(T, HEAD)`` tensor with blocks along HEAD."""
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD)
+    mask = offs_m < T
+    x = tl.load(x_ptr + offs_m[:, None] * sx_t + offs_d[None, :] * sx_d,
+                mask=mask[:, None], other=0.0)
+    q, s = _quantize_block(x, BLOCK_M, HEAD, BLOCK_SUB)
+    tl.store(q_ptr + offs_m[:, None] * sq_t + offs_d[None, :] * sq_d, q,
+             mask=mask[:, None])
+    groups: tl.constexpr = HEAD // BLOCK_SUB
+    offs_g = tl.arange(0, groups)
+    tl.store(s_ptr + offs_m[:, None] * ss_t + offs_g[None, :] * ss_g, s,
+             mask=mask[:, None])
+
+
+def quantize_rows(x: torch.Tensor):
+    """``(T, HEAD)`` -> ``(e4m3, ue8m0)`` with blocks along HEAD."""
+    x = x.contiguous()
+    t, head = x.shape
+    q = torch.empty(t, head, device=x.device, dtype=torch.float8_e4m3fn)
+    s = torch.empty(t, head // BLOCK_SCALE, device=x.device, dtype=torch.uint8)
+    _quant_rows_kernel[(triton.cdiv(t, 32),)](
+        x, q, s, t, head, x.stride(0), x.stride(1), q.stride(0), q.stride(1),
+        s.stride(0), s.stride(1), BLOCK_M=32, BLOCK_SUB=BLOCK_SCALE, num_warps=4)
+    return q, s
+
+
+def mxfp8_attention(q, k, v, causal: bool = False, sm_scale: float | None = None,
+                    block_m: int = 64, block_n: int = 64):
+    """Single-head MXFP8 attention over ``(T, HEAD)`` inputs; returns ``(O, lse)``."""
+    t, head = q.shape
+    if head % BLOCK_SCALE:
+        raise ValueError(f"head_dim={head} must be a multiple of {BLOCK_SCALE}")
+    if block_n % BLOCK_SCALE:
+        raise ValueError(f"block_n={block_n} must be a multiple of {BLOCK_SCALE}")
+    sm_scale = sm_scale if sm_scale is not None else head**-0.5
+    qq, qs = quantize_rows(q)
+    kq, ks = quantize_rows(k)
+    o = torch.empty(t, head, device=q.device, dtype=v.dtype)
+    lse = torch.empty(t, device=q.device, dtype=torch.float32)
+    _fwd_kernel[(triton.cdiv(t, block_m),)](
+        qq, qs, kq, ks, v, o, lse, sm_scale, t, head,
+        qq.stride(0), qq.stride(1), qs.stride(0), qs.stride(1),
+        kq.stride(0), kq.stride(1), ks.stride(0), ks.stride(1),
+        v.stride(0), v.stride(1), o.stride(0), o.stride(1),
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_SUB=BLOCK_SCALE,
+        CAUSAL=causal, num_warps=4, num_stages=2)
+    return o, lse

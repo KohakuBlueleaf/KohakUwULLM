@@ -52,6 +52,20 @@ The SiLU-times-up fusion is the biggest single item, because the intermediate is
 `FFN`-wide: it is both the most expensive quantize and the largest bf16 tensor
 that never needs to exist.
 
+### Landed
+
+`kernels/mxfp8/fused_act.py`:
+
+| kernel | unfused | fused | gain |
+|---|---|---|---|
+| `swiglu_mx`, `silu(gate)*up` -> e4m3 | 0.181 ms | **0.096 ms** | **1.88x** |
+| `rmsnorm_mx` | 0.115 ms | **0.077 ms** | **1.50x** |
+
+`swiglu_mx` is also *more* accurate than the unfused path, against an fp64
+reference: relmax 0.0275 versus 0.0286, because the intermediate stays fp32
+instead of round-tripping through bf16. On a whole block the two fusions plus
+the gate/up de-duplication are worth **1.041x**.
+
 ### Why this is a kernel change, not a graph change
 
 `torch.compile` cannot do it. Inductor can fuse elementwise chains, but the MX

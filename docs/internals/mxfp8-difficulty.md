@@ -138,9 +138,62 @@ this card. Its limitation is the scale layout, not the instruction.
 
 ---
 
+## 6b. `torch.compile` is not actually blocked, and the fix is three lines
+
+An earlier revision of this document, and of the session that produced it,
+claimed `torch._scaled_mm` cannot be used under `torch.compile`. **That is
+wrong, and it was wrong in two ways.**
+
+Measured on this machine:
+
+| path | `torch.compile(fullgraph=True)` |
+|---|---|
+| per-tensor fp8 `_scaled_mm` | **works** |
+| rowwise fp8 `_scaled_mm` | **works** |
+| MXFP8 block-scaled with swizzled scales, `_scaled_mm_v2` | fails |
+
+Inductor registers lowerings for both `aten._scaled_mm.default` and
+`aten._scaled_mm_v2.default`, and TorchAO uses the op under `torch.compile`
+routinely. The failure is narrow and its message says so:
+
+```
+LoweringException: AssertionError: Inductor _scaled_mm_v2 lowering does not yet
+support non-trivial swizzles (got swizzle_a=[1], swizzle_b=[1])
+```
+
+Only the swizzled MXFP8 path is affected -- which is, unhappily, exactly the
+path that makes the vendor kernel fast (section 1).
+
+**The fix is to make the op opaque to Inductor.** Wrap it in
+`torch.library.custom_op` with a `register_fake`, and the graph compiles past
+it: no lowering is attempted, no graph break, the kernel runs as the vendor
+kernel. `kohakuwullm::mxfp8_mm_swizzled` in `kernels/mxfp8/interop.py` is that
+wrapper.
+
+Measured on a transformer block, `D=2048`, `FFN=8192`, 4096 tokens:
+
+| arm | ms |
+|---|---|
+| vendor eager | 3.060 |
+| vendor through the custom op, eager | 3.056 |
+| **vendor through the custom op, compiled** | **3.033** |
+| our Triton kernel plus fused epilogues, eager | 3.174 |
+
+So the vendor kernel keeps its speed **and** compiles, and it beats our best
+Triton path by about 4.6%. What you give up is fusion *into* the GEMM, which
+nobody wants anyway -- epilogue fusion belongs in the producing kernel, which is
+what `kernels/mxfp8/fused_act.py` does.
+
+**The general lesson: a lowering gap is not a compilation gap.** Before
+concluding that an op cannot be compiled, check whether it merely cannot be
+*lowered*, and wrap it if so.
+
+---
+
 ## 7. Decision
 
-**Keep `torch._scaled_mm` for MXFP8.** Reasons, in order:
+**Use `torch._scaled_mm` for MXFP8, through the custom-op wrapper in section
+6b.** It is the fastest path and it compiles. Reasons, in order:
 
 - The kernel gap is 1.31x, but MXFP8 is worth 1.08 to 1.23x end to end on our
   dense models. Closing the kernel gap completely is worth a few percent of a
