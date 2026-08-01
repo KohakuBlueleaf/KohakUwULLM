@@ -131,10 +131,10 @@ On `sm_120`, all non-FP64 tensor core instructions have the same latency of 29
 cycles and the same throughput of 23 cycles. FP16, BF16, FP8, FP6, FP4 and INT8
 all share one pipeline.
 
-Low precision is faster for one reason only. One instruction covers more K. An
-fp8 instruction multiplies twice the depth of an fp16 instruction in the same
-number of cycles. So the speed comes from the instruction shape, not from a
-faster circuit.
+Low precision covers more K per instruction, which predicts fp8 at 2x fp16.
+**Measured, it is 2.77x** (section 5c). The excess is pipeline depth, not the
+instruction shape: bf16 gets half the stages in 99 KB of shared memory and stalls
+first.
 
 The practical result is that **precision is a bandwidth and capacity decision,
 not a compute decision**. You pick fp8 to move fewer bytes and to fit more
@@ -426,14 +426,12 @@ does not do.
 
 ### It does not compute its register budget
 
-This is the largest single defect and it is invisible in the source.
+A `128 x 128` tile with 4 warps gives 128 accumulator registers per thread, which
+lands at one warp per sub-core.
 
-A `128 x 128` tile with 4 warps gives 128 accumulator registers per thread. The
-occupancy collapses to one warp per sub-core, which is below the threshold where
-this card hides latency at all.
-
-The fix is one number. Use 8 warps, or make the tile narrower. No profiling is
-needed to find this. It is arithmetic on the tile shape.
+**Measured, this is worth about 1%** (section 5b), and 16 warps is worth nothing
+at all. It reads like the largest defect and it is not. Compute the budget so you
+know where you are, then sweep the tile, which is worth up to 15%.
 
 ### It does not order its CTAs
 
@@ -540,6 +538,47 @@ against a 99 KiB budget means one CTA per SM whatever the register count says.
 Treat `regs_per_thread <= 102` as a rule for kernels that rely on warp-level
 latency hiding, and **not** as a rule for a software-pipelined GEMM.
 
+## 5c. The empirical ceilings, and why fp8 beats its instruction ratio
+
+Section 2 says a low-precision instruction is faster only because it covers more
+K, which predicts fp8 at 2x bf16. Measured across eight large shapes on one
+RTX 5090, the ratio is **2.77x**, and it is stable (2.69 to 2.91).
+
+| | value | what it is |
+|---|---|---|
+| bf16 compute peak | 420 TF/s | the hardware limit |
+| bf16 MAMF | 270 TF/s | achievable matmul rate, section 0 |
+| bf16 best cuBLAS observed | 247.0 TF/s | what a library reaches, **not a ceiling** |
+| MXFP8 best `scaled_mm` observed | 684.7 TF/s | likewise |
+
+**Do not use the cuBLAS figure as a denominator.** It is a library's achieved
+rate, not the machine's limit. A GEMM is compute bound at these shapes, so the
+ceiling is the compute peak, and MAMF is the honest achievable target.
+
+The extra 0.77x is the pipeline, and section 1 predicted it without connecting
+it to this number. At 99 KB of shared memory a bf16 tile costs about 32 KB per
+stage and an fp8 tile about 16 KB, so bf16 gets roughly half the stages and
+cannot hide the 372-cycle DRAM latency as well. **bf16 on this card is shared
+memory limited before it is tensor core limited.** Low precision buys depth as
+well as bandwidth, and depth is worth more here than the instruction shape.
+
+Against those ceilings rather than against cuBLAS at one shape:
+
+| kernel | best | of MAMF | of compute peak |
+|---|---|---|---|
+| our Triton bf16 | 243.5 | **90%** | **58%** |
+| cuBLAS bf16 | 247.0 | 91% | 59% |
+
+So our bf16 kernel matches cuBLAS and **both are at 58% of the compute peak**.
+Reaching cuBLAS is not reaching the hardware. The remaining 42% is what section 1
+predicts: bf16 gets about half the pipeline stages fp8 does in 99 KB of shared
+memory, so it stalls before the tensor core saturates.
+
+For MXFP8 at the shapes this model actually runs, K is 384 or 768, and our Triton
+kernel aggregates to **87.9% of `scaled_mm`**, beating it on the head at 103%.
+[../internals/mxfp8.md](../internals/mxfp8.md) attributes that residual to the
+scale fragment layout.
+
 ## 6. Conclusion
 
 A GEMM is a memory schedule with some arithmetic attached. The arithmetic is
@@ -564,7 +603,7 @@ The order of work that follows from this document:
    170 wastes whole SMs.
 7. **Put fusion in the epilogue, never in the prologue.** The load path is a copy
    engine. It cannot compute. Cast where the data is already in registers.
-7. **Use asynchronous loads last.** TMA is present on this card but its load
+8. **Use asynchronous loads last.** TMA is present on this card but its load
    latency is 488 to 620 cycles, which is worse than a plain DRAM read. It pays
    only when you already have enough pipeline stages to hide it, and shared
    memory limits those to about three. Multicast TMA is worse than absent here,
@@ -600,34 +639,3 @@ External references:
 - [Accelerating MoE with a persistent cache aware grouped GEMM in Triton](https://pytorch.org/blog/accelerating-moes-with-a-triton-persistent-cache-aware-grouped-gemm-kernel/).
 - [CUTLASS: persistent kernels and Stream-K](https://research.colfax-intl.com/cutlass-tutorial-persistent-kernels-and-stream-k/).
 - [CUTLASS: efficient GEMM in CUDA](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html).
-
-## 5c. The empirical ceilings, and why fp8 beats its instruction ratio
-
-Section 2 says a low-precision instruction is faster only because it covers more
-K, which predicts fp8 at 2x bf16. Measured across eight large shapes on one
-RTX 5090, the ratio is **2.77x**, and it is stable (2.69 to 2.91).
-
-| | best observed | shape |
-|---|---|---|
-| bf16, cuBLAS | **247.0 TF/s** | 16384 x 8192 x 8192 |
-| MXFP8, `scaled_mm` | **684.7 TF/s** | 4096 cubed |
-
-The extra 0.77x is the pipeline, and section 1 predicted it without connecting
-it to this number. At 99 KB of shared memory a bf16 tile costs about 32 KB per
-stage and an fp8 tile about 16 KB, so bf16 gets roughly half the stages and
-cannot hide the 372-cycle DRAM latency as well. **bf16 on this card is shared
-memory limited before it is tensor core limited.** Low precision buys depth as
-well as bandwidth, and depth is worth more here than the instruction shape.
-
-Against those ceilings rather than against cuBLAS at one shape:
-
-| kernel | best | share of the ceiling |
-|---|---|---|
-| our Triton bf16 | 243.5 | **99%** |
-| our Triton MXFP8, K=1280 | 645 | **94%** |
-| our Triton MXFP8, square | 512 | 75% |
-
-So the bf16 kernel is at the machine's limit, not merely at cuBLAS's. The MXFP8
-kernel is at the limit for shallow K and 25 points short for square shapes, and
-[../internals/mxfp8.md](../internals/mxfp8.md) attributes that residual to the
-scale fragment layout.
