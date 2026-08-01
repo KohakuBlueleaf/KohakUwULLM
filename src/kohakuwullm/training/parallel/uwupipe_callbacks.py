@@ -61,7 +61,8 @@ class SamplePreview(Callback):
         at_start: also preview on the first step, before any training.
         report: ``(step, rows) -> None`` on rank 0, where a row is
             ``(name, prompt, index, text)``. The text is never logged.
-        max_new_tokens / temperature / top_p: sampling controls.
+        max_new_tokens / temperature / top_p / top_k / min_p: sampling
+            controls. ``max_new_tokens=None`` fills the model's context.
     """
 
     def __init__(
@@ -74,9 +75,11 @@ class SamplePreview(Callback):
         at_start: bool = True,
         samples: int = 16,
         report=None,
-        max_new_tokens: int = 128,
+        max_new_tokens: int | None = 128,
         temperature: float = 0.35,
         top_p: float = 0.95,
+        top_k: int = 0,
+        min_p: float = 0.0,
     ) -> None:
         self.module = module
         self.tokenizer = tokenizer
@@ -91,6 +94,8 @@ class SamplePreview(Callback):
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.top_k = top_k
+        self.min_p = min_p
         self._generator = None
 
     def on_train_batch_end(self, loop, out, batch=None, batch_idx=0) -> None:
@@ -119,6 +124,9 @@ class SamplePreview(Callback):
                     max_new_tokens=self.max_new_tokens,
                     temperature=self.temperature,
                     top_p=self.top_p,
+                    top_k=self.top_k,
+                    min_p=self.min_p,
+                    eos_token_id=self.tokenizer.eos_token_id,
                 )
                 if self.ranks.rank:
                     continue

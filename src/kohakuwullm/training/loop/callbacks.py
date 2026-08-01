@@ -74,7 +74,8 @@ class SampleLogCallback(Callback):
         tokenizer: used to decode (and to encode the prompts).
         prompts: raw prompt strings; ``None`` uses a small TIPO-shaped default.
         every_n_steps: cadence; ``<= 0`` disables.
-        max_new_tokens / temperature / top_p: sampling settings.
+        max_new_tokens / temperature / top_p / top_k / min_p: sampling
+            settings. ``max_new_tokens=None`` fills the model's context.
     """
 
     DEFAULT_PROMPTS = [
@@ -88,9 +89,11 @@ class SampleLogCallback(Callback):
         tokenizer,
         prompts: list[str] | None = None,
         every_n_steps: int = 1000,
-        max_new_tokens: int = 96,
+        max_new_tokens: int | None = 96,
         temperature: float = 0.8,
         top_p: float = 0.95,
+        top_k: int = 0,
+        min_p: float = 0.0,
     ) -> None:
         self.tokenizer = tokenizer
         self.prompts = prompts or self.DEFAULT_PROMPTS
@@ -98,6 +101,8 @@ class SampleLogCallback(Callback):
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.top_k = top_k
+        self.min_p = min_p
         self._last_step = -1
         self._disabled = False
         self._collective = False
@@ -158,6 +163,8 @@ class SampleLogCallback(Callback):
                 max_new_tokens=self.max_new_tokens,
                 temperature=self.temperature,
                 top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
             completion = self.tokenizer.decode(

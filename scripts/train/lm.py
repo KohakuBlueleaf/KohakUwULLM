@@ -154,6 +154,12 @@ LOG_INTERVAL = 10
 CKPT_INTERVAL = 5000
 SAMPLE_INTERVAL = 1000  # generate preview completions every N steps (0 disables)
 SAMPLE_PROMPTS = None
+# None runs every row to EOS or to the model's context limit.
+SAMPLE_TOKENS: int | None = None
+SAMPLE_TEMPERATURE = 0.8
+SAMPLE_TOP_P = 0.95
+SAMPLE_TOP_K = 0
+SAMPLE_MIN_P = 0.0
 THROUGHPUT_INTERVAL = 50
 
 
@@ -357,7 +363,14 @@ def main():
     if SAMPLE_INTERVAL > 0:
         callbacks.append(
             SampleLogCallback(
-                tokenizer, prompts=SAMPLE_PROMPTS, every_n_steps=SAMPLE_INTERVAL
+                tokenizer,
+                prompts=SAMPLE_PROMPTS,
+                every_n_steps=SAMPLE_INTERVAL,
+                max_new_tokens=SAMPLE_TOKENS,
+                temperature=SAMPLE_TEMPERATURE,
+                top_p=SAMPLE_TOP_P,
+                top_k=SAMPLE_TOP_K,
+                min_p=SAMPLE_MIN_P,
             )
         )
 

@@ -284,3 +284,68 @@ def test_decode_absorbs_the_schedules_first_extra_forward(monkeypatch):
     steps = prompt.shape[1] + 4 - 1
     assert attached[-1][0].length == steps
     assert built == [1], "the schedule was rebuilt, so the extra forward ran again"
+
+
+# ------------------------------------------------------------------ stop rules
+
+
+def test_a_finished_row_stays_at_eos_and_stops_the_batch():
+    """One row hitting EOS must not be resampled, and an all-EOS batch stops.
+
+    Without the hold, a finished row keeps drawing tokens, so ``finished.all()``
+    is never reached and every preview runs the full budget.
+    """
+    tokens = torch.zeros(3, 1, dtype=torch.long)
+    finished = torch.tensor([[False], [False], [False]])
+    tokens, finished = engine.advance(
+        tokens, torch.tensor([[7], [1], [2]]), finished, 7
+    )
+    assert finished.tolist() == [[True], [False], [False]]
+
+    # Row 0 has finished: whatever it samples next is replaced by EOS.
+    tokens, finished = engine.advance(
+        tokens, torch.tensor([[3], [7], [4]]), finished, 7
+    )
+    assert tokens[0].tolist() == [0, 7, 7]
+    assert finished.tolist() == [[True], [True], [False]]
+
+    tokens, finished = engine.advance(
+        tokens, torch.tensor([[3], [3], [7]]), finished, 7
+    )
+    assert bool(finished.all())
+    assert tokens[:, -1].tolist() == [7, 7, 7]
+
+
+def test_token_budget_fills_the_context_and_clamps():
+    """``None`` means 'to the context limit'; a larger request is clamped to it."""
+    assert engine.token_budget(None, 10, 4096) == 4086
+    assert engine.token_budget(50, 10, 4096) == 50
+    assert engine.token_budget(10_000, 10, 4096) == 4086
+    assert engine.token_budget(None, 4096, 4096) == 0
+
+
+def test_generation_stops_early_when_every_row_emits_eos():
+    """A batch whose rows all reach EOS must return before the budget is spent."""
+    backbone = _backbone()
+    sampler = PreviewSampler()
+    # Both rows carry the same prompt, so greedy decoding makes them finish on
+    # the same step; a batch that finishes raggedly is covered by `advance`.
+    prompt = torch.randint(0, 512, (1, 5)).expand(2, 5).contiguous()
+    # Whatever the first token is, declare it EOS.
+    first = sampler.generate(backbone, prompt, max_new_tokens=1, temperature=0.0)
+    eos = int(first[0, -1])
+    out = sampler.generate(
+        backbone, prompt, max_new_tokens=64, temperature=0.0, eos_token_id=eos
+    )
+    assert out.shape[1] < prompt.shape[1] + 64
+    assert (out[:, -1] == eos).all()
+
+
+def test_generation_without_a_cap_fills_the_context():
+    """``max_new_tokens=None`` runs to ``max_position``, not to a default."""
+    backbone = _backbone(max_position=24)
+    prompt = torch.randint(0, 512, (2, 5))
+    out = PreviewSampler().generate(
+        backbone, prompt, max_new_tokens=None, temperature=0.0
+    )
+    assert out.shape[1] == 24

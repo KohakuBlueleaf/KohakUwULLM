@@ -135,8 +135,12 @@ SAMPLE_INTERVAL = 0
 # Each is kwargs for `tipo.build_prompt`; a bare tag string is off-distribution.
 SAMPLE_PROMPTS: list | None = None
 SAMPLE_COUNT = 16
-SAMPLE_TOKENS = 128
+# None runs every row to EOS or to the model's context limit.
+SAMPLE_TOKENS: int | None = None
 SAMPLE_TEMPERATURE = 0.35
+SAMPLE_TOP_P = 0.95
+SAMPLE_TOP_K = 0
+SAMPLE_MIN_P = 0.0
 # Ranks to launch when the script is run outside torchrun. 0 uses every GPU.
 GPUS = 0
 
@@ -388,6 +392,9 @@ def main() -> None:
                 report=report_samples,
                 max_new_tokens=SAMPLE_TOKENS,
                 temperature=SAMPLE_TEMPERATURE,
+                top_p=SAMPLE_TOP_P,
+                top_k=SAMPLE_TOP_K,
+                min_p=SAMPLE_MIN_P,
             )
         )
     scaling = (

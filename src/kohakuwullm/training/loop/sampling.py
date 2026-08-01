@@ -6,6 +6,7 @@ default one. See docs/guides/training.md.
 
 import torch
 
+from kohakuwullm.generation.engine import advance, sample, token_budget
 from kohakuwullm.models.cache import KVCache
 
 # Fixed rather than derived from the run seed, so two runs draw the same noise.
@@ -33,45 +34,55 @@ class PreviewSampler:
         self,
         backbone,
         prompt_ids: torch.Tensor,
-        max_new_tokens: int = 128,
+        max_new_tokens: int | None = 128,
         temperature: float = 1.0,
         top_p: float = 0.95,
+        top_k: int = 0,
+        min_p: float = 0.0,
         eos_token_id: int | None = None,
         generator: torch.Generator | None = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
         """Autoregressively extend ``prompt_ids`` in the padded layout.
 
-        ``use_cache=False`` re-runs the whole prefix each step; the two must
-        agree token for token at ``temperature=0``. See docs/concepts/architecture.md.
+        ``max_new_tokens=None`` runs until every row has emitted EOS or the
+        model's context is full. ``use_cache=False`` re-runs the whole prefix each
+        step; the two must agree token for token at ``temperature=0``.
+        See docs/concepts/architecture.md.
         """
         was_training = backbone.training
         generator = generator or self.generator(prompt_ids.device)
+        rows, prompt_len = prompt_ids.shape
+        budget = token_budget(max_new_tokens, prompt_len, backbone.config.max_position)
         backbone.eval()
         try:
             tokens = prompt_ids.clone()
+            finished = torch.zeros(rows, 1, dtype=torch.bool, device=prompt_ids.device)
             cache = (
                 KVCache.from_config(
                     backbone.config,
-                    batch_size=tokens.shape[0],
-                    max_length=tokens.shape[1] + max_new_tokens,
+                    batch_size=rows,
+                    max_length=prompt_len + budget,
                     device=tokens.device,
                 )
                 if use_cache
                 else None
             )
             step = tokens
-            for _ in range(max_new_tokens):
+            for _ in range(budget):
                 hidden = backbone(step, cache=cache)
                 logits = backbone.head.logits(hidden[:, -1]).float()
-                if temperature <= 0:
-                    nxt = logits.argmax(-1, keepdim=True)
-                else:
-                    probs = torch.softmax(logits / temperature, dim=-1)
-                    nxt = top_p_sample(probs, top_p, generator)
-                tokens = torch.cat([tokens, nxt], dim=1)
-                step = nxt if cache is not None else tokens
-                if eos_token_id is not None and (nxt == eos_token_id).all():
+                nxt = sample(
+                    logits,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    generator=generator,
+                )
+                tokens, finished = advance(tokens, nxt, finished, eos_token_id)
+                step = tokens[:, -1:].contiguous() if cache is not None else tokens
+                if bool(finished.all()):
                     break
         finally:
             # Restored even if sampling raises; gradient checkpointing keys off it.
