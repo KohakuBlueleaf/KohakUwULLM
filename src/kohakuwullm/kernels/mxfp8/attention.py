@@ -556,3 +556,77 @@ def mxfp8_attn(
 ) -> torch.Tensor:
     """Differentiable single-head MXFP8 attention over ``(T, HEAD)`` inputs."""
     return _MXFP8Attention.apply(q, k, v, causal, sm_scale, smooth_k)
+
+
+def split_qkv_mx(q_fused, s_fused, dim: int):
+    """Split a fused ``(T, 3*dim)`` MXFP8 qkv into three views, scales included.
+
+    ``dim`` must be a multiple of the scale block, so the split lands on group
+    boundaries and no re-quantization is needed.
+    """
+    if dim % BLOCK_SCALE:
+        raise ValueError(f"dim={dim} must be a multiple of {BLOCK_SCALE}")
+    g = dim // BLOCK_SCALE
+    return tuple(
+        (q_fused[:, i * dim : (i + 1) * dim], s_fused[:, i * g : (i + 1) * g])
+        for i in range(3)
+    )
+
+
+def mxfp8_attention_q(
+    qq,
+    qs,
+    kq,
+    ks,
+    v,
+    causal: bool = False,
+    sm_scale: float | None = None,
+    block_m: int = 64,
+    block_n: int | None = None,
+):
+    """Attention from operands already quantized by the producing kernel.
+
+    Avoids re-reading Q and K to quantize them, which the attention loop would
+    otherwise pay once per Q block. See docs/internals/mxfp8-attention.md.
+    """
+    t, head = qq.shape
+    if head % BLOCK_SCALE:
+        raise ValueError(f"head_dim={head} must be a multiple of {BLOCK_SCALE}")
+    if block_n is not None and block_n % BLOCK_SCALE:
+        raise ValueError(f"block_n={block_n} must be a multiple of {BLOCK_SCALE}")
+    sm_scale = sm_scale if sm_scale is not None else head**-0.5
+    block_n = block_n if block_n is not None else (128 if head <= 64 else 64)
+    stages = 3 if head <= 64 else 2
+    o = torch.empty(t, head, device=qq.device, dtype=v.dtype)
+    lse = torch.empty(t, device=qq.device, dtype=torch.float32)
+    _fwd_kernel[(triton.cdiv(t, block_m),)](
+        qq,
+        qs,
+        kq,
+        ks,
+        v,
+        o,
+        lse,
+        sm_scale,
+        t,
+        head,
+        qq.stride(0),
+        qq.stride(1),
+        qs.stride(0),
+        qs.stride(1),
+        kq.stride(0),
+        kq.stride(1),
+        ks.stride(0),
+        ks.stride(1),
+        v.stride(0),
+        v.stride(1),
+        o.stride(0),
+        o.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_SUB=BLOCK_SCALE,
+        CAUSAL=causal,
+        num_warps=4,
+        num_stages=stages,
+    )
+    return o, lse
