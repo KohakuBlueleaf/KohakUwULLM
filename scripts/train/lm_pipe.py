@@ -99,6 +99,9 @@ AUTOCAST_DTYPE = "bf16"
 MXFP8 = False
 MXFP8_MOE = "fused"
 COMPILE: dict | None = None
+# torch.compile each rank's whole stage module, in place. Default inductor mode:
+# reduce-overhead captures CUDA graphs, which 1F1B forbids.
+COMPILE_STAGE = False
 
 # ===================================================================== #
 # Optimizer / schedule
@@ -144,6 +147,9 @@ SAMPLE_MIN_P = 0.0
 # Gather the model and decode on one card; pipelined decode costs one
 # pipeline traversal per token.
 SAMPLE_LOCAL = True
+# When SAMPLE_LOCAL is off: drive pipelined decode with a forward-only
+# send/recv pass instead of a training schedule.
+SAMPLE_FORWARD_ONLY = True
 # Ranks to launch when the script is run outside torchrun. 0 uses every GPU.
 GPUS = 0
 
@@ -356,7 +362,7 @@ def main() -> None:
         head_kwargs=HEAD_KWARGS or None,
         mxfp8=MXFP8,
         mxfp8_moe=MXFP8_MOE,
-        compile_spec=COMPILE,
+        compile_spec=COMPILE or ({} if COMPILE_STAGE else None),
         scheduler_config=schedule_config,
         loader=loader,
     )
@@ -399,6 +405,7 @@ def main() -> None:
                 top_k=SAMPLE_TOP_K,
                 min_p=SAMPLE_MIN_P,
                 local=SAMPLE_LOCAL,
+                forward_only=SAMPLE_FORWARD_ONLY,
             )
         )
     scaling = (

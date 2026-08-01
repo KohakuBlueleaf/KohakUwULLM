@@ -12,7 +12,6 @@ import torch
 import torch.distributed as dist
 from anyschedule import AnySchedule
 
-from kohakuwullm.compile_utils import apply_compile
 from kohakuwullm.models import LMBackbone
 from kohakuwullm.models.components.moe import MoEMLP
 from kohakuwullm.models.mxfp8_swap import refresh_mxfp8_weights, swap_mxfp8
@@ -219,11 +218,15 @@ class LMPipelineModule(PipelineModule):
             if report.blocking:
                 raise RuntimeError(f"mxfp8 swap incomplete: {report.blocking}")
             self.mxfp8_modules = len(report.modules)
-        if self.compile_spec and self.compile_spec.get("mode", "module") == "model":
-            raise ValueError(
-                "compile mode 'model' renames checkpoint keys; use 'module'"
-            )
-        apply_compile(inner, self.compile_spec)
+        if self.compile_spec is not None:
+            if not isinstance(self.compile_spec, dict):
+                raise TypeError(
+                    f"compile_spec must be a dict of torch.compile kwargs, got "
+                    f"{type(self.compile_spec).__name__} {self.compile_spec!r}"
+                )
+            # In place and over the whole stage: one graph per rank, and the
+            # checkpoint keys stay unprefixed. See docs/internals/pipeline.md.
+            inner.compile(**self.compile_spec)
         self.inner = inner
         if self.autocast_dtype is None:
             return inner

@@ -67,6 +67,8 @@ class SamplePreview(Callback):
             ``(name, prompt, index, text)``. The text is never logged.
         local: gather the whole model and decode on one card. Off falls back to
             pipelined decode, which costs one pipeline traversal per token.
+        forward_only: drive pipelined decode with a plain send/recv forward
+            rather than a training schedule.
         max_new_tokens / temperature / top_p / top_k / min_p: sampling
             controls. ``max_new_tokens=None`` fills the model's context.
     """
@@ -87,6 +89,7 @@ class SamplePreview(Callback):
         top_k: int = 0,
         min_p: float = 0.0,
         local: bool = True,
+        forward_only: bool = True,
     ) -> None:
         self.module = module
         self.tokenizer = tokenizer
@@ -104,6 +107,7 @@ class SamplePreview(Callback):
         self.top_k = top_k
         self.min_p = min_p
         self.local = local
+        self.forward_only = forward_only
         self._generator = None
         self._local_model = None
 
@@ -219,5 +223,6 @@ class SamplePreview(Callback):
                 world=self.ranks.world,
                 microbatches=1,
                 autocast_dtype=self.module.autocast_dtype,
+                forward_only_decode=self.forward_only,
             )
         return self._generator

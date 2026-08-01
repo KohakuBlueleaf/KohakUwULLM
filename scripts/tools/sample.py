@@ -101,10 +101,8 @@ def build_model():
     if MXFP8:
         model._swap_to_mxfp8()
     if COMPILE:
-        # Per block, matching scripts/bench/e2e/step_throughput.py: the chunked
-        # cross-entropy head is hostile to whole-model compilation.
-        for i, block in enumerate(model.blocks):
-            model.blocks[i] = torch.compile(block, mode=COMPILE)
+        # In place and over the whole backbone: one graph per decode step.
+        model.compile(mode=COMPILE)
     return model
 
 

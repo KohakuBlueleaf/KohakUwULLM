@@ -121,9 +121,10 @@ class LocalGenerator(Generator):
         backbone: an :class:`LMBackbone` with an ``LMHead``.
     """
 
-    def __init__(self, backbone, seed: int = SAMPLE_SEED) -> None:
+    def __init__(self, backbone, seed: int = SAMPLE_SEED, static: bool = True) -> None:
         super().__init__(seed)
         self.backbone = backbone
+        self.static = static
 
     @torch.no_grad()
     def generate(
@@ -160,6 +161,7 @@ class LocalGenerator(Generator):
                     batch_size=rows,
                     max_length=prompt_len + budget,
                     device=prompt_ids.device,
+                    static=self.static,
                 )
                 if use_cache
                 else None
@@ -210,9 +212,11 @@ class PipelineGenerator(Generator):
         seed: int = SAMPLE_SEED,
         microbatches: int | None = None,
         autocast_dtype: torch.dtype | None = None,
+        forward_only_decode: bool = True,
     ) -> None:
         super().__init__(seed)
         self.microbatches = microbatches
+        self.forward_only_decode = forward_only_decode
         self.stage = stage
         self.head_module = head_module
         self.rank = rank
@@ -229,6 +233,31 @@ class PipelineGenerator(Generator):
     def cache_dtype(self) -> torch.dtype:
         """Dtype the key/value buffers are stored in."""
         return self.head_module.boundary_dtype or self.autocast_dtype or torch.bfloat16
+
+    def forward_only(self, step, rows: int):
+        """One forward across the stages: recv, run this rank's layers, send.
+
+        Returns the last stage's hidden and ``None`` elsewhere. Carries no
+        autograd state and builds no schedule, so a decode step costs one hop per
+        stage rather than a training step's bookkeeping.
+        See docs/guides/generation.md.
+        """
+        last = self.world - 1
+        dim = self.head_module.config.dim
+        shape = (rows, step.shape[1], dim)
+        with self.head_context():
+            if self.rank == 0:
+                hidden = self.stage.submod(step)
+            else:
+                buf = torch.empty(shape, dtype=self.cache_dtype(), device=step.device)
+                dist.recv(buf, src=self.rank - 1)
+                hidden = self.stage.submod(buf)
+        if isinstance(hidden, tuple):
+            hidden = hidden[0]
+        if self.rank != last:
+            dist.send(hidden.to(self.cache_dtype()).contiguous(), dst=self.rank + 1)
+            return None
+        return hidden
 
     def _caches(self, chunks: int, rows: int, length: int, device):
         """One :class:`KVCache` per microbatch, sized for ``length`` positions."""
@@ -302,8 +331,8 @@ class PipelineGenerator(Generator):
             raise ValueError(f"{rows} rows do not split into {chunks} microbatches")
         per_chunk = rows // chunks
         try:
-            self.prepare(chunks, per_chunk, device)
-            schedule = self.schedule
+            if not self.forward_only_decode:
+                self.prepare(chunks, per_chunk, device)
             self.head_module.set_cache(self._caches(chunks, per_chunk, total, device))
             tokens = prompt_ids.clone()
             finished = torch.zeros(rows, 1, dtype=torch.bool, device=device)
@@ -313,9 +342,14 @@ class PipelineGenerator(Generator):
                 step = tokens[:, pos : pos + 1].clone(
                     memory_format=torch.contiguous_format
                 )
-                # New iteration for cudagraph trees; see docs/guides/generation.md.
-                torch.compiler.cudagraph_mark_step_begin()
-                hidden = schedule.step(step) if self.rank == 0 else schedule.step()
+                if self.forward_only_decode:
+                    hidden = self.forward_only(step, rows)
+                else:
+                    hidden = (
+                        self.schedule.step(step)
+                        if self.rank == 0
+                        else self.schedule.step()
+                    )
                 if pos < prompt_len - 1:
                     continue
                 nxt = torch.zeros(rows, 1, dtype=torch.long, device=device)
