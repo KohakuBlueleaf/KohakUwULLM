@@ -313,6 +313,8 @@ class PipelineGenerator(Generator):
                 step = tokens[:, pos : pos + 1].clone(
                     memory_format=torch.contiguous_format
                 )
+                # New iteration for cudagraph trees; see docs/guides/generation.md.
+                torch.compiler.cudagraph_mark_step_begin()
                 hidden = schedule.step(step) if self.rank == 0 else schedule.step()
                 if pos < prompt_len - 1:
                     continue

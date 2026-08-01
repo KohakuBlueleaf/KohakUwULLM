@@ -55,6 +55,14 @@ NUM_MICROBATCHES = 16
 # [5,4,4,3] measured 13% slower here than the [5,5,5,1] measurement derives.
 LAYERS = []
 SCHEDULE = "1f1b"
+# CUDA-graph capture on the blocks; the chunked CE head is hostile to
+# whole-model compilation. Applies to training and to the preview decode, which
+# runs through the same stage module.
+COMPILE = {
+    "mode": "module",
+    "targets": ["blocks"],
+    "compile_mode": "reduce-overhead",
+}
 PARAM_DTYPE = "fp16"
 AUTOCAST_DTYPE = "fp16"
 MXFP8 = True
@@ -90,8 +98,8 @@ CONSOLE_INTERVAL = 200
 PROGRESS_BAR = True
 SAMPLE_INTERVAL = 2000
 SAMPLE_COUNT = 8
-# None runs each row to its own EOS, capped by the 4096-token context.
-SAMPLE_TOKENS = None
+# Each row still ends at its own EOS; this only bounds a row that never emits one.
+SAMPLE_TOKENS = 512
 SAMPLE_TEMPERATURE = 1.0
 SAMPLE_MIN_P = 0.1
 # kwargs for tipo.build_prompt: the format the renderer trains on, not a bare

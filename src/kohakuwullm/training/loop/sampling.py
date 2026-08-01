@@ -70,6 +70,8 @@ class PreviewSampler:
             )
             step = tokens
             for _ in range(budget):
+                # New iteration for cudagraph trees; see docs/guides/generation.md.
+                torch.compiler.cudagraph_mark_step_begin()
                 hidden = backbone(step, cache=cache)
                 logits = backbone.head.logits(hidden[:, -1]).float()
                 nxt = sample(
