@@ -36,9 +36,19 @@ Two numbers are **not** in that list and must be measured, not computed.
   Do not derive it from `memory_clock_rate`. On the 5090 the stock-clock
   theoretical figure sits within a rounding error of the measured one and the
   card actually clocks higher, so the theoretical number is a convincing decoy.
-- **Peak matmul rate.** Time a large square cuBLAS GEMM. Do not compute it from
-  the clock and the core count. Use the measured value as the denominator for
-  every efficiency claim you make.
+- **Peak matmul rate.** Write a microbenchmark of back to back `mma.sync` with
+  register-resident operands and several independent accumulator chains, and
+  time that. `scratchpad/mma_peak.cu` is the one this repo uses.
+
+  **Do not use a cuBLAS GEMM for this, and do not use a vendor spec sheet.**
+  cuBLAS is a library's achieved rate, so dividing by it hides exactly the gap
+  you are looking for, and it can be beaten. A spec sheet quotes the
+  fp16-accumulate rate, which is 2x the fp32-accumulate rate on GeForce and is
+  not a rate a trainer may use. Both mistakes were live in this repo's own
+  documents and each one moved every reported efficiency by more than 30 points.
+
+  Report the accumulator type with the number, always. On this card, measured:
+  276.8 TFLOP/s for bf16 or fp16 into fp32, 551.0 for fp16 into fp16.
 
 ---
 
@@ -58,7 +68,9 @@ memory size. They do not share anything that scales with the die.
 | registers per SM | 65536 | 65536 |
 | shared memory per CTA | about 99 KB | about 99 KB |
 | L1 per SM | 128 KB | 128 KB |
-| bf16 matmul, fp32 accumulate | 270 TFLOP/s measured | **estimate only, measure it** |
+| bf16 matmul into fp32, ISA ceiling | 276.8 TFLOP/s measured | **estimate only, measure it** |
+| the same, achievable with a real instruction mix | 265.2 TFLOP/s measured | **measure it** |
+| sustained SM clock, tensor-only load | 3.16 GHz measured | **measure it** |
 
 The 5060 Ti compute figure is deliberately left blank. Scaling by SM count and
 clock suggests roughly 60 TFLOP/s, but an estimate is not a denominator. Measure
@@ -200,8 +212,26 @@ compiled = my_kernel[grid](...)
 print(compiled.n_regs, compiled.n_spills, compiled.metadata.shared)
 ```
 
-**Any value of `n_spills` above zero means you have already lost.** A spill goes
-to local memory, which is DRAM.
+**Spilling is a gradient, not a switch.** A spill goes to local memory, which is
+backed by DRAM but caches in L1, so a handful of spill slots in a hot loop cost
+almost nothing while a large number falls off a cliff. Measured on the Stream-K
+bf16 GEMM, all at the same tile:
+
+| registers | spills | TFLOP/s |
+|---|---|---|
+| 160 | 0 | 250.4 |
+| 128 | 16 | 253.9 |
+| 84 | 84 | **52.6** |
+
+The 16-spill config is the fastest of the three, because capping registers at
+128 is what fits a second CTA on the SM, and that is worth more than the spills
+cost. A TMA variant of the same kernel reaches 128 registers with **zero**
+spills and measures 253.1, which is the same rate. So those 16 spills are worth
+under 0.5%.
+
+Treat `n_spills` as a number to read and weigh against what buying it down
+would cost, not as a pass/fail gate. Above roughly a quarter of the register
+count, it is a cliff and the gate is real.
 
 ### Budget 2: shared memory, which sets pipeline depth
 
@@ -244,16 +274,42 @@ the hardware maximum. Target 5 or more. See budget 1 for the register cost.
 
 ```
 ctas       = ceil(M / BM) * ceil(N / BN)
-waves      = ceil(ctas / (SMs * ctas_per_sm))
-efficiency = ctas / (waves * SMs * ctas_per_sm)
+efficiency = (ctas / SMs) / ceil(ctas / SMs)
 ```
 
-If efficiency is below about 0.9, use a persistent kernel. Launch exactly
-`SMs * ctas_per_sm` CTAs and loop over output tiles inside. There is then no
-partial wave by construction.
+**`ctas_per_sm` does not appear.** Whatever the residency, the SM that draws the
+most CTAs sets the makespan, and it draws `ceil(ctas / SMs)` of them while the
+average is `ctas / SMs`. Residency decides whether the tensor pipe stays busy,
+which is budget 3, not how the work divides.
+
+For a GEMM this is usually the largest single term. On 170 SMs with 128-wide
+tiles it is 86% at `4096^3` and 75% at `256 x 128`. Measure it before you tune
+anything else.
+
+A persistent kernel alone does **not** fix it: six tiles per CTA and a leftover
+of four is still one CTA doing seven while the rest do six. The fix is Stream-K,
+which splits the leftover tiles along K so every CTA finishes together, and it
+is worth 1.06x against cuBLAS where efficiency is poor. It costs an fp32 fixup,
+so it is a per-shape decision with a closed form; see
+[../performance/gemm.md](../performance/gemm.md) section 5d.
 
 Compute this for the card you are on **and** for the 5090, because of the trap in
 section 3.
+
+### The two factors, and how to tell them apart
+
+A GEMM's distance from the ISA ceiling factors cleanly:
+
+```
+%ISA = wave_efficiency * pipe_busy
+```
+
+`wave_efficiency` is budget 4 and is pure arithmetic on the shape. `pipe_busy`
+is everything else, and it is measured by dividing. Keeping them separate is
+what makes a result interpretable: at `4096^3` a plain `128x128x32` kernel runs
+at 82.4% of the ceiling, which is 86.1% of waves times 95.7% of pipe. The tile
+was nearly perfect and the schedule was the problem, and the single number 82.4%
+does not tell you that.
 
 ### Budget 5: bytes against FLOPs, which tells you where to look
 
@@ -354,6 +410,18 @@ the CPU and pass.
 
 ### Benchmarking
 
+- **Report best-of-N, not the mean, and say which you used.** Warm up 50 times,
+  then time 50 to 100 iterations with CUDA events and keep the minimum. This is
+  the MAMF convention. On this card the difference between mean and best is only
+  about 1%, so the mean is not what makes a number wrong, but it does put the
+  measurement at the mercy of whatever else the machine did during the run.
+- **Interleave the arms you are comparing.** Sustained benchmarking heats the
+  card and the clock drops. Measured here: the same config timed first and timed
+  fifth in one run differed by 1.8%, which is larger than most of the effects
+  worth chasing. Run arms round-robin and keep each arm's best round, and report
+  the spread as the noise floor.
+- **Establish that noise floor before you believe any single-digit result.**
+  It is about 1 to 3% on an idle 5090.
 - **Warm up every shape.** A partial warmup over a varlen stream charges Triton
   compilation as throughput.
 - **Use graph timing for small kernels.** `graph_ms` gives device time without

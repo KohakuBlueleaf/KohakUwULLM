@@ -20,14 +20,72 @@ A GEMM does `2*M*N*K` floating point operations. It moves at least
 `M*K + K*N + M*N` elements. The ratio of these two numbers is the arithmetic
 intensity. It tells you which limit you are close to.
 
-The RTX 5090 gives us these ceilings:
+The RTX 5090 gives us these ceilings. Every one is measured on this card, by
+`mma_peak.cu` for the instruction rates and `l2_bw.cu` for the memory rates.
 
-| resource | value | source |
+| resource | value | how |
 |---|---|---|
-| DRAM bandwidth | 1791 GB/s | measured, see [README.md](README.md) |
-| bf16 matmul, fp32 accumulate | 270 TFLOP/s | measured ceiling |
-| fp16 matmul, fp16 accumulate | 325 TFLOP/s | measured |
-| MXFP8 matmul, vendor kernel | 693 TFLOP/s | measured |
+| DRAM read | 1830 GB/s | streaming read, working set far above L2 |
+| L2 read | 13300 GB/s | 32 MB working set, L1 bypassed with `ld.global.cg` |
+| bf16 or fp16 matmul, fp32 accumulate | **276.8 TFLOP/s** | back to back `mma.sync`, operands in registers |
+| fp16 matmul, fp16 accumulate | 551.0 TFLOP/s | same |
+| e4m3 matmul, fp32 accumulate | 551.3 TFLOP/s | same |
+| fp32 FMA on the CUDA cores | 132.9 TFLOP/s | same |
+
+Sustained SM clock under a tensor-only load is 3.16 GHz. Divide the rates by
+`170 SMs * 3.16 GHz` and the per-SM numbers come out as exact powers of two:
+512 FLOP/cycle for an fp32 accumulator, 1024 for an fp16 accumulator or for
+fp8, and 128 FMA lanes.
+
+**276.8 TFLOP/s is the number to divide by for a bf16 training GEMM**, because
+training accumulates in fp32. The 420 TFLOP/s figure that appears in vendor
+material is the fp16-accumulate rate at stock boost clock, which is a different
+instruction and not one a trainer may use. An earlier revision of this document
+used it as the bf16 ceiling and so reported every kernel at roughly 60% of peak
+when the true figure was about 90%.
+
+### Two ways to get this number wrong, both of which happened here
+
+**Do not take a rate from a spec sheet.** The widely quoted 420 TFLOP/s for this
+card is the fp16-accumulate rate at stock boost. It is a different instruction
+and a trainer may not use it.
+
+**Do not take a rate from a peak-finder without reading its disassembly.** The
+`mmapeak` tool on this machine reports 409.2 TFLOP/s for `bf16bf16f32`. Its
+kernel is built on `wmma::fragment<16,16,16>` and it credits `2*M*N*K` per
+`mma_sync`, which is 8192 FLOP. Disassembled, that kernel contains exactly 8192
+`HMMA.16816` for its 8192 loop iterations, so it issues **one** `m16n8k16` per
+call and does 4096 FLOP. Its bf16 figure is therefore exactly 2x too high, and
+the honest reading of it is 204.6 TFLOP/s. It is lower than our 276.8 because
+its loop is a single serial accumulator chain with a `__syncwarp()` per
+iteration, so it measures dependent-issue latency, not throughput.
+
+The same 2x applies to every shape it reports as `16_16_16` or `32_8_16`,
+including `f16f16f16` and `s8s8s32`. Its `16_8_32` shapes match the hardware
+instruction and **are** counted correctly.
+
+### The fp8 rates, and why the block scaled one is not the plain one
+
+From the same disassembly, three different SASS opcodes appear for fp8:
+
+| mmapeak kernel | SASS | reported | counted correctly |
+|---|---|---|---|
+| `f8f8f32_16_8_32` | `QMMA.16832.F32.E4M3.E4M3` | 408.9 | yes |
+| `f8f8f16_16_8_32` | `QMMA.16832.F16.E4M3.E4M3` | 817.9 | yes |
+| `mxf8mxf8f32_16_8_32` | `QMMA.SF.16832.F32.E4M3.E4M3.E8` | 816.8 | yes |
+
+**The block scaled instruction runs at twice the plain one and keeps that rate
+with an fp32 accumulator.** Plain e4m3 into fp32 is half rate, exactly as bf16
+into fp32 is; the `QMMA.SF` form is not. So MXFP8's advantage over bf16 is not
+2x from K depth alone, it is closer to 4x, and the 693 TFLOP/s recorded for the
+vendor kernel in section 4 sits comfortably under that ceiling rather than
+above it.
+
+Our own multi-chain measurement of *plain* e4m3 is 551.3, which is higher than
+mmapeak's 408.9 for the same instruction because of the ILP difference above.
+The block scaled ceiling has **not** been measured here with adequate ILP; the
+2x ratio above comes from mmapeak's own latency-bound pair, so treat roughly
+1100 TFLOP/s as an estimate and measure it before quoting a percentage.
 
 Take one real shape from our benchmark, `16384 x 5120 x 1280`. It needs 215
 GFLOP. It moves 223 MB if the reuse is perfect. At the ceilings above, the
@@ -125,16 +183,26 @@ save bandwidth. It doubles the pipeline depth you can afford.** On a card with
 
 ## 2. Tensor cores and CUDA cores
 
-### The tensor core is the same speed for every format
+### The tensor core issue rate depends on the accumulator, not on the input
 
-On `sm_120`, all non-FP64 tensor core instructions have the same latency of 29
-cycles and the same throughput of 23 cycles. FP16, BF16, FP8, FP6, FP4 and INT8
-all share one pipeline.
+Measured on this card, one `mma.sync` occupies its sub-core for:
 
-Low precision covers more K per instruction, which predicts fp8 at 2x fp16.
-**Measured, it is 2.77x** (section 5c). The excess is pipeline depth, not the
-instruction shape: bf16 gets half the stages in 99 KB of shared memory and stalls
-first.
+| instruction | cycles | FLOP/cycle/SM |
+|---|---|---|
+| `m16n8k16.f32.bf16.bf16.f32` | 32 | 512 |
+| `m16n8k16.f32.f16.f16.f32` | 32 | 512 |
+| `m16n8k16.f16.f16.f16.f16` | 16 | 1024 |
+| `m16n8k32.f32.e4m3.e4m3.f32` | 32 | 1024 |
+
+Two separate effects hide behind "low precision is faster", and they compose:
+
+- **An fp16 accumulator issues twice as fast as an fp32 one**, for the same
+  input type and the same instruction shape. This is a GeForce restriction. A
+  trainer cannot spend it, because a 16k-deep fp16 reduction is not accurate
+  enough for a loss curve.
+- **A narrower input covers more K per instruction.** e4m3 keeps the 32 cycle
+  issue rate but contracts 32 elements instead of 16, so it delivers exactly
+  2x. Nothing about the pipeline is involved.
 
 The practical result is that **precision is a bandwidth and capacity decision,
 not a compute decision**. You pick fp8 to move fewer bytes and to fit more
@@ -538,46 +606,143 @@ against a 99 KiB budget means one CTA per SM whatever the register count says.
 Treat `regs_per_thread <= 102` as a rule for kernels that rely on warp-level
 latency hiding, and **not** as a rule for a software-pipelined GEMM.
 
-## 5c. The empirical ceilings, and why fp8 beats its instruction ratio
+## 5c. Where a bf16 GEMM's time actually goes
 
-Section 2 says a low-precision instruction is faster only because it covers more
-K, which predicts fp8 at 2x bf16. Measured across eight large shapes on one
-RTX 5090, the ratio is **2.77x**, and it is stable (2.69 to 2.91).
+The ceiling is 276.8 TFLOP/s (section 0). A bf16 GEMM's distance from it is the
+product of three factors, each measurable on its own. All three come from one
+fixed shape, `4096 x 4096 x 4096`, on an idle RTX 5090.
 
-| | value | what it is |
+### Factor 1: the instruction mix, worth 4.2 points
+
+`mma_ldsm.cu` runs the main loop with no global traffic and no epilogue: HMMA
+fed from shared memory by `ldmatrix`, at a chosen ratio, with a chosen number of
+`bar.sync` per iteration. The ratios come from counting the real kernel's SASS,
+which is 32 HMMA, 12 LDSM and 2 BAR per k-iteration.
+
+| mix per 32 HMMA | 1 CTA/SM | 2 CTA/SM |
 |---|---|---|
-| bf16 compute peak | 420 TF/s | the hardware limit |
-| bf16 MAMF | 270 TF/s | achievable matmul rate, section 0 |
-| bf16 best cuBLAS observed | 247.0 TF/s | what a library reaches, **not a ceiling** |
-| MXFP8 best `scaled_mm` observed | 684.7 TF/s | likewise |
+| 12 LDSM, 0 BAR | 98.7% | 99.4% |
+| 12 LDSM, 1 BAR | 95.2% | 97.2% |
+| **12 LDSM, 2 BAR** | 93.5% | **95.8%** |
+| 12 LDSM, 4 BAR | 91.3% | 94.8% |
+| 0 LDSM, 2 BAR | 99.5% | 99.5% |
 
-**Do not use the cuBLAS figure as a denominator.** It is a library's achieved
-rate, not the machine's limit. A GEMM is compute bound at these shapes, so the
-ceiling is the compute peak, and MAMF is the honest achievable target.
+Read the last row against the third. **Barriers alone are free and `ldmatrix`
+alone is free; only the combination costs anything.** A `bar.sync` makes every
+warp rendezvous, which exposes the `ldmatrix` latency that warps were otherwise
+hiding for each other. This is the tax a shared-memory pipeline pays for being
+synchronous, and it is why the achievable target for this instruction mix is
+265.2 TFLOP/s, not 276.8.
 
-The extra 0.77x is the pipeline, and section 1 predicted it without connecting
-it to this number. At 99 KB of shared memory a bf16 tile costs about 32 KB per
-stage and an fp8 tile about 16 KB, so bf16 gets roughly half the stages and
-cannot hide the 372-cycle DRAM latency as well. **bf16 on this card is shared
-memory limited before it is tensor core limited.** Low precision buys depth as
-well as bandwidth, and depth is worth more here than the instruction shape.
+### Factor 2: wave quantization, worth up to 25 points
 
-Against those ceilings rather than against cuBLAS at one shape:
+170 SMs and whole output tiles. With `BM = BN = 128` on this shape the grid is
+1024 tiles, some SM must run `ceil(1024/170) = 7` of them, and the average is
+6.02. That caps the kernel at `6.02/7 = 86.1%` before any other consideration.
 
-| kernel | best | of MAMF | of compute peak |
+Tile choice moves it, and the two effects fight:
+
+| tile | wave efficiency | of its wave bound | %ISA |
 |---|---|---|---|
-| our Triton bf16 | 243.5 | **90%** | **58%** |
-| cuBLAS bf16 | 247.0 | 91% | 59% |
+| 256x128x32 | 75.3% | 92.8% | 69.9% |
+| 128x128x32 | 86.1% | 95.7% | 82.4% |
+| 128x64x64 | 92.7% | 92.3% | 85.6% |
+| 64x128x64 | 92.7% | 94.3% | 87.3% |
+| 64x64x64 | 96.4% | 84.5% | 81.5% |
 
-So our bf16 kernel matches cuBLAS and **both are at 58% of the compute peak**.
-Reaching cuBLAS is not reaching the hardware. The remaining 42% is what section 1
-predicts: bf16 gets about half the pipeline stages fp8 does in 99 KB of shared
-memory, so it stalls before the tensor core saturates.
+A smaller tile balances better and computes worse. The product peaks near
+`64 x 128`. **Stream-K decouples them**, and section 5d is what that buys.
 
-For MXFP8 at the shapes this model actually runs, K is 384 or 768, and our Triton
-kernel aggregates to **87.9% of `scaled_mm`**, beating it on the head at 103%.
-[../internals/mxfp8.md](../internals/mxfp8.md) attributes that residual to the
-scale fragment layout.
+### Factor 3: occupancy, worth 5 points
+
+One CTA per SM leaves nothing to cover a tile's prologue and epilogue. Two CTAs
+per SM cover each other. The register file decides which you get: at 8 warps a
+`128 x 128` fp32 accumulator is 64 registers per thread, and two CTAs of 256
+threads need the total at or under 128.
+
+That single constraint is why `128 x 128` is the largest useful bf16 tile here,
+and it is a register argument, not a shared memory one.
+
+### What this replaces
+
+An earlier revision of this section claimed bf16 was "shared memory limited
+before it is tensor core limited", and put both our kernel and cuBLAS at 58% of
+peak. Both statements were artefacts of dividing by the wrong ceiling. Deeper
+pipelines were then measured and do nothing: at `BLOCK_K = 16`, going from 3 to
+4 to 5 buffers moves the rate by less than 1%, and every one of them is slower
+than `BLOCK_K = 32`. Shared memory capacity is not what limits a bf16 GEMM on
+this card.
+
+## 5d. Stream-K, and beating cuBLAS on a fixed shape
+
+Wave quantization is the largest single term and it is a scheduling problem, so
+it has a scheduling answer. Launch exactly `SMs * CTAs_per_SM` CTAs. Give each
+one a whole number of output tiles, then split the leftover tiles along K so
+every CTA finishes at the same moment. Split tiles accumulate into an fp32
+scratch that a fixup pass casts into C.
+
+At `4096^3`, bf16, order-controlled and best-of-N:
+
+| kernel | TFLOP/s | %ISA | vs cuBLAS |
+|---|---|---|---|
+| plain `128x128x32` | 228.0 | 82.4% | 0.946 |
+| plain `64x128x64` | 241.1 | 87.1% | 1.000 |
+| cuBLAS | 241.1 | 87.1% | 1.000 |
+| Stream-K, all CTAs split | 251.6 | 90.9% | 1.043 |
+| **Stream-K, 85 CTAs split** | **255.9** | **92.5%** | **1.061** |
+
+Two details carry most of it.
+
+**Two CTAs per SM, bought with `maxnreg`.** The persistent kernel naturally
+compiles to 160 registers, which fits one CTA. Capping it at 128 fits two and
+costs 16 spilled registers, and the trade is worth about 1.4%.
+
+**Cap how many CTAs take part in the K split.** The leftover here is 4 tiles.
+Letting all 340 CTAs share them balances perfectly but makes 340 CTAs each
+atomically add a `128 x 128` fp32 tile, which is 22 MB of atomic traffic to
+finish 4 tiles. Letting too few share them rebuilds the imbalance. The cost is
+`sk_total/s` of imbalance against `s * BM * BN * 4` of traffic, so the optimum
+is near `s = sqrt(c * sk_total)`; `c` fits at about 14 on this card.
+
+| CTAs splitting | 340 | 170 | 85 | 32 | 8 |
+|---|---|---|---|---|---|
+| TFLOP/s | 253.7 | 256.3 | **256.7** | 254.5 | 240.3 |
+
+### Stream-K is a selection, not a default
+
+Across six shapes and both dtypes it is a geometric mean of 1.004 against
+cuBLAS, winning on eight of twelve points and losing badly on one.
+
+| shape | wave eff | vs cuBLAS bf16 | vs cuBLAS fp16 |
+|---|---|---|---|
+| 4096 x 4096 x 4096 | 86.1% | **1.053** | **1.066** |
+| 4096 x 4096 x 16384 | 86.1% | **1.054** | **1.053** |
+| 16384 x 1280 x 5120 | 94.1% | 1.018 | 1.026 |
+| 16384 x 5120 x 1280 | 97.2% | 1.020 | 1.007 |
+| 8192 x 8192 x 8192 | 96.4% | 0.988 | 0.987 |
+| 8192 x 1280 x 1280 | 94.1% | **0.896** | **0.897** |
+
+The pattern is exactly what factor 2 predicts. Stream-K pays where wave
+efficiency is worst and does nothing where it is already high.
+
+The failure is instructive. `8192 x 1280 x 1280` gives 640 tiles against 340
+CTAs, so `640 // 340` is 1 and the leftover is **300 of the 640 tiles**. Nearly
+half the output goes through the atomic path, for about 67 MB of fixup traffic
+against only 101 us of arithmetic. Both terms are known before launch, so the
+choice is a calculation:
+
+```
+gain = (1 / wave_efficiency) / (1 + fixup_seconds / compute_seconds)
+```
+
+That predicts 0.79 for this shape and above 1.02 for the four that win, which is
+the right call in all six cases. **This is the offline selection table that
+section 5 says a fixed tile cannot replace**, and it is arithmetic on shape, not
+a benchmark sweep.
+
+Accuracy is unchanged: against an fp64 reference, cuBLAS, the plain kernel and
+Stream-K all give a maximum relative error of 0.002869 and an RMS of 0.001662,
+which is bf16 output rounding and nothing else.
 
 ## 6. Conclusion
 
@@ -586,31 +751,43 @@ fixed by the problem. Everything you control is about moving data.
 
 The order of work that follows from this document:
 
-1. **Compute the roofline for your shape.** One line of arithmetic tells you
+1. **Measure your own ceiling before you divide by anything.** One microbenchmark
+   of back to back `mma.sync` with register-resident operands. Every efficiency
+   claim in this document changed when that number changed.
+2. **Compute the roofline for your shape.** One line of arithmetic tells you
    whether to work on memory or on compute. Our shapes are 7 times compute bound,
    which rules out most bandwidth work immediately.
-2. **Sweep the tile shape.** Measured at up to 15%, shape-dependent, and the
-   single largest lever. No one tile wins everywhere, which is why cuBLAS ships
-   many kernels and why an offline table beats a constant.
-3. **Check that your low precision instruction is the one you think it is.** Read
+3. **Count the waves.** `(tiles/SMs) / ceil(tiles/SMs)` is a hard cap and on a
+   170 SM card it is routinely 86%. It is the largest single term in section 5c
+   and it costs one line to compute.
+4. **Fix the waves with Stream-K, and decide per shape whether to.** Section 5d.
+   Worth 1.06x against cuBLAS where wave efficiency is poor, 0.90x where the
+   fixup traffic outweighs it, and the two are comparable before launch.
+5. **Get two CTAs per SM.** It covers the prologue and epilogue that one CTA
+   cannot. On this card that means the register total at or under 128, which
+   caps the accumulator and therefore the tile.
+6. **Sweep the tile shape.** Measured at up to 15%, shape-dependent. No one tile
+   wins everywhere, which is why cuBLAS ships many kernels and why an offline
+   table beats a constant.
+7. **Check that your low precision instruction is the one you think it is.** Read
    the PTX. A silent fallback to bf16 gives correct answers at half speed. Ours
    emits `mma.sync...kind::mxf8f6f4.block_scale`, verified.
-4. **Add the contiguity hints and an aligned-K fast path.** Worth 2.5%, cheap,
+8. **Add the contiguity hints and an aligned-K fast path.** Worth 2.5%, cheap,
    and the most reliable change measured.
-5. **Do not reach for warp count or rasterization first.** Measured at 1% and 0%
+9. **Do not reach for warp count or rasterization first.** Measured at 1% and 0%
    respectively on this card. See section 5b.
-6. **Remove partial waves.** 170 SMs and a tile count that is not a multiple of
-   170 wastes whole SMs.
-7. **Put fusion in the epilogue, never in the prologue.** The load path is a copy
-   engine. It cannot compute. Cast where the data is already in registers.
-8. **Use asynchronous loads last.** TMA is present on this card but its load
-   latency is 488 to 620 cycles, which is worse than a plain DRAM read. It pays
-   only when you already have enough pipeline stages to hide it, and shared
-   memory limits those to about three. Multicast TMA is worse than absent here,
-   because it degrades by about four orders of magnitude.
+10. **Put fusion in the epilogue, never in the prologue.** The load path is a copy
+    engine. It cannot compute. Cast where the data is already in registers.
+11. **Use asynchronous loads last, and expect nothing from warp specialization.**
+    TMA does cut register pressure, measured at 126 registers with no spills
+    against 128 with 16, but Triton then allocates twice the shared memory and
+    the occupancy is lost again. Warp specialization measured 0.93x on this
+    card: consumer warps still hold the accumulator in registers, because
+    `mma.sync` has nowhere else to put it, so the producer and consumer split
+    buys nothing that this architecture can spend.
 
-The pattern across all seven is the same. Most of the wins come from arithmetic
-you can do on paper, about tiles, registers, waves and cache sizes. The
+The pattern is the same across all eleven. Most of the wins come from arithmetic
+you can do on paper, about waves, registers, tiles and cache sizes. The
 instruction level work comes last, and it is worth less than it looks.
 
 The most expensive mistake is to read advice for the wrong chip. Consumer
