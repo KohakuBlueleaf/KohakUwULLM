@@ -81,11 +81,44 @@ into fp32 is; the `QMMA.SF` form is not. So MXFP8's advantage over bf16 is not
 vendor kernel in section 4 sits comfortably under that ceiling rather than
 above it.
 
-Our own multi-chain measurement of *plain* e4m3 is 551.3, which is higher than
-mmapeak's 408.9 for the same instruction because of the ILP difference above.
-The block scaled ceiling has **not** been measured here with adequate ILP; the
-2x ratio above comes from mmapeak's own latency-bound pair, so treat roughly
-1100 TFLOP/s as an estimate and measure it before quoting a percentage.
+Measured here with four independent accumulator chains, which is the honest
+throughput rather than mmapeak's dependent-issue latency:
+
+| instruction | TFLOP/s | vs bf16 into fp32 |
+|---|---|---|
+| `m16n8k16 f32.bf16.bf16.f32` | 279.3 | 1.00x |
+| `m16n8k32 f32.e4m3.e4m3.f32` | 555.8 | 1.99x |
+| `m16n8k32 kind::mxf8f6f4.block_scale ... ue8m0` | **1096.7** | **3.93x** |
+
+**The block scaled instruction is twice the plain e4m3 one and roughly four
+times bf16.** It keeps full rate with an fp32 accumulator, which plain e4m3 does
+not. Note that it needs `-gencode arch=compute_120a,code=sm_120a`; a plain
+`-arch=sm_120` rejects `.kind::mxf8f6f4` outright.
+
+Against that ceiling, every MXFP8 path we have is far from the machine:
+
+| path | best | of 1096.7 |
+|---|---|---|
+| vendor `_scaled_mm`, pre-quantized | 696.9 | **63.5%** |
+| our Triton pre-quantized | 596.5 | 54.4% |
+| our Stream-K port | 528.8 | 48.2% |
+
+### Stream-K does not transfer to MXFP8
+
+The scheduling fix that is worth 1.06x on bf16 measures **0.65 to 0.84x of the
+vendor kernel** here, and is slower than our own pre-quantized kernel on every
+shape tried. The reason is in the ceiling above. At four times the arithmetic
+rate, a tile's compute time is a quarter of what it was, so every fixed cost
+inflates fourfold against it:
+
+- The fixup atomics move the same bytes against a quarter of the compute.
+- L2 traffic per tile is unchanged, so its utilisation at a `128 x 128` tile
+  rises from about 32% to about 65%.
+
+**Wave quantization stops being the dominant term when the arithmetic gets
+cheap enough.** The bf16 cost model's weights do not carry over, and an MXFP8
+planner needs its own calibration with larger tiles to cut L2 traffic. Replacing
+`_scaled_mm` is not yet possible: the gap is 1.17x at best and 1.5x at worst.
 
 Take one real shape from our benchmark, `16384 x 5120 x 1280`. It needs 215
 GFLOP. It moves 223 MB if the reuse is perfect. At the ceilings above, the
