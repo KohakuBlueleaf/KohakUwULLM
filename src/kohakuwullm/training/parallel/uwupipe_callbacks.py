@@ -12,6 +12,36 @@ from kohakuwullm.training.parallel.pipeline_lightning import decode_stage
 from kohakuwupipe import Callback
 
 
+class RouterBiasFreeze(Callback):
+    """Zero every router's bias update rate from ``step`` onward.
+
+    The balancing bias stops moving and the imbalance metric keeps reporting, so
+    the freeze is visible in the logs. Applied on resume too, when the restored
+    step is already past ``step``. See docs/internals/moe-router-loss.md.
+
+    Args:
+        module: the :class:`LMPipelineModule` being trained.
+        step: global step at which to freeze; 0 never freezes.
+    """
+
+    def __init__(self, module, step: int) -> None:
+        self.module = module
+        self.step = step
+        self.frozen = False
+
+    def freeze(self, loop) -> None:
+        self.module.inner.set_bias_update_rate(0.0)
+        self.frozen = True
+
+    def on_train_start(self, loop) -> None:
+        if not self.frozen and 0 < self.step <= loop.global_step:
+            self.freeze(loop)
+
+    def on_train_batch_end(self, loop, out, batch=None, batch_idx=0) -> None:
+        if not self.frozen and 0 < self.step <= out.index:
+            self.freeze(loop)
+
+
 class SamplePreview(Callback):
     """Generate completions through the schedule every ``every_n_steps``.
 

@@ -33,7 +33,10 @@ from kohakuwullm.training.parallel.uwupipe import (
     plan_for,
     with_router_losses,
 )
-from kohakuwullm.training.parallel.uwupipe_callbacks import SamplePreview
+from kohakuwullm.training.parallel.uwupipe_callbacks import (
+    RouterBiasFreeze,
+    SamplePreview,
+)
 from kohakuwullm.utils import autofill_schedule_steps
 from kohakuwupipe import (
     Checkpoint,
@@ -76,6 +79,9 @@ HEAD_KWARGS: dict = {}
 # Both ride a second boundary stream. See docs/internals/moe-router-loss.md.
 AUX_LOSS_WEIGHT = 0.0
 ROUTER_Z_LOSS_WEIGHT = 0.0
+# Step at which the aux-loss-free balancer stops moving; 0 leaves it on for the
+# whole run. See docs/internals/moe-router-loss.md.
+BIAS_FREEZE_STEP = 0
 
 # ===================================================================== #
 # Pipeline. LAYERS pins the split; None lets the cost model choose.
@@ -355,6 +361,8 @@ def main() -> None:
     ]
     if PROGRESS_BAR:
         callbacks.append(ProgressBar())
+    if BIAS_FREEZE_STEP:
+        callbacks.append(RouterBiasFreeze(module, BIAS_FREEZE_STEP))
     if CKPT_DIR:
         callbacks.append(
             Checkpoint(

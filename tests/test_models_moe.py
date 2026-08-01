@@ -260,3 +260,25 @@ def test_relu_router_counts_match_its_own_indices():
     for expert in idx.reshape(-1).tolist():
         expected[expert] += 1
     assert torch.equal(counts, expected)
+
+
+def test_freezing_the_bias_rate_stops_it_without_stopping_the_metric():
+    """A zero update rate must hold the bias still and keep reporting imbalance.
+
+    Freezing by skipping ``update_bias`` would also stop the load counter, so the
+    run would go blind to the routing exactly when it stops being steered.
+    """
+    moe = MoEMLP(dim=8, num_experts=4, top_k=2, hidden=8, num_shared=0)
+    load = torch.tensor([10.0, 1.0, 1.0, 1.0])
+
+    moe.router.load_accum.copy_(load)
+    before = moe.router.expert_bias.clone()
+    assert moe.router.update_bias() is not None
+    assert not torch.equal(moe.router.expert_bias, before), "the bias never moved"
+
+    moe.router.bias_update_rate = 0.0
+    moe.router.load_accum.copy_(load)
+    frozen = moe.router.expert_bias.clone()
+    ratio = moe.router.update_bias()
+    assert torch.equal(moe.router.expert_bias, frozen), "a frozen bias still moved"
+    assert ratio is not None and float(ratio) == pytest.approx(10.0 / 3.25)

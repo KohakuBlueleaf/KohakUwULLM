@@ -287,6 +287,18 @@ class LMStage(nn.Module):
             "moe/load_imbalance_mean": stacked.mean(),
         }
 
+    def set_bias_update_rate(self, rate: float) -> None:
+        """Set every router's balancing step size. Zero freezes the bias.
+
+        The load counter and the imbalance metric keep running, so a frozen run
+        still reports what the routing is doing.
+        See docs/internals/moe-router-loss.md.
+        """
+        for block in self.blocks:
+            router = getattr(block.mlp, "router", None)
+            if router is not None:
+                router.bias_update_rate = rate
+
     def global_names(self) -> dict[str, str]:
         """This stage's state-dict keys mapped to their whole-backbone names.
 
