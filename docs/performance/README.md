@@ -6,6 +6,7 @@ Numbers, and the method that makes them numbers rather than anecdotes. Read
 | Doc | Covers |
 |---|---|
 | [performance.md](performance.md) | Measured throughput across the ladder, on 4x RTX 5090, and where the time goes |
+| [gemm.md](gemm.md) | How a fast GEMM is built on sm_120: cache levels, warp and register budgets, what to fuse and where, MXFP8 vs NVFP4, why a naive Triton kernel loses |
 | [benchmarking.md](benchmarking.md) | How this repo measures: wall vs device time, the L2 flush, which ceiling to divide by, ULP modes |
 | [ab-testing.md](ab-testing.md) | Running a trustworthy A/B: noise floors, block bootstrap, admissibility |
 | [upstream-cutlass-findings.md](upstream-cutlass-findings.md) | Why CUTLASS grouped block-scaled GEMM is unusable on sm_120 |
