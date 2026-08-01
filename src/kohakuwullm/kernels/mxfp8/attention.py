@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
+from kohakuwullm.kernels.gemm.device import RTX_5090
 from kohakuwullm.kernels.mxfp8.quantize import BLOCK_SCALE, _quantize_block
 
 
@@ -359,7 +360,7 @@ def _bwd_kernel(
     BLOCK_SUB: tl.constexpr,
     CAUSAL: tl.constexpr,
 ):
-    """One BLOCK_N block of dK and dV; dQ is accumulated atomically."""
+    """One BLOCK_N block of dK and dV; dQ has its own kernel."""
     pid = tl.program_id(0)
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD)
@@ -438,13 +439,6 @@ def _bwd_kernel(
             other=0.0,
         )
         dk += tl.dot(tl.trans(ds), qb).to(tl.float32)
-        dq = tl.dot(ds, kb).to(tl.float32)
-        tl.atomic_add(
-            dq_ptr + offs_m[:, None] * sdq_t + offs_d[None, :] * sdq_d,
-            dq,
-            mask=mm[:, None],
-            sem="relaxed",
-        )
 
     tl.store(
         dk_ptr + offs_n[:, None] * sdk_t + offs_d[None, :] * sdk_d,
@@ -458,14 +452,74 @@ def _bwd_kernel(
     )
 
 
+BWD_CANDIDATES = (
+    (32, 64, 4, 3),
+    (64, 32, 4, 3),
+    (64, 64, 4, 3),
+    (64, 64, 8, 2),
+    (32, 128, 4, 3),
+    (64, 128, 4, 2),
+    (128, 64, 4, 2),
+    (128, 64, 8, 2),
+)
+_BWD_CACHE: dict[tuple, tuple] = {}
+
+
+def _legal_bwd(cfg, head, smem_limit):
+    """Shared-memory and accumulator budgets for one backward tile."""
+    bm, bn, warps, stages = cfg
+    smem = (bn * head * 3 + bn * (head // BLOCK_SCALE)) * max(stages - 1, 1)
+    return smem <= smem_limit and bm * head / (32 * warps) <= 168
+
+
+def plan_attn_bwd(t, head, block_m=None, block_n=None, dev=None, time_it=None):
+    """Tiles for the dK/dV and dQ kernels, cached per shape.
+
+    Candidates are filtered by the card's budgets; ``time_it(kind, cfg) -> ms``
+    picks among them and the winner is cached. Without it the first legal
+    candidate is used. See docs/internals/mxfp8-attention.md.
+    """
+    if block_m or block_n:
+        base = (block_m or 64, block_n or 64, 4, 3)
+        return base, base
+    key = (t, head)
+    if key in _BWD_CACHE:
+        return _BWD_CACHE[key]
+    limit = (dev or RTX_5090).smem_per_cta
+    legal = [c for c in BWD_CANDIDATES if _legal_bwd(c, head, limit)]
+    if not legal:
+        raise ValueError(f"no legal backward tile for T={t} head={head}")
+    chosen = []
+    for kind in ("dkdv", "dq"):
+        best, best_ms = legal[0], float("inf")
+        if time_it is not None:
+            for cfg in legal:
+                try:
+                    ms = time_it(kind, cfg)
+                except Exception:
+                    continue
+                if ms < best_ms:
+                    best, best_ms = cfg, ms
+        chosen.append(best)
+    _BWD_CACHE[key] = tuple(chosen)
+    return _BWD_CACHE[key]
+
+
+def clear_bwd_cache() -> None:
+    _BWD_CACHE.clear()
+
+
 def mxfp8_attention_backward(
-    do, q, k, v, o, lse, mu, causal, sm_scale, block_m=64, block_n=64
+    do, q, k, v, o, lse, mu, causal, sm_scale, block_m=None, block_n=None
 ):
-    """Gradients of `mxfp8_attention`; returns ``(dQ, dK, dV)``."""
+    """Gradients of `mxfp8_attention`; returns ``(dQ, dK, dV)``.
+
+    dK/dV and dQ run as separate kernels so each accumulates in registers and
+    neither needs atomics. Tiles come from `plan_attn_bwd`.
+    """
     t, head = q.shape
-    block_n = block_n if block_n is not None else (128 if head <= 64 else 64)
     delta = torch.empty(t, device=q.device, dtype=torch.float32)
-    _bwd_preprocess[(triton.cdiv(t, block_m),)](
+    _bwd_preprocess[(triton.cdiv(t, 64),)](
         o,
         do,
         delta,
@@ -475,59 +529,117 @@ def mxfp8_attention_backward(
         o.stride(1),
         do.stride(0),
         do.stride(1),
-        BLOCK_M=block_m,
+        BLOCK_M=64,
         num_warps=4,
     )
-
     qq, qs = quantize_rows(q)
     kq, ks = quantize_rows(k, mu)
     kk = k if mu is None else (k.float() - mu[None, :]).to(k.dtype)
-    dq = torch.zeros(t, head, device=q.device, dtype=torch.float32)
+    dq = torch.empty(t, head, device=q.device, dtype=q.dtype)
     dk = torch.empty(t, head, device=q.device, dtype=q.dtype)
     dv = torch.empty(t, head, device=q.device, dtype=q.dtype)
-    _bwd_kernel[(triton.cdiv(t, block_n),)](
-        qq,
-        qs,
-        q,
-        kq,
-        ks,
-        kk,
-        v,
-        do,
-        lse,
-        delta,
-        dq,
-        dk,
-        dv,
-        sm_scale,
-        t,
-        head,
-        q.stride(0),
-        q.stride(1),
-        qs.stride(0),
-        qs.stride(1),
-        kk.stride(0),
-        kk.stride(1),
-        ks.stride(0),
-        ks.stride(1),
-        v.stride(0),
-        v.stride(1),
-        do.stride(0),
-        do.stride(1),
-        dq.stride(0),
-        dq.stride(1),
-        dk.stride(0),
-        dk.stride(1),
-        dv.stride(0),
-        dv.stride(1),
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_SUB=BLOCK_SCALE,
-        CAUSAL=causal,
-        num_warps=4,
-        num_stages=2,
-    )
-    return dq.to(q.dtype), dk, dv
+
+    def launch_dkdv(cfg):
+        bm, bn, w, st = cfg
+        _bwd_kernel[(triton.cdiv(t, bn),)](
+            qq,
+            qs,
+            q,
+            kq,
+            ks,
+            kk,
+            v,
+            do,
+            lse,
+            delta,
+            dq,
+            dk,
+            dv,
+            sm_scale,
+            t,
+            head,
+            q.stride(0),
+            q.stride(1),
+            qs.stride(0),
+            qs.stride(1),
+            kk.stride(0),
+            kk.stride(1),
+            ks.stride(0),
+            ks.stride(1),
+            v.stride(0),
+            v.stride(1),
+            do.stride(0),
+            do.stride(1),
+            dq.stride(0),
+            dq.stride(1),
+            dk.stride(0),
+            dk.stride(1),
+            dv.stride(0),
+            dv.stride(1),
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            BLOCK_SUB=BLOCK_SCALE,
+            CAUSAL=causal,
+            num_warps=w,
+            num_stages=st,
+        )
+
+    def launch_dq(cfg):
+        bm, bn, w, st = cfg
+        _bwd_dq_kernel[(triton.cdiv(t, bm),)](
+            qq,
+            qs,
+            q,
+            kq,
+            ks,
+            kk,
+            v,
+            do,
+            lse,
+            delta,
+            dq,
+            sm_scale,
+            t,
+            head,
+            q.stride(0),
+            q.stride(1),
+            qs.stride(0),
+            qs.stride(1),
+            kk.stride(0),
+            kk.stride(1),
+            ks.stride(0),
+            ks.stride(1),
+            v.stride(0),
+            v.stride(1),
+            do.stride(0),
+            do.stride(1),
+            dq.stride(0),
+            dq.stride(1),
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            BLOCK_SUB=BLOCK_SCALE,
+            CAUSAL=causal,
+            num_warps=w,
+            num_stages=st,
+        )
+
+    def time_it(kind, cfg):
+        fn = launch_dkdv if kind == "dkdv" else launch_dq
+        fn(cfg)
+        torch.cuda.synchronize()
+        beg = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        beg.record()
+        for _ in range(5):
+            fn(cfg)
+        end.record()
+        torch.cuda.synchronize()
+        return beg.elapsed_time(end)
+
+    dkdv_cfg, dq_cfg = plan_attn_bwd(t, head, block_m, block_n, time_it=time_it)
+    launch_dkdv(dkdv_cfg)
+    launch_dq(dq_cfg)
+    return dq, dk, dv
 
 
 class _MXFP8Attention(torch.autograd.Function):
@@ -630,3 +742,115 @@ def mxfp8_attention_q(
         num_stages=stages,
     )
     return o, lse
+
+
+@triton.jit
+def _bwd_dq_kernel(
+    q_ptr,
+    qs_ptr,
+    qb_ptr,
+    k_ptr,
+    ks_ptr,
+    kb_ptr,
+    v_ptr,
+    do_ptr,
+    lse_ptr,
+    delta_ptr,
+    dq_ptr,
+    sm_scale,
+    T,
+    HEAD: tl.constexpr,
+    sq_t,
+    sq_d,
+    sqs_t,
+    sqs_g,
+    sk_t,
+    sk_d,
+    sks_t,
+    sks_g,
+    sv_t,
+    sv_d,
+    sdo_t,
+    sdo_d,
+    sdq_t,
+    sdq_d,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_SUB: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
+    """One BLOCK_M block of dQ, accumulated in registers so no atomics are needed."""
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD)
+    groups: tl.constexpr = HEAD // BLOCK_SUB
+    offs_g = tl.arange(0, groups)
+    mm = offs_m < T
+
+    q = tl.load(
+        q_ptr + offs_m[:, None] * sq_t + offs_d[None, :] * sq_d,
+        mask=mm[:, None],
+        other=0.0,
+    )
+    qs = tl.load(
+        qs_ptr + offs_m[:, None] * sqs_t + offs_g[None, :] * sqs_g,
+        mask=mm[:, None],
+        other=0,
+    )
+    do = tl.load(
+        do_ptr + offs_m[:, None] * sdo_t + offs_d[None, :] * sdo_d,
+        mask=mm[:, None],
+        other=0.0,
+    )
+    lse = tl.load(lse_ptr + offs_m, mask=mm, other=0.0)
+    delta = tl.load(delta_ptr + offs_m, mask=mm, other=0.0)
+    dq = tl.zeros((BLOCK_M, HEAD), dtype=tl.float32)
+
+    hi = (pid + 1) * BLOCK_M if CAUSAL else T
+    for start in range(0, hi, BLOCK_N):
+        offs_n = start + tl.arange(0, BLOCK_N)
+        nm = offs_n < T
+        k = tl.load(
+            k_ptr + offs_n[:, None] * sk_t + offs_d[None, :] * sk_d,
+            mask=nm[:, None],
+            other=0.0,
+        )
+        ks = tl.load(
+            ks_ptr + offs_n[:, None] * sks_t + offs_g[None, :] * sks_g,
+            mask=nm[:, None],
+            other=0,
+        )
+        s = tl.dot_scaled(
+            q,
+            qs,
+            "e4m3",
+            tl.trans(k),
+            ks,
+            "e4m3",
+            acc=tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32),
+        )
+        s = s * sm_scale
+        if CAUSAL:
+            s = tl.where(offs_m[:, None] >= offs_n[None, :], s, float("-inf"))
+        s = tl.where(nm[None, :] & mm[:, None], s, float("-inf"))
+        p = tl.exp(s - lse[:, None])
+
+        v = tl.load(
+            v_ptr + offs_n[:, None] * sv_t + offs_d[None, :] * sv_d,
+            mask=nm[:, None],
+            other=0.0,
+        )
+        dp = tl.dot(do, tl.trans(v)).to(tl.float32)
+        ds = (p * (dp - delta[:, None]) * sm_scale).to(do.dtype)
+        kb = tl.load(
+            kb_ptr + offs_n[:, None] * sk_t + offs_d[None, :] * sk_d,
+            mask=nm[:, None],
+            other=0.0,
+        )
+        dq += tl.dot(ds, kb).to(tl.float32)
+
+    tl.store(
+        dq_ptr + offs_m[:, None] * sdq_t + offs_d[None, :] * sdq_d,
+        dq.to(dq_ptr.dtype.element_ty),
+        mask=mm[:, None],
+    )
