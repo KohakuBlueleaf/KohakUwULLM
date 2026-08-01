@@ -8,6 +8,8 @@ Read these when you are modifying the thing, not when you are using it.
 | [data.md](data.md) | KohakuVault sources, TIPO rendering, tokenization, loss masking, packing, the loader and its resume contract |
 | [optimizers.md](optimizers.md) | Muon, parameter grouping and weight decay, muP, low-bit state, stochastic rounding |
 | [kernels.md](kernels.md) | Every Triton kernel: what it does, what constrains its numerics, and the trap in it |
+| [kernel-dev.md](kernel-dev.md) | The method: how to derive tile, warp and pipeline budgets from what a card reports, on any sm_120 part |
+| [kernel-dsls.md](kernel-dsls.md) | Triton against TileLang and CuTeDSL, and why the published gaps may not reach sm_120 |
 | [mxfp8.md](mxfp8.md) | Block-scaled fp8 training: the format, what is converted, what is verified, what is still open |
 | [pipeline.md](pipeline.md) | Pipeline parallelism: stage splitting, boundary dtype, the Lightning wiring, DDP vs pipeline |
 | [moe-router-loss.md](moe-router-loss.md) | The two router auxiliary losses in the fused kernel, and the boundary stream that carries them across stages |

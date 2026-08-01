@@ -176,9 +176,15 @@ Take a `128 x 128` output tile with 4 warps. That is 128 threads. Each thread
 holds `128 * 128 / 128 = 128` accumulator values. In fp32 that is **128 registers
 per thread**, before any address, operand or scale register.
 
-The register file allows 255 registers per thread. At 128 accumulators plus
-overhead, the compiler fits one CTA per SM, and that CTA has 4 warps. That is 1
-warp per sub-core. It is the worst side of the threshold.
+The register file holds 65536 registers per SM, and a thread may use at most 255.
+To reach 5 warps per sub-core you need 20 warps resident per SM, which is 640
+threads, which allows only `65536 / 640` or about **102 registers per thread**.
+At 128 accumulators plus operands and addresses we are well past that, so the
+kernel lands at two or three warps per sub-core. It is the wrong side of the
+threshold.
+
+[../internals/kernel-dev.md](../internals/kernel-dev.md) derives this budget in
+full, and gives the table for other tile shapes.
 
 The same tile with 8 warps needs 64 accumulator registers per thread. The same
 tile with `BLOCK_N = 64` and 8 warps needs 32.
