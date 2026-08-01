@@ -9,7 +9,7 @@ import json
 
 import torch
 
-from kohakuwullm.kernels.gemm import RTX_5090, StreamKGemm, plan
+from kohakuwullm.kernels.gemm import RTX_5090, StreamKGemm, TunedGemm, plan
 
 SHAPES = [
     # square, the classic ladder
@@ -62,6 +62,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16"])
     ap.add_argument("--rounds", type=int, default=3)
+    ap.add_argument("--tune", type=int, default=0)
     ap.add_argument("--out", default="")
     args = ap.parse_args()
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
@@ -84,7 +85,13 @@ def main() -> None:
         flops = 2.0 * m * n * k
         p = plan(m, n, k, dev, a.element_size())
         try:
-            g = StreamKGemm(m, n, k, dev, a.element_size(), p=p)
+            if args.tune:
+                g = TunedGemm(
+                    m, n, k, dev, a.element_size(), shortlist=args.tune, dtype=dtype
+                )
+                p = g.plan
+            else:
+                g = StreamKGemm(m, n, k, dev, a.element_size(), p=p)
             g(a, b, c)
         except Exception as exc:
             print(f"{str((m, n, k)):>22} {type(exc).__name__}: {str(exc)[:40]}")

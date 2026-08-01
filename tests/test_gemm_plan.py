@@ -79,3 +79,35 @@ def test_streamk_scratch_does_not_carry_over():
     for _ in range(4):
         rel = (g(a, b).double() - ref).abs().max().item() / scale
         assert rel < 0.02, f"drifted to rel {rel}"
+
+
+def test_plan_topk_is_ranked():
+    """The shortlist is ordered by prediction and never repeats a candidate."""
+    from kohakuwullm.kernels.gemm import plan_topk
+
+    cands = plan_topk(4096, 4096, 4096, RTX_5090, 2, 6)
+    assert len(cands) == 6
+    preds = [c.predicted_tflops for c in cands]
+    assert preds == sorted(preds, reverse=True)
+    assert len({(c.tile, c.warps, c.stages) for c in cands}) == len(cands)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_tuned_gemm_is_cached_and_correct():
+    """Tuning runs once per shape and its winner is still numerically right."""
+    from kohakuwullm.kernels.gemm import TunedGemm
+    from kohakuwullm.kernels.gemm.tune import clear, key, _CACHE
+
+    clear()
+    m, n, k = 2048, 1024, 3072
+    torch.manual_seed(0)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
+    g = TunedGemm(m, n, k, RTX_5090, shortlist=3)
+    assert key(m, n, k, 2) in _CACHE
+    again = TunedGemm(m, n, k, RTX_5090, shortlist=3)
+    assert again.plan == g.plan
+    ref = a.double() @ b.double()
+    rel = (g(a, b).double() - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 0.02
+    clear()

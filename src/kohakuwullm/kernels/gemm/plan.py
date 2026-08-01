@@ -179,14 +179,22 @@ def score(
     )
 
 
+def plan_topk(
+    m: int, n: int, k: int, dev: Device, elem_bytes: int = 2, topk: int = 1
+) -> list[Plan]:
+    """The ``topk`` highest-scoring legal tiles, best first."""
+    dev.validate()
+    scored = [
+        p
+        for p in (score(m, n, k, dev, elem_bytes, *c) for c in _candidates(elem_bytes))
+        if p is not None
+    ]
+    if not scored:
+        raise ValueError(f"no legal tile for {m}x{n}x{k} on {dev.name}")
+    scored.sort(key=lambda p: -p.predicted_tflops)
+    return scored[:topk]
+
+
 def plan(m: int, n: int, k: int, dev: Device, elem_bytes: int = 2) -> Plan:
     """Best tile and schedule for this shape on this card."""
-    dev.validate()
-    best = None
-    for cand in _candidates(elem_bytes):
-        p = score(m, n, k, dev, elem_bytes, *cand)
-        if p and (best is None or p.predicted_tflops > best.predicted_tflops):
-            best = p
-    if best is None:
-        raise ValueError(f"no legal tile for {m}x{n}x{k} on {dev.name}")
-    return best
+    return plan_topk(m, n, k, dev, elem_bytes, 1)[0]
