@@ -54,6 +54,7 @@ class KVCache:
         head_dim: int,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        static: bool = False,
     ) -> None:
         if layers <= 0 or max_length <= 0:
             raise ValueError(
@@ -67,6 +68,10 @@ class KVCache:
         self.device = device
         self.dtype = dtype
         self.length = 0
+        self.static = static
+        # Device-side, so a compiled decode step carries no Python int and its
+        # graph stays capturable. See docs/guides/generation.md.
+        self.pos = torch.zeros((), dtype=torch.long, device=device or "cpu")
         self.keys: list[torch.Tensor | None] = [None] * layers
         self.values: list[torch.Tensor | None] = [None] * layers
 
@@ -78,6 +83,7 @@ class KVCache:
         max_length: int,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        static: bool = False,
     ) -> "KVCache":
         """Size a cache from an architecture spec."""
         return cls(
@@ -88,6 +94,7 @@ class KVCache:
             head_dim=config.head_dim,
             device=device,
             dtype=dtype,
+            static=static,
         )
 
     def layer(self, index: int) -> LayerKVCache:
@@ -101,8 +108,11 @@ class KVCache:
         shape = (self.batch_size, self.max_length, self.kv_heads, self.head_dim)
         device = self.device or like.device
         dtype = self.dtype or like.dtype
-        self.keys[index] = torch.empty(shape, device=device, dtype=dtype)
-        self.values[index] = torch.empty(shape, device=device, dtype=dtype)
+        make = torch.zeros if self.static else torch.empty
+        self.keys[index] = make(shape, device=device, dtype=dtype)
+        self.values[index] = make(shape, device=device, dtype=dtype)
+        if self.pos.device != device:
+            self.pos = self.pos.to(device)
 
     def append(self, index: int, k: torch.Tensor, v: torch.Tensor):
         """Store ``k``/``v`` at ``length`` and return the prefix through this step.
@@ -129,6 +139,13 @@ class KVCache:
         if self.keys[index] is None:
             self._allocate(index, k)
         keys, values = self.keys[index], self.values[index]
+        if self.static:
+            # Scatter at a device-side offset and hand back the whole buffer, so
+            # the shape a compiled step sees never moves.
+            at = self.pos + torch.arange(steps, device=keys.device)
+            keys.index_copy_(1, at, k.to(keys.dtype))
+            values.index_copy_(1, at, v.to(values.dtype))
+            return keys, values
         keys[:, self.length : end] = k
         values[:, self.length : end] = v
         return keys[:, :end], values[:, :end]
@@ -140,6 +157,24 @@ class KVCache:
                 f"KV cache overflow: {self.length} cached + {steps} new exceeds max_length={self.max_length}"
             )
         self.length += steps
+        if self.static:
+            self.pos += steps
+
+    def key_mask(self, steps: int) -> torch.Tensor:
+        """``(1, 1, steps, max_length)`` -- which cached keys each query may see.
+
+        Causal within the step and bounded by the committed prefix, so a query
+        never reads a slot that has not been written.
+        """
+        keys = torch.arange(self.max_length, device=self.pos.device)
+        queries = self.pos + torch.arange(steps, device=self.pos.device)
+        return (keys[None, :] <= queries[:, None])[None, None]
+
+    def window_mask(self, steps: int, window: int) -> torch.Tensor:
+        """``(1, 1, steps, max_length)`` -- the inclusive left span each query keeps."""
+        keys = torch.arange(self.max_length, device=self.pos.device)
+        queries = self.pos + torch.arange(steps, device=self.pos.device)
+        return ((queries[:, None] - keys[None, :]) < window)[None, None]
 
     def seq_info(self, tokens: torch.Tensor) -> SeqInfo:
         """Padded :class:`SeqInfo` whose positions continue the cached prefix."""
@@ -148,10 +183,11 @@ class KVCache:
                 f"cached generation takes padded (B, S) tokens, got {tuple(tokens.shape)}"
             )
         batch, steps = tokens.shape
-        pos = torch.arange(self.length, self.length + steps, device=tokens.device)
+        base = self.pos if self.static else self.length
+        pos = base + torch.arange(steps, device=tokens.device)
         return SeqInfo(
             cu_seqlens=None,
-            max_seqlen=self.length + steps,
+            max_seqlen=self.max_length if self.static else self.length + steps,
             position_ids=pos.unsqueeze(0).expand(batch, steps),
             num_seqs=batch,
         )
@@ -159,3 +195,4 @@ class KVCache:
     def reset(self) -> None:
         """Drop the prefix, keeping the buffers."""
         self.length = 0
+        self.pos.zero_()

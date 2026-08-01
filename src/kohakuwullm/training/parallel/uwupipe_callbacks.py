@@ -4,6 +4,8 @@
 a tokenizer or a sampler lives here. See docs/internals/pipeline.md.
 """
 
+import time
+
 import torch
 import torch.distributed as dist
 from anyschedule.utils import get_scheduler
@@ -113,6 +115,7 @@ class SamplePreview(Callback):
 
     def preview(self, loop, step: int) -> None:
         """One collective round per prompt. Every rank must reach every round."""
+        began = time.perf_counter()
         was_training = loop.stage_module.training
         loop.stage_module.eval()
         rows = []
@@ -153,6 +156,13 @@ class SamplePreview(Callback):
         finally:
             bar.close()
             loop.stage_module.train(was_training)
+        if self.ranks.rank == 0:
+            tokens_out = sum(len(r[3]) > 0 for r in rows)
+            print(
+                f"[preview@{step}] {time.perf_counter() - began:.2f}s "
+                f"local={self.local} prompts={len(self.prompts)} rows={tokens_out}",
+                flush=True,
+            )
         if self.ranks.rank == 0 and self.report is not None:
             self.report(step, rows)
 

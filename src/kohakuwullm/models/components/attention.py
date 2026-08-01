@@ -109,6 +109,15 @@ class BaseAttention(nn.Module):
         offset = cache.offset
         q, k, v = self.project(x, posenc)
         k, v = cache.append(k, v)
+        if cache.cache.static:
+            mask = cache.cache.key_mask(q.shape[1])
+            if self.sliding_window is not None:
+                mask = mask & cache.cache.window_mask(q.shape[1], self.sliding_window)
+            return self.merge(
+                _attend_with_mask(
+                    self, q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mask
+                )
+            )
         if q.shape[1] == 1:
             return self.merge(_decode_attend(self, q, k, v))
         return self.merge(_sdpa_attend(self, q, k, v, q_offset=offset))

@@ -55,14 +55,10 @@ NUM_MICROBATCHES = 16
 # [5,4,4,3] measured 13% slower here than the [5,5,5,1] measurement derives.
 LAYERS = []
 SCHEDULE = "1f1b"
-# CUDA-graph capture on the blocks; the chunked CE head is hostile to
-# whole-model compilation. Applies to training and to the preview decode, which
-# runs through the same stage module.
-COMPILE = {
-    "mode": "module",
-    "targets": ["blocks"],
-    "compile_mode": "reduce-overhead",
-}
+# No COMPILE here: reduce-overhead captures CUDA graphs, and a 1F1B
+# schedule holds microbatch N's activations for backward while N+1 runs
+# forward, which graph capture forbids. Measured: rank 1 dies with
+# "accessing tensor output of CUDAGraphs that has been overwritten".
 PARAM_DTYPE = "fp16"
 AUTOCAST_DTYPE = "fp16"
 MXFP8 = True
