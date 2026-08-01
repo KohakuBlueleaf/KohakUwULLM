@@ -187,8 +187,11 @@ of the total, since operands, addresses and the pipeline need the rest.
 | 256 x 128 | 8 | 128 | over budget |
 
 This repo ships `BLOCK_M 128, BLOCK_N 128` with `num_warps 4` in
-`kernels/mxfp8/grouped.py`. That is the first row. Measure before assuming it is
-wrong: the same shape in a dense bf16 GEMM costs only about 1%.
+`kernels/mxfp8/grouped.py`. That is the first row of the table, and it is
+**measured to be right**: 72 alternative tile, warp and stage combinations at
+MoE-1B shapes beat it by at most 1.3%, which is noise. The grouped MoE GEMM is
+wave-bound rather than tile-bound, so the lever that is worth 15% on a dense
+GEMM is worth nothing here. Measure before assuming a constant is wrong.
 
 Verify the real number rather than trusting the estimate. Triton reports it:
 

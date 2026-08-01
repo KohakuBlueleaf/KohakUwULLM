@@ -872,3 +872,20 @@ So roughly 80% of the vendor is the practical ceiling for a Triton MXFP8 GEMM on
 `sm_120` today, and closing the rest needs either a `tl.dot_scaled` that accepts
 the swizzled layout, or dropping to inline PTX for the `mma.sync` and its scale
 operands.
+
+### The MoE grouped GEMM is already at its configuration boundary
+
+The dense findings above do not transfer to `grouped.py`. Sweeping 72
+combinations of tile, warp count and stage depth at MoE-1B shapes (dim 768, 64
+experts, top-8, 16384 tokens) beats the shipping `128x128x64` at 4 warps by
+**1.3%**, which is inside the noise.
+
+That is consistent with the per-expert path being wave-bound: with top-8 of 64
+over 16384 tokens each expert sees about 2048 rows, so the kernel is limited by
+how the waves land rather than by how well one tile is shaped. The lever worth
+up to 15% on a dense GEMM is worth nothing here.
+
+There is also no vendor alternative to fall back on. CUTLASS grouped
+block-scaled GEMM is unusable on sm_120, see
+[../performance/upstream-cutlass-findings.md](../performance/upstream-cutlass-findings.md),
+so Triton is not a choice for the MoE path, it is the only option.
