@@ -833,3 +833,42 @@ sequence actually built rather than naive-versus-final:
   against bf16's none. No kernel change reaches this — it is a storage decision.
 - **`combine_routed` is a nondeterministic scatter-add**, disagreeing with itself by
   0.0625 in bf16. Any A/B downstream of it needs that noise floor reported alongside.
+
+---
+
+## Where the Triton pre-quantized GEMM stops, and why
+
+Measured on a free RTX 5090, bf16 out, against `F.scaled_mm` with pre-swizzled
+scales. Four changes took the kernel from 63.5-83.5% of the vendor to
+72.1-94.3%, mean 81.7%: a wider autotune space, group-M rasterization,
+`max_contiguous`/`multiple_of` hints, and an aligned fast path gated on K depth.
+
+The remaining gap on square shapes is about 26 points and it is **not** any of
+these, all tested:
+
+| hypothesis | result |
+|---|---|
+| tile selection | swept 12 tiles x 2 group modes x 2 warp counts x 3 stage depths |
+| rasterization | added, worth ~0 on this card, as for dense bf16 |
+| contiguity hints | added, worth a few points |
+| mask arithmetic in the K loop | aligned path added, worth 10 points at K=4096 |
+| `tl.trans(bq)` in the main loop | **refuted.** Removing it costs 17 points at 4096 cubed and 11 at 8192 cubed. Triton folds the transpose into the shared-memory layout, and storing B as `(N, K)` keeps K contiguous for the load. Storing `(K, N)` to avoid the transpose is strictly worse. |
+
+What is left is the **scale feed**. The block-scaled MMA takes its scale factors
+in a hardware-mandated per-thread register layout: for the A operand threads 0
+and 1 of each quad supply them and the other two hold copies, and for B only
+thread 0 does, a 4x replication. cuBLAS is handed scales already in the
+`SWIZZLE_32_4_4` layout, so it loads them straight into that arrangement.
+`tl.dot_scaled` takes the natural `(rows, K/32)` layout and the compiler must
+shuffle into the fragment layout inside the loop.
+
+Note also that the vendor arm is timed with the swizzle hoisted, which is fair
+for training, where `quantize_mx_vendor` writes the swizzled layout straight out
+of the cast once per optimizer step. It does mean the comparison hands the
+vendor a layout our kernel is not allowed to consume: Triton exposes no way to
+pass pre-swizzled scales to `tl.dot_scaled`.
+
+So roughly 80% of the vendor is the practical ceiling for a Triton MXFP8 GEMM on
+`sm_120` today, and closing the rest needs either a `tl.dot_scaled` that accepts
+the swizzled layout, or dropping to inline PTX for the `mma.sync` and its scale
+operands.
