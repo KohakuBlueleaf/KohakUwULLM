@@ -5,10 +5,12 @@ a tokenizer or a sampler lives here. See docs/internals/pipeline.md.
 """
 
 import torch
+import torch.distributed as dist
 from anyschedule.utils import get_scheduler
 from tqdm.auto import tqdm
 
-from kohakuwullm.generation import build_generator
+from kohakuwullm.generation import LocalGenerator, build_generator
+from kohakuwullm.models import LMBackbone
 from kohakuwullm.training.parallel.pipeline_lightning import decode_stage
 from kohakuwupipe import Callback
 
@@ -61,6 +63,8 @@ class SamplePreview(Callback):
         at_start: also preview on the first step, before any training.
         report: ``(step, rows) -> None`` on rank 0, where a row is
             ``(name, prompt, index, text)``. The text is never logged.
+        local: gather the whole model and decode on one card. Off falls back to
+            pipelined decode, which costs one pipeline traversal per token.
         max_new_tokens / temperature / top_p / top_k / min_p: sampling
             controls. ``max_new_tokens=None`` fills the model's context.
     """
@@ -80,6 +84,7 @@ class SamplePreview(Callback):
         top_p: float = 0.95,
         top_k: int = 0,
         min_p: float = 0.0,
+        local: bool = True,
     ) -> None:
         self.module = module
         self.tokenizer = tokenizer
@@ -96,7 +101,9 @@ class SamplePreview(Callback):
         self.top_p = top_p
         self.top_k = top_k
         self.min_p = min_p
+        self.local = local
         self._generator = None
+        self._local_model = None
 
     def on_train_batch_end(self, loop, out, batch=None, batch_idx=0) -> None:
         first = self.at_start and batch_idx == 0
@@ -109,6 +116,7 @@ class SamplePreview(Callback):
         was_training = loop.stage_module.training
         loop.stage_module.eval()
         rows = []
+        gathered = self._gathered(loop) if self.local else None
         bar = tqdm(
             self.prompts,
             desc=f"preview@{step}",
@@ -118,8 +126,11 @@ class SamplePreview(Callback):
         )
         try:
             for name, text in bar:
+                if gathered is not None and self.ranks.rank:
+                    break
                 prompt_ids = self._encode(text)
-                tokens = self._build().generate(
+                generator = gathered or self._build()
+                tokens = generator.generate(
                     prompt_ids.to(self.ranks.device),
                     max_new_tokens=self.max_new_tokens,
                     temperature=self.temperature,
@@ -144,6 +155,33 @@ class SamplePreview(Callback):
             loop.stage_module.train(was_training)
         if self.ranks.rank == 0 and self.report is not None:
             self.report(step, rows)
+
+    def _gathered(self, loop):
+        """A whole-model `LocalGenerator` on rank 0, or ``None`` off rank 0.
+
+        Collective: every rank must reach the gather.
+        See docs/guides/generation.md.
+        """
+        local = self.module.inner.global_state_dict()
+        merged = {}
+        if dist.is_available() and dist.is_initialized():
+            parts = [None] * self.ranks.world
+            dist.all_gather_object(parts, local)
+            for part in parts:
+                merged.update(part)
+        else:
+            merged.update(local)
+        if self.ranks.rank:
+            return None
+        if self._local_model is None:
+            self._local_model = LMBackbone(
+                self.module.config, head_kwargs=self.module.head_kwargs
+            ).to(self.ranks.device, dtype=self.module.param_dtype)
+        missing, _ = self._local_model.load_state_dict(merged, strict=False)
+        if missing:
+            raise RuntimeError(f"preview gather missed {len(missing)}: {missing[:3]}")
+        self._local_model.eval()
+        return LocalGenerator(self._local_model)
 
     def _encode(self, text: str) -> torch.Tensor:
         """One prompt repeated ``samples`` times, the decode batch's shape."""

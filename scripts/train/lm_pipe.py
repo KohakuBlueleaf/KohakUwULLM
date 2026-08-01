@@ -141,6 +141,9 @@ SAMPLE_TEMPERATURE = 0.35
 SAMPLE_TOP_P = 0.95
 SAMPLE_TOP_K = 0
 SAMPLE_MIN_P = 0.0
+# Gather the model and decode on one card; pipelined decode costs one
+# pipeline traversal per token.
+SAMPLE_LOCAL = True
 # Ranks to launch when the script is run outside torchrun. 0 uses every GPU.
 GPUS = 0
 
@@ -395,6 +398,7 @@ def main() -> None:
                 top_p=SAMPLE_TOP_P,
                 top_k=SAMPLE_TOP_K,
                 min_p=SAMPLE_MIN_P,
+                local=SAMPLE_LOCAL,
             )
         )
     scaling = (
