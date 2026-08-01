@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.nn.attention.varlen import AuxRequest, varlen_attn
 
 from kohakuwullm.kernels.attention.flash_attn import triton_varlen_attn
+from kohakuwullm.kernels.mxfp8.attention import mxfp8_attention_heads
 from kohakuwullm.models.components.norm import RMSNorm
 from kohakuwullm.registry import ATTENTION
 
@@ -304,6 +305,40 @@ class TritonVarlenAttention(BaseAttention):
         else:
             out = result
         return self.merge(out)
+
+
+@ATTENTION.register("mxfp8")
+class MXFP8Attention(BaseAttention):
+    """Causal attention with `QK^T` in block-scaled e4m3 (``kernels/mxfp8/attention.py``).
+
+    Falls back to SDPA for anything the kernel does not cover: a padded batch, a
+    non-16-bit dtype, a sliding window, or a head_dim that is not a multiple of
+    the 32-element scale block. See docs/internals/mxfp8-attention.md.
+    """
+
+    def forward(
+        self, x: torch.Tensor, seq_info, posenc=None, cache=None
+    ) -> torch.Tensor:
+        if cache is not None:
+            return self.attend_cached(x, posenc, cache)
+        q, k, v = self.project(x, posenc)
+        usable = (
+            seq_info.packed
+            and v.dtype in (torch.float16, torch.bfloat16)
+            and self.sliding_window is None
+            and self.sink is None
+            and q.shape[-1] % 32 == 0
+            and seq_info.cu_seqlens.numel() == 2
+        )
+        if not usable:
+            if seq_info.packed:
+                doc_id = _doc_ids(seq_info, q.shape[0], q.device)
+                q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+                return self.merge(_sdpa_attend(self, q, k, v, doc_id).squeeze(0))
+            return self.merge(_sdpa_attend(self, q, k, v))
+        return self.merge(
+            mxfp8_attention_heads(q, k, v, causal=True, sm_scale=self.scale)
+        )
 
 
 @ATTENTION.register("sdpa")

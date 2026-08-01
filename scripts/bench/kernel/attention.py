@@ -1,7 +1,8 @@
 """Which attention backend, at what sequence length, at what window.
 
-Four backends implement one contract -- ``varlen`` (PyTorch 2.13 FA2), ``triton``
-(ours), ``sdpa``, ``flex`` -- and the choice is not about speed alone. ``sdpa``
+Five backends implement one contract -- ``varlen`` (PyTorch 2.13 FA2), ``triton``
+(ours), ``mxfp8`` (ours, block-scaled e4m3 scores), ``sdpa``, ``flex`` -- and the
+choice is not about speed alone. ``sdpa``
 has no varlen path: handed the packed training layout it needs an explicit
 ``(T, T)`` block-diagonal mask, which drops it off the fused kernel onto one that
 materializes ``(B, H, T, T)`` scores. A latency plot hides that right up to the
@@ -68,6 +69,7 @@ from kohakuwullm.bench import (
 )
 from kohakuwullm.models.components.attention import (
     FlexAttention,
+    MXFP8Attention,
     SDPAAttention,
     TritonVarlenAttention,
     VarlenAttention,
@@ -77,6 +79,7 @@ from kohakuwullm.models.components.seqinfo import SeqInfo
 BACKENDS = {
     "varlen": VarlenAttention,
     "triton": TritonVarlenAttention,
+    "mxfp8": MXFP8Attention,
     "sdpa": SDPAAttention,
     "flex": FlexAttention,
 }

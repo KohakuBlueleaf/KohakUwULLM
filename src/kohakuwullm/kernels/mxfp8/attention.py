@@ -39,13 +39,27 @@ def _fwd_kernel(
     sv_d,
     so_t,
     so_d,
+    sq_h,
+    sqs_h,
+    sk_h,
+    sks_h,
+    sv_h,
+    so_h,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_SUB: tl.constexpr,
     CAUSAL: tl.constexpr,
 ):
-    """One BLOCK_M row-block of output; K and V are streamed in BLOCK_N chunks."""
+    """One BLOCK_M row-block of one head; K and V stream in BLOCK_N chunks."""
     pid = tl.program_id(0)
+    head_id = tl.program_id(1)
+    q_ptr += head_id * sq_h
+    qs_ptr += head_id * sqs_h
+    k_ptr += head_id * sk_h
+    ks_ptr += head_id * sks_h
+    v_ptr += head_id * sv_h
+    o_ptr += head_id * so_h
+    lse_ptr += head_id * T
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD)
     groups: tl.constexpr = HEAD // BLOCK_SUB
@@ -152,6 +166,7 @@ def _quant_rows_kernel(
     sq_d,
     ss_t,
     ss_g,
+    ROWS_PER_MU,
     BLOCK_M: tl.constexpr,
     BLOCK_SUB: tl.constexpr,
     SMOOTH: tl.constexpr,
@@ -171,7 +186,8 @@ def _quant_rows_kernel(
         other=0.0,
     ).to(tl.float32)
     if SMOOTH:
-        x = x - tl.load(mu_ptr + offs_d)[None, :]
+        head = offs_m // ROWS_PER_MU
+        x = x - tl.load(mu_ptr + head[:, None] * HEAD + offs_d[None, :])
     q, s = _quantize_block(x, BLOCK_M, HEAD, BLOCK_SUB)
     tl.store(
         q_ptr + offs_m[:, None] * sq_t + offs_d[None, :] * sq_d, q, mask=mask[:, None]
@@ -194,10 +210,13 @@ def column_mean(x: torch.Tensor) -> torch.Tensor:
     return mu
 
 
-def quantize_rows(x: torch.Tensor, mu: torch.Tensor | None = None):
+def quantize_rows(
+    x: torch.Tensor, mu: torch.Tensor | None = None, rows_per_mu: int | None = None
+):
     """``(T, HEAD)`` -> ``(e4m3, ue8m0)`` with blocks along HEAD.
 
-    ``mu``, when given, is subtracted in fp32 registers before quantizing.
+    ``mu`` is subtracted in fp32 registers before quantizing; with
+    ``rows_per_mu`` it is a per-group mean, one row of ``mu`` per that many rows.
     """
     x = x.contiguous()
     t, head = x.shape
@@ -216,6 +235,7 @@ def quantize_rows(x: torch.Tensor, mu: torch.Tensor | None = None):
         q.stride(1),
         s.stride(0),
         s.stride(1),
+        rows_per_mu if rows_per_mu else t,
         BLOCK_M=32,
         BLOCK_SUB=BLOCK_SCALE,
         SMOOTH=mu is not None,
@@ -255,7 +275,7 @@ def mxfp8_attention(
     kq, ks = quantize_rows(k, mu)
     o = torch.empty(t, head, device=q.device, dtype=v.dtype)
     lse = torch.empty(t, device=q.device, dtype=torch.float32)
-    _fwd_kernel[(triton.cdiv(t, block_m),)](
+    _fwd_kernel[(triton.cdiv(t, block_m), 1)](
         qq,
         qs,
         kq,
@@ -278,6 +298,12 @@ def mxfp8_attention(
         v.stride(1),
         o.stride(0),
         o.stride(1),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_SUB=BLOCK_SCALE,
@@ -711,7 +737,7 @@ def mxfp8_attention_q(
     stages = 3 if head <= 64 else 2
     o = torch.empty(t, head, device=qq.device, dtype=v.dtype)
     lse = torch.empty(t, device=qq.device, dtype=torch.float32)
-    _fwd_kernel[(triton.cdiv(t, block_m),)](
+    _fwd_kernel[(triton.cdiv(t, block_m), 1)](
         qq,
         qs,
         kq,
@@ -734,6 +760,12 @@ def mxfp8_attention_q(
         v.stride(1),
         o.stride(0),
         o.stride(1),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_SUB=BLOCK_SCALE,
@@ -854,3 +886,78 @@ def _bwd_dq_kernel(
         dq.to(dq_ptr.dtype.element_ty),
         mask=mm[:, None],
     )
+
+
+def mxfp8_attention_heads(
+    q,
+    k,
+    v,
+    causal: bool = True,
+    sm_scale=None,
+    block_m: int = 64,
+    block_n=None,
+    smooth_k: bool = True,
+):
+    """Multi-head MXFP8 attention over ``(T, H, D)`` inputs; returns ``(T, H, D)``.
+
+    Heads occupy the grid's second axis, which is what fills 170 SMs at the
+    single-sequence shapes attention actually runs at.
+    """
+    t, heads, head = q.shape
+    if head % BLOCK_SCALE:
+        raise ValueError(f"head_dim={head} must be a multiple of {BLOCK_SCALE}")
+    sm_scale = sm_scale if sm_scale is not None else head**-0.5
+    block_n = block_n if block_n is not None else (128 if head <= 64 else 64)
+    stages = 3 if head <= 64 else 2
+    kv_heads = k.shape[1]
+    if kv_heads != heads:
+        rep = heads // kv_heads
+        k = k.unsqueeze(2).expand(t, kv_heads, rep, head).reshape(t, heads, head)
+        v = v.unsqueeze(2).expand(t, kv_heads, rep, head).reshape(t, heads, head)
+
+    qh = q.transpose(0, 1).contiguous()
+    kh = k.transpose(0, 1).contiguous()
+    vh = v.transpose(0, 1).contiguous()
+    # Accumulate the mean in fp32 without ever widening K in memory.
+    mu = kh.mean(dim=1, dtype=torch.float32) if smooth_k else None
+    qq, qs = quantize_rows(qh.reshape(-1, head))
+    kq, ks = quantize_rows(kh.reshape(-1, head), mu, rows_per_mu=t)
+    o = torch.empty_like(vh)
+    lse = torch.empty(heads, t, device=q.device, dtype=torch.float32)
+    _fwd_kernel[(triton.cdiv(t, block_m), heads)](
+        qq,
+        qs,
+        kq,
+        ks,
+        vh,
+        o,
+        lse,
+        sm_scale,
+        t,
+        head,
+        qq.stride(0),
+        qq.stride(1),
+        qs.stride(0),
+        qs.stride(1),
+        kq.stride(0),
+        kq.stride(1),
+        ks.stride(0),
+        ks.stride(1),
+        vh.stride(1),
+        vh.stride(2),
+        o.stride(1),
+        o.stride(2),
+        t * qq.stride(0),
+        t * qs.stride(0),
+        t * kq.stride(0),
+        t * ks.stride(0),
+        vh.stride(0),
+        o.stride(0),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_SUB=BLOCK_SCALE,
+        CAUSAL=causal,
+        num_warps=4,
+        num_stages=stages,
+    )
+    return o.transpose(0, 1).contiguous()
