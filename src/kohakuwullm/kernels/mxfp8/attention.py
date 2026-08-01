@@ -12,6 +12,13 @@ import triton
 import triton.language as tl
 
 from kohakuwullm.kernels.gemm.device import RTX_5090
+
+
+def _cu2(t, device):
+    """A one-document cu_seqlens."""
+    return torch.tensor([0, t], device=device, dtype=torch.int32)
+
+
 from kohakuwullm.kernels.mxfp8.quantize import BLOCK_SCALE, _quantize_block
 
 
@@ -24,8 +31,8 @@ def _fwd_kernel(
     v_ptr,
     o_ptr,
     lse_ptr,
+    cu_ptr,
     sm_scale,
-    T,
     HEAD: tl.constexpr,
     sq_t,
     sq_d,
@@ -45,27 +52,41 @@ def _fwd_kernel(
     sks_h,
     sv_h,
     so_h,
+    slse_h,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_SUB: tl.constexpr,
     CAUSAL: tl.constexpr,
+    WINDOW: tl.constexpr,
 ):
-    """One BLOCK_M row-block of one head; K and V stream in BLOCK_N chunks."""
-    pid = tl.program_id(0)
-    head_id = tl.program_id(1)
-    q_ptr += head_id * sq_h
-    qs_ptr += head_id * sqs_h
-    k_ptr += head_id * sk_h
-    ks_ptr += head_id * sks_h
-    v_ptr += head_id * sv_h
-    o_ptr += head_id * so_h
-    lse_ptr += head_id * T
-    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    """One BLOCK_M row-block of one document and one head.
+
+    Documents come from ``cu_ptr``, so a block never attends across a boundary.
+    See docs/internals/mxfp8-attention.md.
+    """
+    start_m = tl.program_id(0)
+    doc = tl.program_id(1)
+    head_id = tl.program_id(2)
+
+    seq_start = tl.load(cu_ptr + doc)
+    seq_len = tl.load(cu_ptr + doc + 1) - seq_start
+    if start_m * BLOCK_M >= seq_len:
+        return
+
+    q_ptr += head_id * sq_h + seq_start * sq_t
+    qs_ptr += head_id * sqs_h + seq_start * sqs_t
+    k_ptr += head_id * sk_h + seq_start * sk_t
+    ks_ptr += head_id * sks_h + seq_start * sks_t
+    v_ptr += head_id * sv_h + seq_start * sv_t
+    o_ptr += head_id * so_h + seq_start * so_t
+    lse_ptr += head_id * slse_h + seq_start
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD)
     groups: tl.constexpr = HEAD // BLOCK_SUB
     offs_g = tl.arange(0, groups)
+    qm = offs_m < seq_len
 
-    qm = offs_m < T
     q = tl.load(
         q_ptr + offs_m[:, None] * sq_t + offs_d[None, :] * sq_d,
         mask=qm[:, None],
@@ -81,10 +102,15 @@ def _fwd_kernel(
     m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
-    hi = (pid + 1) * BLOCK_M if CAUSAL else T
-    for start in range(0, hi, BLOCK_N):
+    hi = tl.minimum(seq_len, (start_m + 1) * BLOCK_M) if CAUSAL else seq_len
+    lo = 0
+    if WINDOW > 0:
+        lo = tl.maximum(0, start_m * BLOCK_M - WINDOW + 1)
+        lo = (lo // BLOCK_N) * BLOCK_N
+
+    for start in range(lo, hi, BLOCK_N):
         offs_n = start + tl.arange(0, BLOCK_N)
-        km = offs_n < T
+        km = offs_n < seq_len
         k = tl.load(
             k_ptr + offs_n[:, None] * sk_t + offs_d[None, :] * sk_d,
             mask=km[:, None],
@@ -95,7 +121,6 @@ def _fwd_kernel(
             mask=km[:, None],
             other=0,
         )
-        # Contraction is head_dim, so both scale sets are already on the right axis.
         s = tl.dot_scaled(
             q,
             qs,
@@ -106,13 +131,21 @@ def _fwd_kernel(
             acc=tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32),
         )
         s = s * sm_scale
-        s = tl.where(km[None, :], s, float("-inf"))
+        keep = km[None, :] & qm[:, None]
         if CAUSAL:
-            s = tl.where(offs_m[:, None] >= offs_n[None, :], s, float("-inf"))
+            keep = keep & (offs_m[:, None] >= offs_n[None, :])
+        if WINDOW > 0:
+            keep = keep & (offs_m[:, None] - offs_n[None, :] < WINDOW)
+        s = tl.where(keep, s, float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.exp2((m_i - m_new) * 1.4426950408889634)
-        p = tl.exp2((s - m_new[:, None]) * 1.4426950408889634)
+        # A fully masked row keeps m_i at -inf; clamp so exp2 sees a finite shift.
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp2(
+            (tl.where(m_i == float("-inf"), m_safe, m_i) - m_safe) * 1.4426950408889634
+        )
+        p = tl.exp2((s - m_safe[:, None]) * 1.4426950408889634)
+        p = tl.where(keep, p, 0.0)
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
 
@@ -122,15 +155,15 @@ def _fwd_kernel(
             other=0.0,
         )
         acc = tl.dot(p.to(v.dtype), v, acc)
-        m_i = m_new
+        m_i = m_safe
 
-    acc = acc / l_i[:, None]
+    acc = acc / tl.where(l_i == 0.0, 1.0, l_i)[:, None]
     tl.store(
         o_ptr + offs_m[:, None] * so_t + offs_d[None, :] * so_d,
         acc.to(o_ptr.dtype.element_ty),
         mask=qm[:, None],
     )
-    tl.store(lse_ptr + offs_m, m_i + tl.log(l_i), mask=qm)
+    tl.store(lse_ptr + offs_m, m_i + tl.log(tl.where(l_i == 0.0, 1.0, l_i)), mask=qm)
 
 
 @triton.jit
@@ -275,7 +308,7 @@ def mxfp8_attention(
     kq, ks = quantize_rows(k, mu)
     o = torch.empty(t, head, device=q.device, dtype=v.dtype)
     lse = torch.empty(t, device=q.device, dtype=torch.float32)
-    _fwd_kernel[(triton.cdiv(t, block_m), 1)](
+    _fwd_kernel[(triton.cdiv(t, block_m), 1, 1)](
         qq,
         qs,
         kq,
@@ -283,8 +316,8 @@ def mxfp8_attention(
         v,
         o,
         lse,
+        _cu2(t, qq.device),
         sm_scale,
-        t,
         head,
         qq.stride(0),
         qq.stride(1),
@@ -304,10 +337,12 @@ def mxfp8_attention(
         0,
         0,
         0,
+        0,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_SUB=BLOCK_SCALE,
         CAUSAL=causal,
+        WINDOW=0,
         num_warps=4,
         num_stages=stages,
     )
@@ -737,7 +772,7 @@ def mxfp8_attention_q(
     stages = 3 if head <= 64 else 2
     o = torch.empty(t, head, device=qq.device, dtype=v.dtype)
     lse = torch.empty(t, device=qq.device, dtype=torch.float32)
-    _fwd_kernel[(triton.cdiv(t, block_m), 1)](
+    _fwd_kernel[(triton.cdiv(t, block_m), 1, 1)](
         qq,
         qs,
         kq,
@@ -745,8 +780,8 @@ def mxfp8_attention_q(
         v,
         o,
         lse,
+        _cu2(t, qq.device),
         sm_scale,
-        t,
         head,
         qq.stride(0),
         qq.stride(1),
@@ -766,10 +801,12 @@ def mxfp8_attention_q(
         0,
         0,
         0,
+        0,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_SUB=BLOCK_SCALE,
         CAUSAL=causal,
+        WINDOW=0,
         num_warps=4,
         num_stages=stages,
     )
@@ -897,11 +934,15 @@ def mxfp8_attention_heads(
     block_m: int = 64,
     block_n=None,
     smooth_k: bool = True,
+    cu_seqlens=None,
+    max_seqlen=None,
+    window=None,
 ):
     """Multi-head MXFP8 attention over ``(T, H, D)`` inputs; returns ``(T, H, D)``.
 
-    Heads occupy the grid's second axis, which is what fills 170 SMs at the
-    single-sequence shapes attention actually runs at.
+    ``cu_seqlens`` carries document boundaries for a packed batch; attention never
+    crosses one. ``window`` bounds each query's history. Heads occupy the grid's
+    third axis, which is what fills 170 SMs at real shapes.
     """
     t, heads, head = q.shape
     if head % BLOCK_SCALE:
@@ -924,7 +965,11 @@ def mxfp8_attention_heads(
     kq, ks = quantize_rows(kh.reshape(-1, head), mu, rows_per_mu=t)
     o = torch.empty_like(vh)
     lse = torch.empty(heads, t, device=q.device, dtype=torch.float32)
-    _fwd_kernel[(triton.cdiv(t, block_m), heads)](
+    if cu_seqlens is None:
+        cu_seqlens = _cu2(t, q.device)
+    n_docs = cu_seqlens.numel() - 1
+    max_seq = max_seqlen or t
+    _fwd_kernel[(triton.cdiv(max_seq, block_m), n_docs, heads)](
         qq,
         qs,
         kq,
@@ -932,8 +977,8 @@ def mxfp8_attention_heads(
         vh,
         o,
         lse,
+        cu_seqlens,
         sm_scale,
-        t,
         head,
         qq.stride(0),
         qq.stride(1),
@@ -953,10 +998,12 @@ def mxfp8_attention_heads(
         t * ks.stride(0),
         vh.stride(0),
         o.stride(0),
+        t,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_SUB=BLOCK_SCALE,
         CAUSAL=causal,
+        WINDOW=window or 0,
         num_warps=4,
         num_stages=stages,
     )

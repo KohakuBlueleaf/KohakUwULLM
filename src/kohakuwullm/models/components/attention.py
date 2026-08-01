@@ -311,9 +311,10 @@ class TritonVarlenAttention(BaseAttention):
 class MXFP8Attention(BaseAttention):
     """Causal attention with `QK^T` in block-scaled e4m3 (``kernels/mxfp8/attention.py``).
 
-    Falls back to SDPA for anything the kernel does not cover: a padded batch, a
-    non-16-bit dtype, a sliding window, or a head_dim that is not a multiple of
-    the 32-element scale block. See docs/internals/mxfp8-attention.md.
+    Packed varlen and sliding windows are handled by the kernel. Falls back to
+    SDPA for a padded batch, a non-16-bit dtype, attention sinks, or a head_dim
+    that is not a multiple of the 32-element scale block.
+    See docs/internals/mxfp8-attention.md.
     """
 
     def forward(
@@ -325,10 +326,8 @@ class MXFP8Attention(BaseAttention):
         usable = (
             seq_info.packed
             and v.dtype in (torch.float16, torch.bfloat16)
-            and self.sliding_window is None
             and self.sink is None
             and q.shape[-1] % 32 == 0
-            and seq_info.cu_seqlens.numel() == 2
         )
         if not usable:
             if seq_info.packed:
@@ -337,7 +336,16 @@ class MXFP8Attention(BaseAttention):
                 return self.merge(_sdpa_attend(self, q, k, v, doc_id).squeeze(0))
             return self.merge(_sdpa_attend(self, q, k, v))
         return self.merge(
-            mxfp8_attention_heads(q, k, v, causal=True, sm_scale=self.scale)
+            mxfp8_attention_heads(
+                q,
+                k,
+                v,
+                causal=True,
+                sm_scale=self.scale,
+                cu_seqlens=seq_info.cu_seqlens,
+                max_seqlen=seq_info.max_seqlen,
+                window=self.sliding_window,
+            )
         )
 
 
