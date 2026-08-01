@@ -103,27 +103,44 @@ def swiglu_mx(gate: torch.Tensor, up: torch.Tensor):
 
 @triton.jit
 def _rmsnorm_mx_kernel(
-    x_ptr, w_ptr, q_ptr, s_ptr, M, K, eps,
-    stride_xm, stride_xk, stride_qm, stride_qk, stride_sm, stride_sk,
-    BLOCK_K: tl.constexpr, BLOCK_SUB: tl.constexpr,
+    x_ptr,
+    w_ptr,
+    q_ptr,
+    s_ptr,
+    M,
+    K,
+    eps,
+    stride_xm,
+    stride_xk,
+    stride_qm,
+    stride_qk,
+    stride_sm,
+    stride_sk,
+    BLOCK_K: tl.constexpr,
+    BLOCK_SUB: tl.constexpr,
 ):
     """RMSNorm quantized to e4m3 with ue8m0 blocks along K; one row per program."""
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_K)
     mask = offs < K
-    x = tl.load(x_ptr + row * stride_xm + offs * stride_xk, mask=mask,
-                other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + row * stride_xm + offs * stride_xk, mask=mask, other=0.0).to(
+        tl.float32
+    )
     inv = tl.rsqrt(tl.sum(x * x, axis=0) / K + eps)
     w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     y = tl.reshape(x * inv * w, (1, BLOCK_K))
 
     q, s = _quantize_block(y, 1, BLOCK_K, BLOCK_SUB)
-    tl.store(q_ptr + row * stride_qm + offs * stride_qk,
-             tl.reshape(q, (BLOCK_K,)), mask=mask)
+    tl.store(
+        q_ptr + row * stride_qm + offs * stride_qk, tl.reshape(q, (BLOCK_K,)), mask=mask
+    )
     groups: tl.constexpr = BLOCK_K // BLOCK_SUB
     offs_g = tl.arange(0, groups)
-    tl.store(s_ptr + row * stride_sm + offs_g * stride_sk,
-             tl.reshape(s, (groups,)), mask=offs_g < tl.cdiv(K, BLOCK_SUB))
+    tl.store(
+        s_ptr + row * stride_sm + offs_g * stride_sk,
+        tl.reshape(s, (groups,)),
+        mask=offs_g < tl.cdiv(K, BLOCK_SUB),
+    )
 
 
 def rmsnorm_mx(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
@@ -138,8 +155,21 @@ def rmsnorm_mx(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
     q = torch.empty(m, k, device=x.device, dtype=torch.float8_e4m3fn)
     s = torch.empty(m, k // BLOCK_SCALE, device=x.device, dtype=torch.uint8)
     _rmsnorm_mx_kernel[(m,)](
-        x2, weight, q, s, m, k, eps,
-        x2.stride(0), x2.stride(1), q.stride(0), q.stride(1), s.stride(0), s.stride(1),
-        BLOCK_K=block_k, BLOCK_SUB=BLOCK_SCALE, num_warps=8,
+        x2,
+        weight,
+        q,
+        s,
+        m,
+        k,
+        eps,
+        x2.stride(0),
+        x2.stride(1),
+        q.stride(0),
+        q.stride(1),
+        s.stride(0),
+        s.stride(1),
+        BLOCK_K=block_k,
+        BLOCK_SUB=BLOCK_SCALE,
+        num_warps=8,
     )
     return q, s

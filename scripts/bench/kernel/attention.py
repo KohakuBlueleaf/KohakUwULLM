@@ -254,6 +254,21 @@ def step_fn(module, x, info, mode):
     return call
 
 
+def backward_reaches_input(module, x, info) -> bool:
+    """Whether a fwd+bwd arm is timing a real backward.
+
+    A kernel called outside an autograd node still lets ``.backward()`` succeed
+    through the output projection's weights, and the arm then reports the
+    forward's cost as a whole step. See docs/internals/mxfp8-attention.md.
+    """
+    x.grad = None
+    module(x, info).sum().backward()
+    reached = x.grad is not None and bool(x.grad.abs().sum() > 0)
+    x.grad = None
+    module.zero_grad(set_to_none=True)
+    return reached
+
+
 def run_cell(env, args, backend, layout, lengths, window, mode) -> dict:
     """Build, warm and measure one (backend, layout, shape, window, mode) cell.
 
@@ -277,8 +292,11 @@ def run_cell(env, args, backend, layout, lengths, window, mode) -> dict:
         flops = proj + attn
         moved = fwd_bytes
 
+    detached = mode == "fwdbwd" and not backward_reaches_input(module, x, info)
     call = step_fn(module, x, info, mode)
     row = measure(call, flops, moved, env)
+    if detached:
+        row.update(ok=False, error="backward does not reach the input")
     del call, module, x, info
     torch.cuda.empty_cache()
     # What this cell left behind was allocated while compiling, i.e. before the

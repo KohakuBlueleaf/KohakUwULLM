@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.nn.attention.varlen import AuxRequest, varlen_attn
 
 from kohakuwullm.kernels.attention.flash_attn import triton_varlen_attn
-from kohakuwullm.kernels.mxfp8.attention import mxfp8_attention_heads
+from kohakuwullm.kernels.mxfp8.attention import BLOCK_SCALE, mxfp8_varlen_attn
 from kohakuwullm.models.components.norm import RMSNorm
 from kohakuwullm.registry import ATTENTION
 
@@ -309,11 +309,11 @@ class TritonVarlenAttention(BaseAttention):
 
 @ATTENTION.register("mxfp8")
 class MXFP8Attention(BaseAttention):
-    """Causal attention with `QK^T` in block-scaled e4m3 (``kernels/mxfp8/attention.py``).
+    """Varlen flash attention with `QK^T` in block-scaled e4m3.
 
-    Packed varlen and sliding windows are handled by the kernel. Falls back to
-    SDPA for a padded batch, a non-16-bit dtype, attention sinks, or a head_dim
-    that is not a multiple of the 32-element scale block.
+    Same contract as ``triton``; ``PV`` and both gradient GEMMs stay in the input
+    dtype. Falls back to SDPA for a padded batch, a non-16-bit dtype, or a
+    head_dim that is not a multiple of the 32-element scale block.
     See docs/internals/mxfp8-attention.md.
     """
 
@@ -326,8 +326,7 @@ class MXFP8Attention(BaseAttention):
         usable = (
             seq_info.packed
             and v.dtype in (torch.float16, torch.bfloat16)
-            and self.sink is None
-            and q.shape[-1] % 32 == 0
+            and q.shape[-1] % BLOCK_SCALE == 0
         )
         if not usable:
             if seq_info.packed:
@@ -335,18 +334,25 @@ class MXFP8Attention(BaseAttention):
                 q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
                 return self.merge(_sdpa_attend(self, q, k, v, doc_id).squeeze(0))
             return self.merge(_sdpa_attend(self, q, k, v))
-        return self.merge(
-            mxfp8_attention_heads(
-                q,
-                k,
-                v,
-                causal=True,
-                sm_scale=self.scale,
-                cu_seqlens=seq_info.cu_seqlens,
-                max_seqlen=seq_info.max_seqlen,
-                window=self.sliding_window,
-            )
+
+        need_lse = self.sink is not None
+        result = mxfp8_varlen_attn(
+            q,
+            k,
+            v,
+            seq_info.cu_seqlens,
+            seq_info.max_seqlen,
+            sm_scale=self.scale,
+            causal=True,
+            window=self.sliding_window,
+            return_lse=need_lse,
         )
+        if need_lse:
+            out, lse = result
+            out = self.apply_sink(out, lse.transpose(0, 1))
+        else:
+            out = result
+        return self.merge(out)
 
 
 @ATTENTION.register("sdpa")
