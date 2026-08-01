@@ -155,11 +155,18 @@ The 4 is the sub-core count and the 32 is the warp size. This gives:
 | 8 | 64 |
 | 12 (the maximum) | 42 |
 
-Five is the number that matters. Characterization of this architecture reports
-that latency hiding improves by roughly 6 times at 5 or more warps per sub-core,
-and is nearly absent at 4 or fewer.
+Five is the number that matters **for a kernel that relies on warp-level latency
+hiding**. Characterization of this architecture reports that hiding improves by
+roughly 6 times at 5 or more warps per sub-core, and is nearly absent at 4 or
+fewer.
 
-**So the working rule is: stay at or below 102 registers per thread.**
+**It does not apply to a software-pipelined GEMM.** Measured on this card, the
+fastest bf16 GEMM configs run at one to two warps per sub-core with 160 to 232
+registers per thread and zero spills, because `num_stages` hides the latency
+inside the warp instead. See ../performance/gemm.md section 5b.
+
+So: use the table to know where you are, and apply the 102-register rule to
+elementwise and reduction kernels. For a GEMM, sweep the tile and check spills.
 
 For a GEMM, the accumulator alone is:
 
@@ -179,8 +186,9 @@ of the total, since operands, addresses and the pipeline need the rest.
 | 64 x 64 | 4 | 32 | comfortable |
 | 256 x 128 | 8 | 128 | over budget |
 
-This repo currently ships `BLOCK_M 128, BLOCK_N 128` with `num_warps 4` in
-`kernels/mxfp8/grouped.py`. That is the first row. It is the first thing to fix.
+This repo ships `BLOCK_M 128, BLOCK_N 128` with `num_warps 4` in
+`kernels/mxfp8/grouped.py`. That is the first row. Measure before assuming it is
+wrong: the same shape in a dense bf16 GEMM costs only about 1%.
 
 Verify the real number rather than trusting the estimate. Triton reports it:
 

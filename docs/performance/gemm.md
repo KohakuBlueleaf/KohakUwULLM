@@ -161,14 +161,20 @@ we do not have.
 
 `mma.sync` keeps its accumulator in registers. `tcgen05.mma` keeps it in a
 separate memory. Because registers are small, the `mma.sync` instruction tile is
-small. One warp cannot fill the tensor core. You need several warps to issue MMA
-together. This is why every fast `sm_120` kernel uses 8 warps per CTA.
+small. One warp cannot fill the tensor core, so several warps issue MMA
+together. Note that 8 warps per CTA is a common choice and not a rule: section 5b
+measures 4 warps winning on square shapes.
 
 ### Warp count decides whether the card hides latency
 
 Characterization of this architecture shows a sharp threshold. With 5 or more
 warps per sub-core, latency hiding improves by about 6 times. With 4 or fewer
 warps, there is almost no hiding at all.
+
+**This threshold does not govern a GEMM.** Section 5b measures the fastest
+variants running at one and two warps per sub-core, because `num_stages`
+pipelining hides the latency inside the warp. Read the rest of this section as
+arithmetic you should be able to do, not as a target to hit.
 
 This threshold is easy to miss, and it interacts with register pressure.
 
@@ -483,6 +489,57 @@ percent of cuBLAS is not hard. The last ten percent is a hundred small things.
 
 ---
 
+## 5b. Measured: what each change is actually worth
+
+The sections above were written from first principles and from published
+characterization. Then they were measured, on a free RTX 5090, one variant at a
+time. Two of the predictions were wrong and the table is the correction.
+
+bf16, fp32 accumulate, best Triton config per shape against cuBLAS:
+
+| shape | cuBLAS | best Triton | ratio |
+|---|---|---|---|
+| 4096 x 4096 x 4096 | 235.8 | 224.8 | 95% |
+| 16384 x 1280 x 5120 | 236.6 | 243.5 | **103%** |
+| 16384 x 5120 x 1280 | 241.5 | 237.3 | 98% |
+| 8192 x 1280 x 1280 | 229.2 | 220.9 | 96% |
+| 4096 x 4096 x 16384 | 235.0 | 225.5 | 96% |
+| 8192 x 8192 x 8192 | 240.3 | 243.4 | **101%** |
+
+fp16 tracks it within a point. **A Triton GEMM reaches 95 to 104% of cuBLAS
+here.** The naive kernel's 90% was not a Triton ceiling, it was a configuration.
+
+Per change, from the same run:
+
+| change | worth |
+|---|---|
+| group-M rasterization | **~0%**, and +2% only at 8192 cubed |
+| 4 warps to 8 warps | **~1%** |
+| `max_contiguous` / `multiple_of` hints | **+2.5%**, the most reliable single change |
+| tile shape, chosen per shape | **up to +15%**, and it is what decides the result |
+
+### The register cliff does not apply to a pipelined GEMM
+
+This is the correction that matters. Compiled register counts, all with **zero
+spills**:
+
+| config | regs/thread | shared KiB | warps per sub-core |
+|---|---|---|---|
+| 128x128x64, 4 warps | 232 | 64 | 1 |
+| 128x128x64, 8 warps | 162 | 64 | 2 |
+| 128x64x64, 4 warps | 164 | 72 | 1 |
+
+Doubling the warp count doubled warps per sub-core from 1 to 2 and bought 1%.
+And `128x64x64` at **one warp per sub-core** is the *fastest* variant on square
+shapes. The `>= 5 warps per sub-core` threshold is a latency-hiding rule for
+generic code; a GEMM main loop hides its latency inside the warp through
+`num_stages` software pipelining, so it does not need warp-level occupancy to do
+it. Shared memory, not registers, is what caps residency here: 64 KiB per CTA
+against a 99 KiB budget means one CTA per SM whatever the register count says.
+
+Treat `regs_per_thread <= 102` as a rule for kernels that rely on warp-level
+latency hiding, and **not** as a rule for a software-pipelined GEMM.
+
 ## 6. Conclusion
 
 A GEMM is a memory schedule with some arithmetic attached. The arithmetic is
@@ -493,16 +550,19 @@ The order of work that follows from this document:
 1. **Compute the roofline for your shape.** One line of arithmetic tells you
    whether to work on memory or on compute. Our shapes are 7 times compute bound,
    which rules out most bandwidth work immediately.
-2. **Compute the accumulator registers per thread.** It is
-   `BM * BN / (32 * num_warps)`. If it is above about 64, fix that before
-   anything else. This card gives no latency hiding below 5 warps per sub-core.
+2. **Sweep the tile shape.** Measured at up to 15%, shape-dependent, and the
+   single largest lever. No one tile wins everywhere, which is why cuBLAS ships
+   many kernels and why an offline table beats a constant.
 3. **Check that your low precision instruction is the one you think it is.** Read
-   the PTX. A silent fallback to bf16 gives correct answers at half speed.
-4. **Size the working set against L2 before you reorder anything.** On a 96 MB
-   L2, the classic reorder may buy very little.
-5. **Remove partial waves.** 170 SMs and a tile count that is not a multiple of
+   the PTX. A silent fallback to bf16 gives correct answers at half speed. Ours
+   emits `mma.sync...kind::mxf8f6f4.block_scale`, verified.
+4. **Add the contiguity hints and an aligned-K fast path.** Worth 2.5%, cheap,
+   and the most reliable change measured.
+5. **Do not reach for warp count or rasterization first.** Measured at 1% and 0%
+   respectively on this card. See section 5b.
+6. **Remove partial waves.** 170 SMs and a tile count that is not a multiple of
    170 wastes whole SMs.
-6. **Put fusion in the epilogue, never in the prologue.** The load path is a copy
+7. **Put fusion in the epilogue, never in the prologue.** The load path is a copy
    engine. It cannot compute. Cast where the data is already in registers.
 7. **Use asynchronous loads last.** TMA is present on this card but its load
    latency is 488 to 620 cycles, which is worse than a plain DRAM read. It pays
