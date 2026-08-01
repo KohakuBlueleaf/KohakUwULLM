@@ -50,26 +50,30 @@ def tuned_plan(
     if ck in _CACHE:
         return _CACHE[ck]
 
+    cands = plan_topk(m, n, k, dev, elem_bytes, shortlist)
+    best = _fastest(cands, m, n, k, dev, elem_bytes, dtype) or cands[0]
+    torch.cuda.empty_cache()
+    _CACHE[ck] = best
+    return best
+
+
+def _fastest(cands, m, n, k, dev, elem_bytes, dtype) -> Plan | None:
+    """Time each candidate on scratch operands; None if every one failed."""
     a = torch.zeros((m, k), device="cuda", dtype=dtype)
     b = torch.zeros((k, n), device="cuda", dtype=dtype)
     c = torch.empty((m, n), device="cuda", dtype=dtype)
     best, best_ms = None, float("inf")
-    for cand in plan_topk(m, n, k, dev, elem_bytes, shortlist):
+    for cand in cands:
         try:
             g = StreamKGemm(m, n, k, dev, elem_bytes, p=cand)
             g(a, b, c)
             if g.handle.n_spills > cand.bm * cand.bn // (32 * cand.warps):
                 continue
-            ms = _time(lambda: g(a, b, c))
+            ms = _time(lambda run=g: run(a, b, c))
         except Exception:
             continue
         if ms < best_ms:
             best, best_ms = cand, ms
-    del a, b, c
-    torch.cuda.empty_cache()
-    if best is None:
-        best = plan_topk(m, n, k, dev, elem_bytes, 1)[0]
-    _CACHE[ck] = best
     return best
 
 
