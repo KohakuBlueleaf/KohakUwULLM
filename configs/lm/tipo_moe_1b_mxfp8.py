@@ -1,19 +1,20 @@
-"""TIPO on Kohaku-MoE-1B, 4 pipeline stages, on the kohakuwupipe trainer.
+"""TIPO on Kohaku-MoE-1B (~200M active) with MXFP8 linears *and* MXFP8 attention.
 
-Drives ``scripts/train/lm_pipe.py``, not ``lm.py``::
+The 100k-step production rung. Identical to
+``tipo_moe_1b_uwupipe.py`` except that ``attn`` selects the training-aware
+block-scaled e4m3 attention kernel, so both GEMM families run in MXFP8::
 
     torchrun --standalone --nproc_per_node=4 $(which kogine) run \
-        scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py
+        scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_mxfp8.py
 
 Ten steps, no network, one checkpoint at the end::
 
     torchrun --standalone --nproc_per_node=4 $(which kogine) run \
-        scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py \
+        scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_mxfp8.py \
         --set MAX_STEPS=10 --set CKPT_INTERVAL=10 --set SAMPLE_INTERVAL=0
 
-The split is measured at startup rather than pinned -- see
-docs/internals/pipeline.md. The micro-batch shape is the measured optimum for
-this rung on 4x RTX 5090.
+See docs/internals/mxfp8-attention.md for what the attention kernel costs in
+accuracy, and docs/internals/pipeline.md for the measured split.
 """
 
 DATA_KIND = "corpus"
@@ -43,6 +44,9 @@ ARCH_OVERRIDES = {
     "qk_norm": True,
     # A tied head cannot span two ranks; the stage would untie it and warn.
     "tie_embeddings": False,
+    # QK^T in block-scaled e4m3; PV and both gradient GEMMs stay 16-bit.
+    # head_dim 64 is a whole number of 32-element scale blocks.
+    "attn": "mxfp8",
 }
 # Aux-loss-free balancing carries the load; no head z-loss, which costs 1.59x
 # end to end. See docs/internals/moe-router-loss.md.
@@ -79,9 +83,9 @@ SCHED_WARMUP_RATIO = 0.02
 MAX_STEPS = 100_000
 SEED = 20090220
 
-CKPT_DIR = "out/ckpt/tipo-moe-1b-uwupipe"
+CKPT_DIR = "out/ckpt/tipo-moe-1b-mxfp8"
 CKPT_INTERVAL = 2000
-NAME = "TIPO-MoE-1B-uwupipe"
+NAME = "TIPO-MoE-1B-mxfp8"
 WANDB_PROJECT = "KohakUwULLM"
 WANDB_OFFLINE = False
 LOG_INTERVAL = 1
@@ -90,7 +94,7 @@ CONSOLE_INTERVAL = 200
 PROGRESS_BAR = True
 SAMPLE_INTERVAL = 2000
 SAMPLE_COUNT = 8
-# None runs each row to its own EOS, capped by the 4096-token context.
+# None runs every row to EOS or to the 4096-token context.
 SAMPLE_TOKENS = None
 SAMPLE_TEMPERATURE = 1.0
 SAMPLE_MIN_P = 0.1

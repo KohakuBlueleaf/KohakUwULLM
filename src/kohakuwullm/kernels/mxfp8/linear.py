@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from kohakuwullm.kernels.mxfp8 import quantize_mx_vendor
-from kohakuwullm.kernels.mxfp8.interop import vendor_mxfp8_matmul_swizzled
+from kohakuwullm.kernels.mxfp8.interop import mxfp8_mm_swizzled
 
 # The alignment `quantize_mx_vendor` needs to emit SWIZZLE_32_4_4 scales.
 VENDOR_K_ALIGN = 128
@@ -55,7 +55,7 @@ class _MXFP8Linear(torch.autograd.Function):
         x2d = x.reshape(-1, shape[-1]).to(compute)
         xq, xs = quantize_mx_vendor(x2d)
         # `out_features` is FPROP's N, not its K, so no padding here.
-        out = vendor_mxfp8_matmul_swizzled(xq, xs, wq_f, ws_f, out_dtype=compute)
+        out = mxfp8_mm_swizzled(xq, xs, wq_f, ws_f, compute)
         ctx.save_for_backward(x2d, wq_d, ws_d)
         ctx.pad_k = pad_k
         # `dx` comes back in the dtype of `x` as the caller passed it.
@@ -68,7 +68,7 @@ class _MXFP8Linear(torch.autograd.Function):
         shape = dout.shape
         d2d = dout.reshape(-1, shape[-1]).to(x2d.dtype).contiguous()
         dq, ds = quantize_mx_vendor(ctx.pad_k(d2d))
-        dx = vendor_mxfp8_matmul_swizzled(dq, ds, wq_d, ws_d, out_dtype=ctx.x_dtype)
+        dx = mxfp8_mm_swizzled(dq, ds, wq_d, ws_d, ctx.x_dtype)
         # 16-bit, and unpadded: the padded axis is this product's N.
         dw = d2d.t() @ x2d
         return dx.reshape(*shape[:-1], dx.shape[-1]), dw, None, None, None, None, None

@@ -103,16 +103,20 @@ def vendor_mxfp8_matmul(
 
 @torch.library.custom_op("kohakuwullm::mxfp8_mm_swizzled", mutates_args=())
 def mxfp8_mm_swizzled(
-    aq: torch.Tensor, a_scale: torch.Tensor, bq: torch.Tensor, b_scale: torch.Tensor
+    aq: torch.Tensor,
+    a_scale: torch.Tensor,
+    bq: torch.Tensor,
+    b_scale: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """`vendor_mxfp8_matmul_swizzled` as an opaque op, so Inductor can compile past it.
 
     Inductor's `_scaled_mm_v2` lowering rejects non-trivial swizzles, which is the
     layout this path requires. See docs/internals/mxfp8-difficulty.md.
     """
-    return vendor_mxfp8_matmul_swizzled(aq, a_scale, bq, b_scale, torch.bfloat16)
+    return vendor_mxfp8_matmul_swizzled(aq, a_scale, bq, b_scale, out_dtype)
 
 
 @mxfp8_mm_swizzled.register_fake
-def _mxfp8_mm_swizzled_fake(aq, a_scale, bq, b_scale):
-    return aq.new_empty((aq.shape[0], bq.shape[0]), dtype=torch.bfloat16)
+def _mxfp8_mm_swizzled_fake(aq, a_scale, bq, b_scale, out_dtype=torch.bfloat16):
+    return aq.new_empty((aq.shape[0], bq.shape[0]), dtype=out_dtype)

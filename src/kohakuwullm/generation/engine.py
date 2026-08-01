@@ -136,11 +136,13 @@ class LocalGenerator(Generator):
         min_p: float = 0.0,
         eos_token_id: int | None = None,
         generator: torch.Generator | None = None,
+        use_cache: bool = True,
     ) -> torch.Tensor:
         """Sample a continuation of ``prompt_ids`` ``(B, S)``.
 
         ``max_new_tokens=None`` runs until every row has emitted EOS or the
-        model's context is full.
+        model's context is full. ``use_cache=False`` re-runs the whole prefix each
+        step; the two must agree token for token at ``temperature=0``.
         """
         was_training = self.backbone.training
         generator = generator or self.generator(prompt_ids.device)
@@ -152,8 +154,21 @@ class LocalGenerator(Generator):
         try:
             tokens = prompt_ids.clone()
             finished = torch.zeros(rows, 1, dtype=torch.bool, device=prompt_ids.device)
+            cache = (
+                KVCache.from_config(
+                    self.backbone.config,
+                    batch_size=rows,
+                    max_length=prompt_len + budget,
+                    device=prompt_ids.device,
+                )
+                if use_cache
+                else None
+            )
+            step = tokens
             for _ in range(budget):
-                hidden = self.backbone(tokens)
+                # New iteration for cudagraph trees; see docs/guides/generation.md.
+                torch.compiler.cudagraph_mark_step_begin()
+                hidden = self.backbone(step, cache=cache)
                 logits = self.backbone.head.logits(hidden[:, -1]).float()
                 nxt = self._choose(
                     logits,
@@ -164,6 +179,7 @@ class LocalGenerator(Generator):
                     min_p=min_p,
                 )
                 tokens, finished = advance(tokens, nxt, finished, eos_token_id)
+                step = tokens[:, -1:].contiguous() if cache is not None else tokens
                 if bool(finished.all()):
                     break
         finally:
