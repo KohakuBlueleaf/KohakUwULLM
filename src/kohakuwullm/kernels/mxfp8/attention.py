@@ -230,7 +230,7 @@ def mxfp8_attention(
     causal: bool = False,
     sm_scale: float | None = None,
     block_m: int = 64,
-    block_n: int = 64,
+    block_n: int | None = None,
     smooth_k: bool = True,
 ):
     """Single-head MXFP8 attention over ``(T, HEAD)`` inputs; returns ``(O, lse)``.
@@ -243,9 +243,12 @@ def mxfp8_attention(
     t, head = q.shape
     if head % BLOCK_SCALE:
         raise ValueError(f"head_dim={head} must be a multiple of {BLOCK_SCALE}")
-    if block_n % BLOCK_SCALE:
+    if block_n is not None and block_n % BLOCK_SCALE:
         raise ValueError(f"block_n={block_n} must be a multiple of {BLOCK_SCALE}")
     sm_scale = sm_scale if sm_scale is not None else head**-0.5
+    # A deeper K block needs shared memory proportional to head_dim.
+    block_n = block_n if block_n is not None else (128 if head <= 64 else 64)
+    stages = 3 if head <= 64 else 2
     mu = column_mean(k) if smooth_k else None
     qq, qs = quantize_rows(q)
     kq, ks = quantize_rows(k, mu)
@@ -279,7 +282,7 @@ def mxfp8_attention(
         BLOCK_SUB=BLOCK_SCALE,
         CAUSAL=causal,
         num_warps=4,
-        num_stages=2,
+        num_stages=stages,
     )
     return o, lse, mu
 
@@ -460,6 +463,7 @@ def mxfp8_attention_backward(
 ):
     """Gradients of `mxfp8_attention`; returns ``(dQ, dK, dV)``."""
     t, head = q.shape
+    block_n = block_n if block_n is not None else (128 if head <= 64 else 64)
     delta = torch.empty(t, device=q.device, dtype=torch.float32)
     _bwd_preprocess[(triton.cdiv(t, block_m),)](
         o,
