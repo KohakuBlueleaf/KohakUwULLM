@@ -852,6 +852,7 @@ these, all tested:
 | rasterization | added, worth ~0 on this card, as for dense bf16 |
 | contiguity hints | added, worth a few points |
 | mask arithmetic in the K loop | aligned path added, worth 10 points at K=4096 |
+| split-K with an fp32 atomic reduction | **refuted.** 46.4% at 4096 cubed and 55.0% at 8192 cubed, against 74.0% and 71.7% without it. The atomic add over the whole `(M, N)` output costs more than the extra K parallelism buys, even though split-K is the one thing that wins on a deep-K *dense* bf16 GEMM. |
 | `tl.trans(bq)` in the main loop | **refuted.** Removing it costs 17 points at 4096 cubed and 11 at 8192 cubed. Triton folds the transpose into the shared-memory layout, and storing B as `(N, K)` keeps K contiguous for the load. Storing `(K, N)` to avoid the transpose is strictly worse. |
 
 What is left is the **scale feed**. The block-scaled MMA takes its scale factors
