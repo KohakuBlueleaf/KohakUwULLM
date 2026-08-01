@@ -364,7 +364,9 @@ def mxfp8_matmul_pq(
         out.stride(1),
         BLOCK_SUB=BLOCK_SCALE,
         GROUP_M=8,
-        EVEN=(m % 256 == 0) and (n % 256 == 0) and (k % 256 == 0),
+        # Skipping the mask pays for its own scheduling cost only once the K
+        # loop is long. See docs/internals/kernels.md.
+        EVEN=(m % 256 == 0) and (n % 256 == 0) and (k % 256 == 0) and k >= 2048,
     )
     return out
 
