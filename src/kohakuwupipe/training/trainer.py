@@ -1,8 +1,7 @@
 """``PipelineTrainer``: builds the stage, the schedule and the loop, then fits.
 
-The ``pl.Trainer`` equivalent. It owns construction order -- cast before the
-stage, stage before the schedule -- which is what a caller most often gets
-wrong. See docs/kohakuwupipe/module.md.
+The ``pl.Trainer`` equivalent. It owns construction order: cast before the
+stage, stage before the schedule. See docs/kohakuwupipe/module.md.
 """
 
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B, ScheduleGPipe
@@ -24,8 +23,7 @@ def _objective(module):
     return module.loss
 
 
-# Interleaved schedules want several stage chunks per rank; this trainer
-# builds one. See docs/internals/pipeline.md.
+# Single-chunk schedules only: this trainer builds one stage per rank.
 SCHEDULES = {"1f1b": Schedule1F1B, "gpipe": ScheduleGPipe}
 
 
@@ -117,8 +115,7 @@ class PipelineTrainer:
         self.loop.trainer = self
         self.loop.module = module
         module._loop = self.loop
-        # One list, not two copies: a callback appended after construction has to
-        # reach the loop, which is the thing that calls it.
+        # One list with the loop, so a later `append` reaches what calls it.
         self.callbacks = self.loop.callbacks
 
     def fit(self, batches, max_steps: int) -> None:
@@ -134,11 +131,21 @@ class PipelineTrainer:
             yield batch
 
     def save_checkpoint(self, path: str) -> bool:
-        """Whole-model checkpoint, Lightning-shaped. Collective."""
+        """Whole-model checkpoint, Lightning-shaped. Collective.
+
+        Carries everything a resume needs beyond the weights: the loop's
+        progress, the LR schedule, the loss scaler, the module's and the
+        callbacks' own state. See docs/kohakuwupipe/checkpoint.md.
+        """
         payload: dict = {}
         self.callbacks.call("on_save_checkpoint", self.loop, payload)
         self.module.on_save_checkpoint(payload)
         payload["callbacks"] = self.callbacks.state_dict()
+        payload["progress"] = self.loop.progress_state()
+        if self.loop.scheduler is not None:
+            payload["lr_schedulers"] = [self.loop.scheduler.state_dict()]
+        if self.scaler is not None:
+            payload["grad_scaler"] = self.scaler.state_dict()
         wrote = checkpoint.save(
             path,
             self.loop.stage_module,
@@ -154,7 +161,7 @@ class PipelineTrainer:
         return wrote
 
     def load_checkpoint(self, path: str, strict: bool = True) -> dict:
-        """Restore this rank's slice, its optimizer entry and the step count."""
+        """Restore this rank's slice and everything :meth:`save_checkpoint` wrote."""
         payload = checkpoint.load(
             path,
             self.loop.stage_module,
@@ -166,6 +173,17 @@ class PipelineTrainer:
         )
         self.loop.global_step = int(payload.get("global_step", 0))
         self.loop.load_progress_state(payload.get("progress"))
+        schedules = payload.get("lr_schedulers") or []
+        if self.loop.scheduler is not None and schedules:
+            self.loop.scheduler.load_state_dict(schedules[0])
+        elif self.loop.scheduler is not None:
+            log.warning(
+                "checkpoint carries no LR schedule; this run restarts its own "
+                "from step 0, warmup included",
+                step=self.loop.global_step,
+            )
+        if self.scaler is not None and "grad_scaler" in payload:
+            self.scaler.load_state_dict(payload["grad_scaler"])
         self.callbacks.load_state_dict(payload.get("callbacks", {}))
         self.callbacks.call("on_load_checkpoint", self.loop, payload)
         self.module.on_load_checkpoint(payload)

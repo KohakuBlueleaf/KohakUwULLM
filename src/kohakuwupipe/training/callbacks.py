@@ -1,10 +1,9 @@
 """Callbacks: throughput, periodic logging, and checkpointing.
 
-Every one is interval-gated, because reading a device tensor costs a
-synchronization and the loop deliberately leaves them unread. See docs/kohakuwupipe/loop.md.
+Every one is interval-gated: reading a device tensor synchronizes, and the loop
+leaves them unread. See docs/kohakuwupipe/loop.md.
 """
 
-import math
 import os
 import time
 
@@ -21,13 +20,11 @@ from kohakuwupipe.utils.logging import get_logger
 class Throughput(Callback):
     """Tokens/s and step time over the window since the last report.
 
-    Trailing, not cumulative: a checkpoint or a preview costs tens of seconds,
-    and a running average carries that into every later number. See docs/kohakuwupipe/loop.md.
+    Trailing, not cumulative. See docs/kohakuwupipe/loop.md.
 
     Args:
         every_n_steps: report cadence, and the window width.
-        warmup_steps: steps excluded from the first window; a varlen stream
-            compiles new shapes for a while and that is not throughput.
+        warmup_steps: steps excluded from the first window.
         report: ``(dict) -> None``; rank 0 only.
     """
 
@@ -108,12 +105,7 @@ class LossLog(Callback):
             if self.ema is None
             else (self.ema_decay * self.ema + (1 - self.ema_decay) * loss)
         )
-        row = {
-            "step": out.index,
-            "loss": loss,
-            "loss_ema": self.ema,
-            "ppl": math.exp(min(loss, 20.0)),
-        }
+        row = {"step": out.index, "loss": loss, "loss_ema": self.ema}
         lrs = [group["lr"] for group in loop.optimizer.param_groups]
         if lrs:
             row["lr"] = max(lrs)
@@ -126,18 +118,17 @@ class LossLog(Callback):
 class ProgressBar(Callback):
     """A tqdm bar on rank 0, updated every step, closed on exit.
 
-    Owns stdout for the run: metrics go to the postfix rather than to a new
-    line, so per-step logging costs one line total. Anything that must print
-    while it is open should go through :meth:`write`.
+    Owns stdout for the run; anything that must print while it is open goes
+    through :meth:`write`.
 
     Args:
-        postfix: ``StepOutput.extra`` keys to show, beyond loss and tokens.
+        postfix: ``StepOutput.extra`` keys to show, beyond loss and progress.
         report: also called with each row, for a metrics sink.
     """
 
     def __init__(
         self,
-        postfix: tuple[str, ...] = ("moe/load_imbalance_max", "scale"),
+        postfix: tuple[str, ...] = ("scale",),
         report=None,
         ema: float = 0.9,
     ):
@@ -156,7 +147,7 @@ class ProgressBar(Callback):
             unit="step",
             desc="train",
             dynamic_ncols=True,
-            # Redirected to a file, every step's redraw would be a line in it.
+            # tqdm's auto-disable: off when stderr is not a tty.
             disable=None,
         )
 
@@ -211,7 +202,13 @@ def _human(count: int) -> str:
 
 
 class Checkpoint(Callback):
-    """Write a whole-model checkpoint every ``every_n_steps``. Collective."""
+    """Write a whole-model checkpoint every ``every_n_steps``. Collective.
+
+    Routes through the trainer when one is attached to the loop, so the file
+    carries the module's and the callbacks' state as well as the weights;
+    ``start_layer`` and ``block_attr`` are what a bare loop needs instead.
+    See docs/kohakuwupipe/checkpoint.md.
+    """
 
     def __init__(
         self,
@@ -237,9 +234,15 @@ class Checkpoint(Callback):
             self.write(loop, "last.ckpt")
 
     def write(self, loop: PipelineLoop, name: str) -> None:
+        """One checkpoint at ``dirpath/name``. Collective: every rank calls."""
         os.makedirs(self.dirpath, exist_ok=True)
+        path = os.path.join(self.dirpath, name)
+        trainer = getattr(loop, "trainer", None)
+        if trainer is not None:
+            trainer.save_checkpoint(path)
+            return
         checkpoint.save(
-            os.path.join(self.dirpath, name),
+            path,
             loop.stage_module,
             loop.optimizer,
             self.start_layer,

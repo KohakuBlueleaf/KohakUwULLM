@@ -1,10 +1,8 @@
 """The pipeline training loop: the step, and nothing between it and the GPU.
 
-Nothing in :meth:`PipelineLoop.step` reads a device tensor on the host, so a
-throughput regression is a regression in this file. Model-specific work -- an
-fp8 weight refresh, a router-bias update -- arrives as ``post_step``.
-
-See docs/kohakuwupipe/loop.md.
+Model-specific work arrives as ``post_step``; the loop itself reads no device
+tensor on the host beyond the loss scaler's overflow flag and the loss_fn's
+microbatch index. See docs/kohakuwupipe/loop.md.
 """
 
 import time
@@ -25,12 +23,9 @@ class MicrobatchStep:
 
     ``inputs`` is read on the first stage only and ``target`` on the last;
     ``layout`` is whatever the stage module's ``set_seq_info`` accepts, and
-    ``trained`` is what the loss is normalized by.
-
-    Neither is examined here: ``inputs`` goes to the stage and ``target`` to
-    ``loss``. A tuple ``inputs`` is the first stage's argument list, so a model
-    conditioned on more than one tensor passes them there; ``target`` may be any
-    structure. Subclass to add fields. See docs/kohakuwupipe/module.md.
+    ``trained`` is what the loss is normalized by. A tuple ``inputs`` is the
+    first stage's argument list; ``target`` may be any structure. Subclass to add
+    fields. See docs/kohakuwupipe/module.md.
     """
 
     inputs: Any
@@ -59,20 +54,10 @@ class MicrobatchStep:
         """This step in pinned memory, for an overlapped host-to-device copy."""
         return self.map(lambda t: t.pin_memory())
 
-    def tensors(self):
-        """Every tensor this step carries, in field order."""
-        found: list[torch.Tensor] = []
-        self.map(lambda t: (found.append(t), t)[1])
-        return found
-
 
 @dataclass
 class StepOutput:
-    """One step's results, device-resident.
-
-    Reading a tensor here costs a synchronization, so a callback does that on
-    its own cadence rather than the loop doing it every step.
-    """
+    """One step's results, device-resident: reading a tensor here synchronizes."""
 
     index: int
     loss: torch.Tensor | None
@@ -145,7 +130,8 @@ class PipelineLoop:
         # This step's target, one entry per microbatch. Held, never sent.
         self.target_pieces: list = [None] * num_microbatches
         self._index = None
-        # Python ints: a run passes 2^31 tokens in under an hour.
+        # This step's per-microbatch losses on the last stage, `None` elsewhere.
+        self._losses: list | None = None
         self.tokens_seen = 0
         self.tokens_trained = 0
         self._elapsed_offset = 0.0
@@ -173,7 +159,7 @@ class PipelineLoop:
         losses = self._losses
         self.callbacks.call("on_after_backward", self)
 
-        # One host sync per step, and the only one: a scaler has to branch.
+        # The scaler branches on the host, so this is the step's own sync.
         overflow = False
         scale = 1.0
         if self.scaler is not None and self.scaler.enabled:
@@ -218,10 +204,8 @@ class PipelineLoop:
     def broadcast_loss(self, losses, scale: float = 1.0) -> torch.Tensor | None:
         """The step's loss, from the last stage to every rank, as a device tensor.
 
-        Microbatch losses **sum**: ``loss_fn`` already divided each one by the
-        step's token count. ``scale`` divides the loss scaler back out, so what
-        is reported is the loss the model actually has.
-        See docs/kohakuwupipe/loop.md.
+        Microbatch losses sum, because ``loss_fn`` normalized each one already;
+        ``scale`` divides the loss scaler back out. See docs/kohakuwupipe/loop.md.
         """
         if losses is not None and not dist.is_initialized():
             return torch.stack(losses).sum().detach() / scale if losses else None
@@ -285,18 +269,13 @@ class PipelineLoop:
     def forward_backward(self, inputs, target=None, layout=None):
         """Run the whole model over one step: forward and backward, all stages.
 
-        The only part of a step this package owns. Call it once per step from
-        ``training_step``, with whatever the module computed. A tuple ``inputs``
-        is the first stage's argument list; ``target`` may be any structure and
-        arrives at ``loss`` one microbatch at a time.
+        Call it once per step from ``training_step``. A tuple ``inputs`` is the
+        first stage's argument list; ``target`` may be any structure and arrives
+        at ``loss`` one microbatch at a time. Under ``torch.no_grad()`` it runs
+        forward only.
 
-        Under ``torch.no_grad()`` this runs forward only -- the schedule's
-        ``step`` refuses a disabled-grad context, so ``eval`` is used instead.
-        That makes ``no_grad`` the knob, as it is everywhere else in torch.
-
-        Returns the step's loss on the last stage and ``None`` elsewhere -- a
-        device tensor, already normalized and unscaled, so logging it costs no
-        synchronization until something reads it.
+        Returns the step's loss on the last stage and ``None`` elsewhere, as a
+        device tensor, already normalized and unscaled.
 
         Collective: every rank must call it the same number of times.
         See docs/kohakuwupipe/module.md.
@@ -306,14 +285,14 @@ class PipelineLoop:
         run = self.schedule.step if torch.is_grad_enabled() else self.schedule.eval
         if self._losses is None:
             self._losses = [] if self.is_last else None
+        # One rank can be both ends of the pipeline, so these are not exclusive.
+        args, kwargs = (), {}
         if self.is_first:
             args = inputs if isinstance(inputs, tuple) else (inputs,)
-            run(*args)
-        elif self.is_last:
+        if self.is_last:
             self.target_pieces[:] = split_target(target, self.num_microbatches)
-            run(target=self._target_index(), losses=self._losses)
-        else:
-            run()
+            kwargs = {"target": self._target_index(), "losses": self._losses}
+        run(*args, **kwargs)
         if not self._losses:
             return None
         scale = 1.0
@@ -350,9 +329,6 @@ class PipelineLoop:
         self.tokens_trained = int(state.get("tokens_trained", 0))
         self._elapsed_offset = float(state.get("elapsed", 0.0))
 
-    # Kept so an existing caller of the old name keeps working.
-    run = fit
-
 
 def split_target(target, chunks: int) -> list:
     """``target`` split into ``chunks`` microbatch pieces, whatever its structure.
@@ -382,15 +358,13 @@ def build_loss_fn(
     pieces: list | None = None,
     objective: Callable | None = None,
 ) -> Callable:
-    """A schedule ``loss_fn`` that normalizes by the step's trained tokens.
+    """A schedule ``loss_fn`` that normalizes by ``denom()``, the step's own work.
 
-    Takes ``stage_module``, not the module it wraps: the schedule calls this
-    outside the stage forward, so only the wrapper carries any autocast.
-
-    With a multi-stream boundary the first stream is the hidden state and any
-    scalar stream is an accumulator added to the loss **after** normalization.
-    An accumulator carries a per-microbatch *mean*, so it is averaged over
-    ``num_microbatches`` rather than summed with them. See docs/kohakuwupipe/streams.md.
+    Takes ``stage_module``, the outermost wrapper, because the schedule calls
+    this outside the stage forward. With a multi-stream boundary the first stream
+    is the hidden state and any scalar stream is an accumulator, averaged over
+    ``num_microbatches`` and added after normalization.
+    See docs/kohakuwupipe/streams.md.
     """
     aux_scale = 1.0 / max(num_microbatches, 1)
     objective = objective or stage_module.loss
