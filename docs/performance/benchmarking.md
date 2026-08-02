@@ -11,7 +11,7 @@ The harness lives in `src/kohakuwullm/bench/` so that a precision check in
 whether a kernel is accurate. Read this before adding a benchmark; the failures below
 were all found after publishing a number, not before.
 
-Results live in [../out/bench/README.md](../../out/bench/README.md) and the throughput
+Results live in [../out/bench_old/README.md](../../out/bench_old/README.md) and the throughput
 story is in [performance.md](performance.md). This document explains how those numbers
 were obtained. For comparing two *training runs* rather than two kernels, see
 [ab-testing.md](ab-testing.md).
@@ -548,7 +548,54 @@ expert, and the caller reports that cost.
 
 ---
 
-## 10. Figures
+## 10. Timing a backward
+
+**Clear the gradients inside the timed closure.** `.backward()` *accumulates*. The first
+call allocates each `.grad` and writes it; every call after that does a read-modify-write
+of a tensor already resident. Those are different amounts of memory traffic, so an arm
+that never clears is not timing a training step's backward — it is timing the accumulate
+path.
+
+It does not cancel in a ratio. The tax is proportional to the gradient bytes an
+implementation owns, and two implementations of the same op rarely own the same set:
+measured at 1.44x for one arm against 1.15x for another in the same figure. A ratio
+between two differently-taxed arms is not the ratio of the arms.
+
+Clear **both** halves:
+
+- the leaf **inputs** — `x.grad = None`. A module's `zero_grad` does not touch them, and
+  this is the half that gets missed;
+- the **parameters** — `module.zero_grad(set_to_none=True)`, or a parameter list built
+  once outside the closure if the per-iteration attribute walk shows up in `host_ms`.
+
+`set_to_none=True` rather than `zero_()`: it is what the trainer does, and it makes every
+iteration pay the same allocate-and-write that the first one did.
+
+`kernels.py` does this through `_fwd_bwd(fn, *grads)`, whose `grads` tuple must name
+**every** leaf that receives one. Passing only the activation leaves the weight gradients
+accumulating, which is precisely the bug this rule exists to prevent.
+
+**A backward that does not reach the input is not a backward.** A kernel called outside an
+autograd node still lets `.backward()` succeed, through the surrounding projections'
+weights, and the arm then reports a forward's cost as a whole step.
+`attention.py::backward_reaches_input` asserts `x.grad` is both non-`None` and non-zero
+before any fwd+bwd row is believed. Note the ordering trap that makes this necessary:
+`torch.randn(...).requires_grad_().to(device)` is **not** a leaf — the `.to` is a graph
+node — so `.grad` stays `None` forever. Build the tensor on the device, then
+`requires_grad_()`.
+
+**Keep the fp64 reference out of memory as well as off the timed path.** A reference
+materialized at full size is the third historical bug: `(tokens, vocab)` fp32 logits are
+4.3 GiB at 16k tokens and 34 GiB at 131k, and a full `(M, N)` fp64 GEMM reference plus its
+difference temporary reaches 9.4 GiB at the widest shape in `gemm_plan.py`. Build both in
+chunks and accumulate in fp64 — `kernels.py::_head_reference` and
+`gemm_plan.py::rel_max_error` — and free the reference before timing starts, since
+`bench_peak_memory` reports *total* allocated bytes and a resident reference inflates
+every peak-memory column equally.
+
+---
+
+## 11. Figures
 
 `bench/core/plotting.py` decides fonts, colors, grid and export settings in one place so
 every benchmark in the repo produces figures that can sit side by side without reading as
@@ -569,7 +616,7 @@ above it.
 
 ---
 
-## 11. Checklist
+## 12. Checklist
 
 Before you quote a number:
 
@@ -582,9 +629,14 @@ Before you quote a number:
    bandwidth denominator measured rather than clock-derived?
 5. Is there an accuracy panel next to the throughput panel, in ULP, with the right mode?
 6. Does `suspect` come back empty?
+7. Does every fwd+bwd arm clear **both** the input and the parameter gradients between
+   iterations, and does its backward actually reach the input?
+8. Is every fp64 reference chunked, and freed before the timing starts?
 
-And audit the benchmark itself the way you would audit the kernel. Three real bugs in
+And audit the benchmark itself the way you would audit the kernel. Four real bugs in
 this repo's history were benchmark bugs that made working code look broken: a non-leaf
 input tensor that made every timed backward fail, a per-element ULP metric that reported
-24,000 ULP for a numerically perfect GEMM, and an fp64 reference that OOMed at 131k
-tokens. **A measurement you have not audited is not evidence.**
+24,000 ULP for a numerically perfect GEMM, an fp64 reference that OOMed at 131k tokens,
+and a missing `grad = None` that taxed two implementations unevenly and so did not cancel
+in the ratio they were compared by. **A measurement you have not audited is not
+evidence.**

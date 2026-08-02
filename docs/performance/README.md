@@ -37,5 +37,5 @@ measured figure and therefore a very convincing decoy. The card actually clocks 
 5. Accuracy panel beside the throughput panel, in ULP, in the right mode?
 6. Does `suspect` come back empty?
 
-Results live in [../../out/bench/README.md](../../out/bench/README.md); the docs
+Results live in [../../out/bench_old/README.md](../../out/bench_old/README.md); the docs
 here explain the methods, that index holds the numbers.

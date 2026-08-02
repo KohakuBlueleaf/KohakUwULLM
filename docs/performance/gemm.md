@@ -8,9 +8,26 @@ target, because that is the card this project trains on. The card reports itself
 as `sm_120`. Most published Blackwell advice is for `sm_100`, which is a
 different machine. The differences matter, so this document names them.
 
-All rates in this document come from measurements in `out/bench/kernel/`, unless
-the text says otherwise. Hardware latencies come from published characterization
+Kernel-level rates in this document come from `out/bench_old/kernel/`, unless the
+text says otherwise. Hardware latencies come from published characterization
 work, which is cited at the end.
+
+**The ISA ceilings are the exception, and their harness is not in this repo.**
+Every `mma.sync` peak below -- 276.8, 551.0, 551.3, 1096.7 TFLOP/s and the L2 and
+DRAM rates -- was produced by standalone CUDA microbenchmarks (`mma_peak.cu`,
+`l2_bw.cu`) that were written in a scratch directory and never checked in. There
+is no `scratchpad/` in the tree and no JSON records them, so they cannot be
+re-derived from this repository. They are quoted here as prior measurements on
+this card; rebuild the microbenchmarks before treating any of them as fresh.
+
+**The planner in `kernels/gemm/` is bench-only today.** `plan`, `TunedGemm`,
+`StreamKGemm` and `RTX_5090` have exactly one consumer in the tree --
+`scripts/bench/kernel/gemm_plan.py`. No training path calls any of them: the
+GEMMs a step actually runs are cuBLAS through `torch`, the Triton grouped GEMM
+in `kernels/moe/`, and `_scaled_mm` on the MXFP8 path. `Device.query`,
+`Device.from_json` and `Device.to_json` have no callers at all, including from
+the bench. Read what follows as a design record and a measurement harness, not
+as a description of what a training step executes.
 
 ---
 
@@ -102,6 +119,15 @@ Against that ceiling, every MXFP8 path we have is far from the machine:
 | vendor `_scaled_mm`, pre-quantized | 696.9 | **63.5%** |
 | our Triton pre-quantized | 596.5 | 54.4% |
 | our Stream-K port | 528.8 | 48.2% |
+
+> **Unsourced, and it disagrees with section 4.** No artifact in `out/` holds
+> these three figures. The archived sweep,
+> `out/bench_old/kernel/mxfp8/mxfp8.json`, records four shapes with `impl` in
+> `bf16 / pq / fused / vendor` and no Stream-K arm at all; its best vendor rate is
+> **693.2** and its best `pq` rate is **568.2**, which is what
+> [section 4](#what-it-buys-measured) quotes. Prefer the section 4 table, which
+> the JSON backs row for row. Treat 696.9 / 596.5 / 528.8 as a later run whose
+> output was not kept, and re-measure before quoting them.
 
 ### Stream-K does not transfer to MXFP8
 
@@ -833,7 +859,7 @@ tutorial targets before you follow it.
 ## Sources
 
 Measurements in this document come from `out/bench/kernel/hgemm/hgemm_acc.json`
-and `out/bench/kernel/mxfp8/mxfp8.json`. End to end figures come from
+and `out/bench_old/kernel/mxfp8/mxfp8.json`. End to end figures come from
 [performance.md](performance.md).
 
 External references:

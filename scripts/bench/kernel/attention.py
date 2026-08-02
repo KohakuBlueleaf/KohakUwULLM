@@ -240,10 +240,19 @@ def measure(fn, flops: float, bytes_moved: float, env: Env) -> dict:
 
 def step_fn(module, x, info, mode):
     """The closure that gets timed, built outside ``run_cell`` so that cell can
-    drop its own references and free the batch before building the next one."""
+    drop its own references and free the batch before building the next one.
+
+    A ``fwdbwd`` closure clears the gradients it is about to write, so every
+    iteration measures a write and not an accumulate.
+    See docs/performance/benchmarking.md.
+    """
     if mode == "fwdbwd":
+        params = [p for p in module.parameters() if p.requires_grad]
 
         def call():
+            x.grad = None
+            for param in params:
+                param.grad = None
             module(x, info).sum().backward()
 
     else:

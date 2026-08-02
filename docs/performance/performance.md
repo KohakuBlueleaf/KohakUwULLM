@@ -111,15 +111,38 @@ ratios within each strategy are.
 - **varlen and padded SDPA are the same speed at the same shape** -- both land on
   a flash kernel. The win from `varlen` is not the kernel, it is that the shape
   is smaller because nothing is padded.
-- **Packing is worth up to 7x.** At the length spread rendered TIPO samples
-  actually have (82% padding in the equivalent padded batch), varlen fwd+bwd is
-  7x faster than padded.
-- **GQA is nearly free and hugely cheaper on cache.** 1 KV head vs 20: 68 vs 49
-  TFLOP/s *and* 20x less KV per token. `kv_heads=4` is the default because 1
-  (MQA) starts to cost quality; the throughput case for GQA is not close.
-- **Sliding window 256 at 8k context: 2.40x.** 512 -> 2.18x, 1024 -> 1.84x.
-  Worth interleaving (`global_layer_every`) once context goes past ~4k.
-- **All three backends agree to 5.6e-3 vs fp64** -- i.e. bf16 rounding, no more.
+- **Packing is worth up to 6.3x.** At the length spread rendered TIPO samples
+  actually have (`pad_frac=0.8204` in the equivalent padded batch), varlen
+  fwd+bwd is 6.0-6.3x faster than padded and forward alone is 5.4-5.8x. Lower
+  spreads give less: 3.1-3.8x at `pad_frac=0.69`, 2.8-3.2x at 0.65. From
+  `out/bench/kernel/attention/attention.json`, `sweep="ragged"`.
+- **GQA buys cache, not throughput.** 1 KV head against 20 is 256 vs 5120 bytes
+  of KV per token -- exactly 20x -- but fwd+bwd measures **167.7 against 178.9
+  TFLOP/s**, so the 20-head arm is the *faster* one by 6%. `kv_heads=4` (165.8
+  TFLOP/s) is the default for the cache, and it costs a little throughput rather
+  than gaining any. Earlier revisions of this page reported "68 vs 49 TFLOP/s"
+  with MQA ahead; no artifact in the tree contains those numbers and the sweep
+  runs the other way.
+- **Sliding window at 16k context, packed: 512 -> 3.4x, 1024 -> 2.7x, 2048 ->
+  2.0x** forward (3.5x / 3.0x / 2.3x fwd+bwd), against the 3.854 ms global
+  baseline. At 4k context the same windows are worth 1.13x or less, so
+  interleaving (`global_layer_every`) only pays past ~4k. The window sweep runs
+  512/1024/2048 at 4k and 16k; there is **no window-256 and no 8k row**, so the
+  "256 at 8k context: 2.40x" this page used to quote has no artifact behind it.
+- **A window on the padded layout falls off the fused kernel.** At 4k, padded
+  windowed rows measure 10.0 ms against 0.579 ms global -- **17x slower** -- and
+  the padded 16k windowed cells do not complete at all. The window flag is only
+  cheap on the packed path.
+- **The four 16-bit backends agree to 5.6e-3 vs fp64** (varlen, triton, sdpa and
+  flex all land at 5.57e-3, i.e. bf16 rounding and no more). `mxfp8` is the fifth
+  backend and is **3.15e-2**, 5.7x looser -- see
+  [../internals/mxfp8-attention.md](../internals/mxfp8-attention.md).
+
+> Every `fwd+bwd` row in `attention.json` predates the gradient-reset fix in
+> `step_fn`, so those arms timed an accumulate rather than a write. The bias is
+> toward *understating* the packed-vs-padded ratio -- a fixed per-iteration tax
+> is a larger share of the faster arm -- but the figure needs a re-run before the
+> fwd+bwd columns are quoted as exact. The `fwd` columns are unaffected.
 
 FlexAttention is ~20% slower than varlen for plain causal work and **must be
 `torch.compile`d** -- uncompiled it materializes the score matrix and OOMs
@@ -128,13 +151,16 @@ no flag for.
 
 ## Module kernels
 
-`scripts/bench/kernel/kernels.py`, dim 1280:
+`scripts/bench/kernel/kernels.py`, dim 1280. Figures below are fwd+bwd, bf16,
+from `out/bench_old/kernel/kernels/kernels.json` — **there is no
+`out/bench/kernel/` copy, so this table has not been regenerated for the current
+tree.**
 
 | kernel | verdict |
 |---|---|
-| RMSNorm | ATen wins below ~32k tokens (0.22 vs 0.38 ms at 2k); Triton wins above (1.40 vs 1.82 ms at 131k). Default stays `rmsnorm` (ATen); `rmsnorm_triton` is there for the large-token regime. |
-| SwiGLU | Triton ties `torch.compile`, both beat eager at scale (5.7 vs 7.4 ms at 131k). Triton is also *more accurate* than eager: 0.50 vs 1.86 ULP, because it reduces in fp32. |
-| MoE grouped GEMM | **14x over a loop of per-expert GEMMs** at 128 experts (98 vs 7 TFLOP/s), and bit-equivalent accuracy (2.23 ULP for both). This is the single biggest kernel win in the repo. |
+| RMSNorm | ATen wins at small token counts (0.233 vs 0.461 ms at 2k); Triton wins at large (1.435 vs 1.765 ms at 131k). Default stays `rmsnorm` (ATen); `rmsnorm_triton` is there for the large-token regime. The crossover is between 2k and 131k; the sweep does not sample finely enough to place it, so the "~32k" this page used to give is an interpolation, not a measurement. |
+| SwiGLU | Triton ties `torch.compile`, both beat eager at scale (5.33 and 5.18 vs 6.66 ms at 131k). Triton is also *more accurate* than eager -- **0.50 vs 0.97 ULP**, because it reduces in fp32. (An earlier revision gave eager as 1.86 ULP; the artifact says 0.97.) |
+| MoE grouped GEMM | **13.6-26.7x over a loop of per-expert GEMMs**, growing with expert count: 7.5-9.1x at 32 experts, 19.2x at 64, 26.7x at 96. Accuracy is bit-identical to the loop at every point (2.41-2.89 ULP for both). This is the single biggest kernel win in the repo. The sweep runs 32/48/64/96 experts -- there is **no 128-expert row**, and the "14x at 128 experts, 98 vs 7 TFLOP/s, 2.23 ULP" this page used to quote matches nothing in the artifact. |
 
 ## The LM head is a memory problem, not a speed problem
 
@@ -142,24 +168,31 @@ At vocab 65536, 16384 tokens, bf16:
 
 | path | time | peak memory | rel. error |
 |---|---|---|---|
-| naive (materialize logits) | 58.5 ms | 16.51 GiB | 6.0e-7 |
-| `linear_cross_entropy(options=None)` | 41.2 ms | 8.51 GiB | 1.2e-5 |
-| `linear_cross_entropy(options=LinearCrossEntropyOptions())` | 77.5 ms | **0.83 GiB** | 9.1e-6 |
+| naive (materialize logits) | 58.5 ms | 12.61 GiB | 5.1e-7 |
+| `linear_cross_entropy(options=None)` | 41.5 ms | 6.61 GiB | 6.0e-6 |
+| `linear_cross_entropy(options=LinearCrossEntropyOptions())` | 77.6 ms | **0.93 GiB** | 1.2e-6 |
+
+From `out/bench_old/kernel/kernels/kernels.json`, `kernel="head"`, bf16. The
+peak-memory column is **measured**, and it is lower than the analytic 16.5 / 8.5
+/ 0.83 GiB this page used to print, because the allocator overlaps the logits
+with their gradient rather than holding both at full size. Note also that the
+chunked path is the **most accurate** of the three, not the least: 1.2e-6
+against the reference path's 6.0e-6.
 
 Two traps, both easy to hit:
 
 1. **`options=None` is the reference path and still materializes.** The chunked
    implementation only engages when an explicit `LinearCrossEntropyOptions()` is
-   passed. Passing nothing gets you a 10x memory regression that looks like it
+   passed. Passing nothing gets you a 7x memory regression that looks like it
    is using the new API.
 2. **The returned scalar carries the input dtype.** At bf16 and 16k tokens the
    internal `mean` reduction is ~6% off the true value -- fine as a gradient,
    useless as a logged number or as a token-weighted denominator. `LMHead` always
    requests `reduction="none"` and reduces in fp32.
 
-The chunked path costs ~1.9x the time of the reference path and saves 10x the
-memory. On a 32 GB card that trade is not close: 16.5 GiB of logits decides the
-batch size, and batch size is worth more than 36 ms.
+The chunked path costs ~1.9x the time of the reference path and saves 13.6x the
+memory against the naive one. On a 32 GB card that trade is not close: 12.6 GiB
+of logits decides the batch size, and batch size is worth more than 36 ms.
 
 ## MFU, and why every figure reported before 2026-07-30 is wrong
 

@@ -642,10 +642,12 @@ def bench_mlp(args, device, peak_bw):
             flops = 6 * tokens * args.dim * hidden
             moved = (2 * tokens * args.dim + 3 * hidden * args.dim) * elem
             for impl, module in variants.items():
+                # "compile" wraps eager, so reset the wrapped module's weights.
+                inner = getattr(module, "_orig_mod", module)
                 rows += _both_phases(
                     f"mlp {impl} {dname} T={tokens}",
                     lambda m=module: m(x),
-                    (x,),
+                    (x, *inner.parameters()),
                     flops=flops,
                     bytes_moved=moved,
                     tensor_cores=True,
@@ -663,6 +665,24 @@ def bench_mlp(args, device, peak_bw):
     return rows
 
 
+def _head_reference(x, w, t, chunk: int = 2048) -> torch.Tensor:
+    """Summed fp32 cross-entropy, with the logits materialized a chunk at a time.
+
+    A whole ``(tokens, vocab)`` fp32 logit tensor is 4.3 GiB at 16k tokens and
+    34 GiB at 131k. Chunk sums accumulate in fp64.
+    See docs/performance/benchmarking.md.
+    """
+    xf = x.detach().float()
+    wf = w.detach().float()
+    total = torch.zeros((), device=x.device, dtype=torch.float64)
+    for start in range(0, xf.shape[0], chunk):
+        stop = start + chunk
+        logits = F.linear(xf[start:stop], wf)
+        total += F.cross_entropy(logits, t[start:stop], reduction="sum").double()
+        del logits
+    return total
+
+
 def bench_head(args, device, peak_bw):
     """LM head: the three cross-entropy paths, judged on memory first."""
     rows = []
@@ -678,9 +698,7 @@ def bench_head(args, device, peak_bw):
                 torch.randn(args.vocab, args.dim, device=device, dtype=dtype) * 0.02
             ).requires_grad_()
             t = torch.randint(0, args.vocab, (tokens,), device=device)
-            truth = F.cross_entropy(
-                F.linear(x.detach().float(), w.detach().float()), t, reduction="sum"
-            ).double()
+            truth = _head_reference(x, w, t)
 
             def lce(options, x=x, w=w, t=t):
                 # options=None is torch's *materializing* path, not a default.

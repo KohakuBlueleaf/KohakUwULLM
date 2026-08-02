@@ -58,6 +58,25 @@ def mamf(fn, warmup=15, iters=40):
     return min(s.elapsed_time(e) for s, e in zip(beg, end))
 
 
+def rel_max_error(a, b, c, chunk: int = 2048) -> float:
+    """``max|c - a@b| / max|a@b|`` against an fp64 reference built in row chunks.
+
+    The whole reference is never resident: at the widest shape here a full
+    ``(M, N)`` fp64 reference plus the difference temporary is 9.4 GiB.
+    See docs/performance/benchmarking.md.
+    """
+    b64 = b.double()
+    worst = 0.0
+    scale = 0.0
+    for start in range(0, a.shape[0], chunk):
+        stop = start + chunk
+        ref = a[start:stop].double() @ b64
+        worst = max(worst, (c[start:stop].double() - ref).abs().max().item())
+        scale = max(scale, ref.abs().max().item())
+        del ref
+    return worst / scale
+
+
 def measure(m, n, k, dev, dtype, args):
     """Time one shape against cuBLAS; returns (plan, {arm: TFLOP/s}, rel err)."""
     torch.manual_seed(0)
@@ -71,9 +90,7 @@ def measure(m, n, k, dev, dtype, args):
         p = plan(m, n, k, dev, a.element_size())
         g = StreamKGemm(m, n, k, dev, a.element_size(), p=p)
     g(a, b, c)
-    ref = a.double() @ b.double()
-    err = (c.double() - ref).abs().max().item() / ref.abs().max().item()
-    del ref
+    err = rel_max_error(a, b, c)
 
     arms = {"ours": lambda: g(a, b, c), "cub": lambda: torch.matmul(a, b, out=c)}
     for fn in arms.values():
