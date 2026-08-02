@@ -216,9 +216,12 @@ class TopKRouter(nn.Module):
 
     @torch.no_grad()
     def update_bias(self) -> torch.Tensor | None:
-        """Nudge the selection bias toward underloaded experts; reset the counter.
+        """Nudge the selection bias toward underloaded experts, reset the counter.
 
-        Call once per optimizer step. Returns the max-to-mean load ratio.
+        Call once per optimizer step. Returns ``(max/mean, min/mean, dead)`` on
+        device, where ``dead`` counts experts this step routed nothing to. One
+        tensor rather than three scalars keeps it to a single host sync when the
+        caller reads it. See docs/internals/moe-router-loss.md.
         """
         if self.load_accum is None:
             return None
@@ -233,9 +236,16 @@ class TopKRouter(nn.Module):
         mean = self.load_accum.mean()
         # sign(), not the raw error, so the step size stays bounded.
         self.expert_bias += self.bias_update_rate * torch.sign(mean - self.load_accum)
-        imbalance = self.load_accum.max() / mean.clamp_min(1)
+        scale = mean.clamp_min(1e-9)
+        stats = torch.stack(
+            (
+                self.load_accum.max() / scale,
+                self.load_accum.min() / scale,
+                (self.load_accum == 0).sum().to(scale.dtype),
+            )
+        )
         self.load_accum.zero_()
-        return imbalance
+        return stats
 
 
 @MLP.register("moe")

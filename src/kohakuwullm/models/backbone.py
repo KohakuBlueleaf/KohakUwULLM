@@ -261,16 +261,22 @@ class LMBackbone(nn.Module):
 
         Call once per *optimizer* step, not per micro-batch.
         """
-        ratios = [
-            r.item()
-            for b in self.moe_blocks
-            if (r := b.mlp.router.update_bias()) is not None
+        stats = [
+            r for b in self.moe_blocks if (r := b.mlp.router.update_bias()) is not None
         ]
-        if not ratios:
+        if not stats:
             return {}
+        # One host sync for every layer and every statistic.
+        rows = torch.stack(stats).tolist()
+        high = [r[0] for r in rows]
+        low = [r[1] for r in rows]
+        dead = [r[2] for r in rows]
         return {
-            "moe/load_imbalance_max": max(ratios),
-            "moe/load_imbalance_mean": sum(ratios) / len(ratios),
+            "moe/load_imbalance_max": max(high),
+            "moe/load_imbalance_mean": sum(high) / len(high),
+            "moe/load_starved_min": min(low),
+            "moe/dead_experts_max": max(dead),
+            "moe/dead_experts_total": sum(dead),
         }
 
     def _swap_to_mxfp8(self) -> None:

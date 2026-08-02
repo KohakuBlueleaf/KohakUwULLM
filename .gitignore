@@ -12,6 +12,7 @@ out/
 ref/
 .claude/
 KohakUwULLM/
+model_out/
 
 # checkpoints
 *.pt
