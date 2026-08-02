@@ -132,8 +132,11 @@ per document is what makes RoPE correct across a packed batch.
 
 Packed varlen is the training layout because rendered TIPO samples run 50–600
 tokens against a 2048 context: a padded batch would be ~80% padding, so packing is
-close to a 4x throughput multiplier before any kernel work. Measured at **7x** at
-82% padding in `scripts/bench/kernel/attention.py`.
+close to a 4x throughput multiplier before any kernel work. Measured at **6.3x**
+at 82% padding in `scripts/bench/kernel/attention.py`
+(`out/bench/kernel/attention/attention.json`, `sweep="ragged"`,
+`pad_frac=0.8204`): 5.4-5.8x forward, 6.0-6.3x forward+backward, consistent
+across all four backends that run packed.
 
 ### The invariant
 

@@ -26,7 +26,8 @@ reported efficiency by more than 30 points.
 
 The denominator is a microbenchmark you write: back-to-back `mma.sync` with
 register-resident operands and several independent accumulator chains.
-`scratchpad/mma_peak.cu` is the one this repo uses.
+`mma_peak.cu` is the one this repo's numbers came from -- **it is not checked
+in**, so rebuild it rather than assuming the figures it produced are current.
 
 **Report the accumulator type with every matmul rate.** "276.8 TFLOP/s" is
 meaningless; "276.8 TFLOP/s bf16 into fp32" is a number.
@@ -166,6 +167,13 @@ spills and it is slow" is not evidence that the spills made it slow.
   launch overhead. Decompose with bulk timing, not per-call events.
 - **Report accuracy in the same table as throughput.** A fast wrong kernel is not
   a result.
+- **A `fwdbwd` arm must assert the backward it is timing actually runs.**
+  `fwdbwd_ms < fwd_ms * 1.5` is not a fast kernel, it is a missing one. An MXFP8
+  attention entry point that returned a tensor with no `grad_fn` benchmarked at
+  612 TFLOP/s for a backward that never executed, and read as 2.8x faster than
+  bf16 while its forward alone was 1.1x *slower*. That inconsistency between the
+  two arms is the only thing that exposed it. See
+  [mxfp8-attention.md](mxfp8-attention.md#5-the-bug-that-motivates-test_output_is_differentiable).
 
 ---
 
@@ -184,6 +192,13 @@ spills and it is slow" is not evidence that the spills made it slow.
 - **Localise before theorising.** When the GEMM was wrong, dumping the scratch
   buffer showed the accumulation was correct to 1.0000, which pointed straight at
   the fixup and skipped every wrong hypothesis about the K partition.
+- **A kernel reachable from a module's `forward` gets a differentiability test.**
+  Assert `out.grad_fn is not None` *and* that every input receives a nonzero
+  gradient. A plain function that launches Triton on raw tensors returns an output
+  with no `grad_fn`: the forward is correct, the loss falls, and every parameter
+  below that module silently receives zero. Accuracy tests do not catch it,
+  because the forward is right. See
+  [mxfp8-attention.md](mxfp8-attention.md#5-the-bug-that-motivates-test_output_is_differentiable).
 
 ---
 

@@ -30,20 +30,16 @@ __all__ = [
 
 from kohakuwupipe.parallel.streams import (  # noqa: E402
     GradCarrier,
-    StreamSpec,
     accumulate,
     accumulator,
-    boundary_examples,
     reduce_accumulator,
     split_streams,
 )
 
 __all__ += [
     "GradCarrier",
-    "StreamSpec",
     "accumulate",
     "accumulator",
-    "boundary_examples",
     "reduce_accumulator",
     "split_streams",
 ]

@@ -66,6 +66,15 @@ reference: relmax 0.0275 versus 0.0286, because the intermediate stays fp32
 instead of round-tripping through bf16. On a whole block the two fusions plus
 the gate/up de-duplication are worth **1.041x**.
 
+> **Unreproducible as of this audit.** The harness that produced every number in
+> this section is no longer in `scripts/`, and no JSON under `out/bench*/` holds
+> them. `swiglu_mx` and `rmsnorm_mx` currently have **zero callers** in the tree
+> — not a bench, not a preset, not the block — so nothing regenerates the 1.88x,
+> the 1.50x, the relmax pair or the 1.041x whole-block figure, and nothing would
+> notice if the kernels regressed. Treat them as claims pending a bench, not as
+> measurements. Landing a `scripts/bench/kernel/` arm for `fused_act.py` is what
+> would make this section evidence again.
+
 ### Why this is a kernel change, not a graph change
 
 `torch.compile` cannot do it. Inductor can fuse elementwise chains, but the MX

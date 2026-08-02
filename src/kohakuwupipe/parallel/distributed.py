@@ -1,9 +1,8 @@
 """Process-group setup for a pipeline: rank wiring, and non-eager NCCL init.
 
-``init_pipeline(...)`` initializes without ``device_id``. Eager initialization
-routes every send/recv through the group's single communicator, where NCCL
-serializes them against each other and against every collective; without it each
-send/recv pair gets its own communicator. See docs/kohakuwupipe/distributed.md.
+``init_pipeline(...)`` initializes without ``device_id``, which is what gives
+each send/recv pair its own communicator.
+See docs/kohakuwupipe/distributed.md.
 """
 
 import os
@@ -57,7 +56,8 @@ def init_pipeline(backend: str = "nccl", timeout=None) -> PipelineRanks:
 def eager_init_in_use() -> bool:
     """Whether the default group was built with a ``device_id``.
 
-    True means P2P shares one communicator and serializes. See docs/kohakuwupipe/distributed.md.
+    True means P2P shares one communicator and serializes.
+    See docs/kohakuwupipe/distributed.md.
     """
     if not dist.is_initialized():
         return False

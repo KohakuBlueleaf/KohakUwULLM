@@ -481,7 +481,7 @@ def main() -> None:
 
 
 def launch() -> None:
-    """Run ``main`` under torchrun when the caller did not."""
+    """Spawn ``GPUS`` ranks and run ``main`` in each when the caller started none."""
     if os.environ.get("RANK") is not None:
         main()
         return

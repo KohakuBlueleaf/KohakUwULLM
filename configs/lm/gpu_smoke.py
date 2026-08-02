@@ -1,5 +1,7 @@
 """Short real run that exercises what CPU tests cannot.
 
+    kogine run scripts/train/lm.py --config configs/lm/gpu_smoke.py
+
 Every path here is one a CPU test skips: pinned-memory transfer of a packed
 step, the sampling generator under autocast, the FLOP model against a real
 device, and a checkpoint/resume through an actual Lightning cycle. Small enough

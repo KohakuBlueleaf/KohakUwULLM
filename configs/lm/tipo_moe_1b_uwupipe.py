@@ -2,13 +2,13 @@
 
 Drives ``scripts/train/lm_pipe.py``, not ``lm.py``::
 
-    torchrun --standalone --nproc_per_node=4 $(which kogine) run \
-        scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py
+    kogine run scripts/train/lm_pipe.py \
+        --config configs/lm/tipo_moe_1b_uwupipe.py
 
 Ten steps, no network, one checkpoint at the end::
 
-    torchrun --standalone --nproc_per_node=4 $(which kogine) run \
-        scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py \
+    kogine run scripts/train/lm_pipe.py \
+        --config configs/lm/tipo_moe_1b_uwupipe.py \
         --set MAX_STEPS=10 --set CKPT_INTERVAL=10 --set SAMPLE_INTERVAL=0
 
 The split is measured at startup rather than pinned -- see

@@ -21,8 +21,7 @@ class PipelineModule(nn.Module):
     A subclass must provide :meth:`configure_model` and
     :meth:`configure_optimizers`; :meth:`loss` is required on the last stage
     only. ``self.stage_module`` is what the schedule calls and what the
-    checkpoint reads, so an autocast wrapper belongs there rather than around
-    ``forward``.
+    checkpoint reads, so an autocast wrapper belongs there.
     """
 
     def __init__(self) -> None:
@@ -54,15 +53,11 @@ class PipelineModule(nn.Module):
     def loss(self, hidden: torch.Tensor, target: Any):
         """The step's objective on the last stage. A sum, not a mean.
 
-        ``target`` is this microbatch's slice of whatever the step carried,
-        unexamined by this package and with its structure intact: a tensor, a
-        tuple, a dict, ``None``. Tensors split along dim 0; anything else is
-        passed whole. See docs/kohakuwupipe/module.md.
-
-        Anything differentiable that a ``LightningModule`` would do between the
-        model output and the loss belongs here, not in :meth:`training_step`.
-        Per-term breakdowns go through :meth:`log` here: this is the only place
-        a microbatch's internals exist. See docs/kohakuwupipe/module.md.
+        ``target`` is this microbatch's slice of whatever the step carried, with
+        its structure intact: a tensor, a tuple, a dict, ``None``. Tensors split
+        along dim 0; anything else is passed whole. Everything differentiable
+        between the model output and the loss belongs here, and per-term
+        breakdowns go through :meth:`log` here. See docs/kohakuwupipe/module.md.
         """
         raise NotImplementedError
 
@@ -70,13 +65,11 @@ class PipelineModule(nn.Module):
         """One step, in the shape a ``LightningModule`` writes it.
 
         Preprocess, call :meth:`forward_backward` exactly once, then log or
-        post-process. The default is the plain case: hand the step's own
-        ``inputs`` and ``target`` straight to the model.
+        post-process. The default hands the step's own ``inputs`` and ``target``
+        straight to the model.
 
-        Returns nothing -- the loss is not available here. A 1F1B schedule
-        interleaves microbatch forwards and backwards across ranks, so there is
-        no point at which one rank holds "the output"; the objective arrives as
-        :meth:`loss`, once per microbatch. See docs/kohakuwupipe/module.md.
+        Returns nothing: the objective arrives as :meth:`loss`, once per
+        microbatch. See docs/kohakuwupipe/module.md.
         """
         self.forward_backward(batch.inputs, batch.target)
 
@@ -101,8 +94,7 @@ class PipelineModule(nn.Module):
     def log(self, name: str, value) -> None:
         """Record a metric for the current step, without reading the device.
 
-        Accumulates: :meth:`loss` runs once per microbatch, so assigning would
-        report the last microbatch rather than the step.
+        Accumulates over the step's microbatches; :meth:`pop_metrics` averages.
         """
         total, count = self._metrics.get(name, (0.0, 0))
         self._metrics[name] = (total + value, count + 1)

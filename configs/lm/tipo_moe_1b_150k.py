@@ -1,20 +1,19 @@
-"""TIPO on Kohaku-MoE-1B (~200M active) with MXFP8 linears *and* MXFP8 attention.
+"""TIPO on Kohaku-MoE-1B, 4 pipeline stages, 150k steps.
 
-The 100k-step production rung. Identical to
-``tipo_moe_1b_uwupipe.py`` except that ``attn`` selects the training-aware
-block-scaled e4m3 attention kernel, so both GEMM families run in MXFP8::
+Drives ``scripts/train/lm_pipe.py``, not ``lm.py``::
 
     kogine run scripts/train/lm_pipe.py \
-        --config configs/lm/tipo_moe_1b_mxfp8.py
+        --config configs/lm/tipo_moe_1b_uwupipe.py
 
 Ten steps, no network, one checkpoint at the end::
 
     kogine run scripts/train/lm_pipe.py \
-        --config configs/lm/tipo_moe_1b_mxfp8.py \
+        --config configs/lm/tipo_moe_1b_uwupipe.py \
         --set MAX_STEPS=10 --set CKPT_INTERVAL=10 --set SAMPLE_INTERVAL=0
 
-See docs/internals/mxfp8-attention.md for what the attention kernel costs in
-accuracy, and docs/internals/pipeline.md for the measured split.
+The split is measured at startup rather than pinned -- see
+docs/internals/pipeline.md. The micro-batch shape is the measured optimum for
+this rung on 4x RTX 5090.
 """
 
 DATA_KIND = "corpus"
@@ -44,9 +43,6 @@ ARCH_OVERRIDES = {
     "qk_norm": True,
     # A tied head cannot span two ranks; the stage would untie it and warn.
     "tie_embeddings": False,
-    # QK^T in block-scaled e4m3; PV and both gradient GEMMs stay 16-bit.
-    # head_dim 64 is a whole number of 32-element scale blocks.
-    "attn": "mxfp8",
 }
 # Aux-loss-free balancing carries the load; no head z-loss, which costs 1.59x
 # end to end. See docs/internals/moe-router-loss.md.
@@ -84,12 +80,12 @@ SCHEDULER_CONFIG = {
     }
 }
 SCHED_WARMUP_RATIO = 0.02
-MAX_STEPS = 100_000
+MAX_STEPS = 150_000
 SEED = 20090220
 
-CKPT_DIR = "out/ckpt/tipo-moe-1b-mxfp8"
+CKPT_DIR = "out/ckpt/tipo-moe-1b-150k"
 CKPT_INTERVAL = 2000
-NAME = "TIPO-MoE-1B-mxfp8"
+NAME = "TIPO-MoE-1B-150k"
 WANDB_PROJECT = "KohakUwULLM"
 WANDB_OFFLINE = False
 LOG_INTERVAL = 1
@@ -102,6 +98,12 @@ SAMPLE_COUNT = 8
 SAMPLE_TOKENS = 512
 SAMPLE_TEMPERATURE = 1.0
 SAMPLE_MIN_P = 0.1
+# min-p alone: top-p and top-k off.
+SAMPLE_TOP_P = 1.0
+SAMPLE_TOP_K = 0
+# Decode through the stages; the gathered path is unverified on hardware.
+SAMPLE_LOCAL = False
+SAMPLE_FORWARD_ONLY = True
 # kwargs for tipo.build_prompt: the format the renderer trains on, not a bare
 # tag string. See docs/internals/data.md.
 SAMPLE_PROMPTS = [

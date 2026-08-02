@@ -145,7 +145,7 @@ back to bf16 and give correct answers at half the speed. This applies to all
 three equally.
 
 **Step 3. Fixed shapes, one GEMM, against three baselines.**
-Use our real shapes from `out/bench/kernel/mxfp8/mxfp8.json`, not square
+Use our real shapes from `out/bench_old/kernel/mxfp8/mxfp8.json`, not square
 matrices. Compare against cuBLAS, against `torch._scaled_mm` and against our own
 Triton kernel. Report accuracy in the same figure as throughput.
 

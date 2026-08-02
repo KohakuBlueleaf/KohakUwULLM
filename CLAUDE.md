@@ -134,8 +134,10 @@ A measurement you have not audited is not evidence.
 Every sequence is concatenated into one flat token axis; `cu_seqlens` carries the
 document boundaries. Nothing is padded. For TIPO-shaped data (50-600 token
 samples against a 2048 context) a padded batch would be ~80% padding, so this is
-close to a 4x throughput multiplier before any kernel work -- measured at **7x**
-at 82% padding in `scripts/bench/kernel/attention.py`.
+close to a 4x throughput multiplier before any kernel work -- measured at
+**2.8x to 5.8x forward**, rising with padding fraction, in
+`scripts/bench/kernel/attention.py`. The fwd+bwd column is not quotable until
+that bench is re-run: it was measured without a per-iteration grad reset.
 
 The invariant that makes it correct: **attention must never cross a document
 boundary.** `varlen` gets this from the kernel; the SDPA and Flex fallbacks build
@@ -154,7 +156,8 @@ for reasons nothing in the loss curve explains.
   split-K buys it back. Only worth it where we own the kernel (the MoE grouped
   GEMM), and never in a backward.
 - **The LM head is memory-bound, not compute-bound.** At vocab 65536 and 16k
-  tokens: naive 16.5 GiB, chunked 0.83 GiB. `options=None` on
+  tokens: naive 12.61 GiB, chunked 0.93 GiB, and the chunked path is the *most*
+  accurate of the three, not the least. `options=None` on
   `F.linear_cross_entropy` silently means *reference* (materializing) -- the
   chunked path needs an explicit `LinearCrossEntropyOptions()`.
 

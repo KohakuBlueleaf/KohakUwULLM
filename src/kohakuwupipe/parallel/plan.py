@@ -11,8 +11,8 @@ from dataclasses import dataclass
 class StagePlan:
     """Which layers belong to one stage, and where it sits in the pipeline.
 
-    Architecture-free: a subclass names what its own ends are, which for an LM
-    is the embedding table and the head. See docs/kohakuwupipe/plan.md.
+    Architecture-free: a subclass names what its own ends carry.
+    See docs/kohakuwupipe/plan.md.
     """
 
     index: int
@@ -60,12 +60,10 @@ def partition(
 ) -> list[int]:
     """Contiguous cut points minimizing the slowest stage; ties break on memory.
 
-    ``layer_cost`` and ``layer_params`` are each either one number for every
-    layer or a per-layer sequence -- layers are not interchangeable once some
-    are sparse, windowed, or on a different attention backend.
-
-    ``allow_empty_last`` lets the head-carrying stage hold no layers, which a
-    large vocabulary can want. See docs/kohakuwupipe/plan.md.
+    ``layer_cost`` and ``layer_params`` are each one number for every layer or a
+    per-layer sequence. ``head_cost`` and ``head_params`` are charged to the last
+    stage, ``embed_params`` to the first; ``allow_empty_last`` lets the last
+    stage hold no layers. See docs/kohakuwupipe/plan.md.
     """
     if num_stages < 1:
         raise ValueError("num_stages must be >= 1")

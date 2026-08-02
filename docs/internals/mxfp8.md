@@ -26,7 +26,7 @@ assert not report.blocking, report.summary()
 quantized copies are derived from the 16-bit masters and are built lazily on the first
 forward, never invalidated. Omitting the refresh trains on initialization-time weights
 for the whole run with no symptom in the loss — the trainer does this at
-`training/trainer.py`, and any custom loop must too. The function returns the number of
+`training/loop/trainer.py`, and any custom loop must too. The function returns the number of
 modules refreshed so a caller can assert it rather than trust it.
 
 ---

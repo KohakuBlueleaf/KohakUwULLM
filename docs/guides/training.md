@@ -396,7 +396,12 @@ Covered under [MFU and HFU](#mfu-and-hfu) above.
 
 ## Preview sampling
 
-`PreviewSampler` (`training/loop/sampling.py`) decodes through a `KVCache` by
+`PreviewSampler` (`training/loop/sampling.py`) is a `LocalGenerator`
+(`generation/engine.py`) that takes its backbone per call rather than holding one —
+the decode loop, the KV cache and every filter have exactly one definition, in the
+generation engine. See [generation.md](generation.md).
+
+It decodes through a `KVCache` by
 default, and `use_cache=False` gives back the cache-free path that recomputes the
 whole prefix every step. The two are not alternatives to choose between: the
 cache-free path is the *reference* the cached one is tested against, token for
@@ -415,7 +420,7 @@ The sampler owns a per-device RNG stream seeded from a **fixed** constant
 (`SAMPLE_SEED = 20090220`), not from the run seed, so the same step in two runs draws
 the same sampling noise — which is what makes two previews comparable at all.
 
-`top_p_sample` keeps the first token that crosses the threshold, so the candidate set
+`filter_top_p` keeps the first token that crosses the threshold, so the candidate set
 is never empty. The backbone's training flag is restored in a `finally`: left in eval,
 gradient checkpointing (which keys off `training`) would be off for the rest of the
 run, and nothing in the loss would say so.

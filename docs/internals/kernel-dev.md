@@ -38,7 +38,8 @@ Two numbers are **not** in that list and must be measured, not computed.
   card actually clocks higher, so the theoretical number is a convincing decoy.
 - **Peak matmul rate.** Write a microbenchmark of back to back `mma.sync` with
   register-resident operands and several independent accumulator chains, and
-  time that. `scratchpad/mma_peak.cu` is the one this repo uses.
+  time that. `mma_peak.cu` is the one this repo's numbers came from; it is not
+  checked in, so it has to be rebuilt before the ceiling can be re-derived.
 
   **Do not use a cuBLAS GEMM for this, and do not use a vendor spec sheet.**
   cuBLAS is a library's achieved rate, so dividing by it hides exactly the gap

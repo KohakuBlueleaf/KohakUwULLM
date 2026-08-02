@@ -83,7 +83,7 @@ length, so progress is measured in optimizer steps. Set `MAX_STEPS`; `EPOCH` exi
 finite datasets.
 
 **Write outputs under `out/`.** It is git-ignored. Benchmarks additionally follow the
-grouping in [../out/bench/README.md](../../out/bench/README.md) and write a table or a
+grouping in [../out/bench_old/README.md](../../out/bench_old/README.md) and write a table or a
 figure, never bare JSON.
 
 ## A benchmark script

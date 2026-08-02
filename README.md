@@ -21,7 +21,8 @@ Sibling to [KohakuLatentMaid](https://github.com/KohakuBlueleaf/KohakuLatentMaid
   (Sinkhorn, expert-choice and ReLU routers registered beside it), z-loss.
   Embeddings are untied by default.
 - **Packed variable-length training.** No padding is ever computed on, and
-  attention cannot cross a document boundary. Worth up to 7x on this corpus.
+  attention cannot cross a document boundary. Worth 2.8x to 5.8x on this
+  corpus, rising with padding fraction.
 - **Native MXFP8 training**, verified against bf16 rather than assumed: e4m3
   values with UE8M0 per-32 block scales, on the attention projections, the
   feed-forward pair and the routed experts. Measured 1.08-1.22x end to end on
@@ -111,7 +112,8 @@ card, with the losing configuration reported as readily as the winning one.
 - **The LM head is a memory problem.** At vocab 65536 / 16k tokens: naive 16.5 GiB,
   chunked 0.83 GiB. And `F.linear_cross_entropy(options=None)` is the
   *materializing* path -- the chunked one needs an explicit options object.
-- **Packing is worth 7x** at the length spread this corpus actually has.
+- **Packing is worth 2.8x to 5.8x** at the length spread this corpus actually
+  has, rising with the padding fraction it removes.
 - **Pipelining beats DDP on this box** and the reason is the fabric: no NVLink, every
   pair over the PCIe host bridge, so a ring all-reduce of the whole gradient is the
   access pattern it handles worst. Pipeline boundary sends are 12-29 MB point-to-point

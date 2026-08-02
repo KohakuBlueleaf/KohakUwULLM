@@ -96,7 +96,7 @@ each pass while the run stays reproducible. A renderer that calls the global
 ## A data source
 
 Any object with `__len__` and `__getitem__` returning a normalized record dict
-(see `data/vault.py::empty_record`). Register it, or pass the instance directly.
+(see `data/sources/vault.py::empty_record`). Register it, or pass the instance directly.
 
 If it holds a database handle, **reopen it on PID change** -- see
 `_ForkSafeVaults`. SQLite handles inherited across a fork return corrupt rows

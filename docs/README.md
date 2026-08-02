@@ -70,13 +70,29 @@ package resolves into this folder.
 | [upstream-cutlass-findings.md](performance/upstream-cutlass-findings.md) | Why CUTLASS grouped block-scaled GEMM is unusable on sm_120 |
 
 Coding conventions live in [../CLAUDE.md](../CLAUDE.md). Benchmark *results* live in
-[../out/bench/README.md](../out/bench/README.md); the docs here explain the methods, that
-index holds the numbers.
+[../out/bench_old/README.md](../out/bench_old/README.md); the docs here explain the
+methods, that index holds the numbers. `out/bench/` holds the current re-runs and
+carries no index of its own yet.
+
+## The test suite is absent from the working tree
+
+Docs across this tree cite `tests/test_*.py` by name and by test function. **None
+of those files are present**: `tests/` does not exist in the working tree and is
+not tracked by git. The suite is pending re-implementation from scratch, so the
+citations name what a test *must* pin rather than a file you can run today. Read
+every `tests/...` reference in the docs as a specification, not as a path.
+
+Affected: `test_generation.py`, `test_models.py`, `test_models_posenc.py`,
+`test_kernels.py`, `test_kernels_cpu_fallback.py`, `test_presets.py`,
+`test_training.py`, `test_iterative_loader.py`, `test_lowbit.py`,
+`test_stochastic_round.py`.
 
 ## Install and smoke-test
 
 ```bash
 uv pip install -e ".[dev,bench]"
+
+# absent from the working tree; see the note above
 .venv/bin/python -m pytest tests/test_models.py -q
 
 # 40 steps of the full shipping path on one card: MXFP8, Muon, real corpus
