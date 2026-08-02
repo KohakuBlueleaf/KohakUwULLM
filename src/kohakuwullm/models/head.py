@@ -75,6 +75,13 @@ class LMHead(nn.Module):
             raise ValueError(f"unknown head kernel {kernel!r}")
         if kernel == "chunked_ce" and label_smoothing:
             raise ValueError("chunked_ce does not implement label smoothing")
+        # Select the loss kernel; a soft cap overrides `kernel`.
+        if soft_cap is not None:
+            self._per_token = self._capped_loss
+        elif kernel == "chunked_ce":
+            self._per_token = self._chunked_loss
+        else:
+            self._per_token = self._aten_loss
 
         if tie_embeddings:
             if embedding is None:
@@ -97,44 +104,47 @@ class LMHead(nn.Module):
             out = self.soft_cap * torch.tanh(out / self.soft_cap)
         return out
 
+    def _capped_loss(self, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Materialized soft-capped logits through ATen cross-entropy."""
+        return F.cross_entropy(
+            self.logits(hidden).float(),
+            labels,
+            ignore_index=self.ignore_index,
+            reduction="none",
+            label_smoothing=self.label_smoothing,
+        )
+
+    def _chunked_loss(self, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Our vocabulary-major fused linear + cross-entropy."""
+        return chunked_linear_cross_entropy(
+            hidden,
+            self.projection,
+            labels,
+            ignore_index=self.ignore_index,
+            chunk=self.chunk,
+            vocab_block=self.vocab_block,
+            retain=self.retain,
+            compute_dtype=self.compute_dtype,
+        ).float()
+
+    def _aten_loss(self, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """ATen ``F.linear_cross_entropy``; ``self.options`` engages its chunked path."""
+        return F.linear_cross_entropy(
+            hidden,
+            self.projection,
+            labels,
+            ignore_index=self.ignore_index,
+            reduction="none",
+            label_smoothing=self.label_smoothing,
+            options=self.options,
+        ).float()
+
     def token_loss(self, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """Per-token cross-entropy, ``(N,)`` in fp32, zero at ignored positions.
 
         Always ``reduction="none"``, so the reduction happens here in fp32.
         """
-        hidden = hidden.reshape(-1, hidden.shape[-1])
-        labels = labels.reshape(-1)
-        if self.soft_cap is not None:
-            logits = self.logits(hidden)
-            per_token = F.cross_entropy(
-                logits.float(),
-                labels,
-                ignore_index=self.ignore_index,
-                reduction="none",
-                label_smoothing=self.label_smoothing,
-            )
-        elif self.kernel == "chunked_ce":
-            per_token = chunked_linear_cross_entropy(
-                hidden,
-                self.projection,
-                labels,
-                ignore_index=self.ignore_index,
-                chunk=self.chunk,
-                vocab_block=self.vocab_block,
-                retain=self.retain,
-                compute_dtype=self.compute_dtype,
-            ).float()
-        else:
-            per_token = F.linear_cross_entropy(
-                hidden,
-                self.projection,
-                labels,
-                ignore_index=self.ignore_index,
-                reduction="none",
-                label_smoothing=self.label_smoothing,
-                options=self.options,
-            ).float()
-        return per_token
+        return self._per_token(hidden.reshape(-1, hidden.shape[-1]), labels.reshape(-1))
 
     def loss(
         self,

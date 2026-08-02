@@ -67,8 +67,9 @@ class StepProgressBar(TQDMProgressBar):
 class SampleLogCallback(Callback):
     """Generate a few completions every ``every_n_steps`` and log them.
 
-    Rank 0 only, from the unwrapped backbone; disables itself under a pipeline
-    split. See docs/guides/training.md.
+    Only rank 0 generates, unless the module sets ``generate_is_collective``, in
+    which case every rank runs the loop and rank 0 reports. Disables itself under
+    a pipeline split no single rank can drive. See docs/guides/training.md.
 
     Args:
         tokenizer: used to decode (and to encode the prompts).

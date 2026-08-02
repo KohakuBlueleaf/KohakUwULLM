@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from kohakuwullm.models.components.mlp import GLUMLP
-from kohakuwullm.models.components.moe import MoEMLP
+from kohakuwullm.models.components.moe import MoEMLP, expert_counts
 from kohakuwullm.registry import MLP, ROUTER
 
 
@@ -72,10 +72,7 @@ class SinkhornRouter(nn.Module):
     def route(self, x: torch.Tensor):
         """``(topk_idx, topk_weight, counts)`` -- the interface ``MoEMLP`` calls."""
         idx, weight = self(x)
-        flat = idx.reshape(-1)
-        counts = torch.zeros(self.num_experts, dtype=torch.int32, device=x.device)
-        counts.scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.int32))
-        return idx, weight, counts
+        return idx, weight, expert_counts(idx.reshape(-1), self.num_experts)
 
     @torch.no_grad()
     def update_bias(self):
@@ -252,11 +249,7 @@ class ReLURouter(nn.Module):
 
     def route(self, x: torch.Tensor):
         idx, weight = self(x)
-        # scatter_add, never bincount: bincount syncs. See docs/concepts/architecture.md.
-        flat = idx.reshape(-1)
-        counts = torch.zeros(self.num_buckets, dtype=torch.int32, device=x.device)
-        counts.scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.int32))
-        return idx, weight, counts
+        return idx, weight, expert_counts(idx.reshape(-1), self.num_buckets)
 
     @torch.no_grad()
     def update_bias(self) -> torch.Tensor | None:

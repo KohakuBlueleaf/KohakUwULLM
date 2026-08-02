@@ -53,6 +53,8 @@ class BaseAttention(nn.Module):
                 f"heads ({self.heads}) must be divisible by kv_heads ({self.kv_heads})"
             )
         self.head_dim = head_dim or (dim // heads)
+        if sliding_window is not None and sliding_window < 1:
+            raise ValueError(f"sliding_window must be >= 1, got {sliding_window}")
         self.sliding_window = sliding_window
         self.scale = softmax_scale or self.head_dim**-0.5
 
@@ -101,6 +103,29 @@ class BaseAttention(nn.Module):
         """``(..., H, Dh)`` -> ``(..., dim)`` and out-project."""
         return self.o_proj(out.reshape(*out.shape[:-2], self.heads * self.head_dim))
 
+    def merge_varlen(self, result) -> torch.Tensor:
+        """Out-project a varlen kernel's return, folding a sink when there is one.
+
+        ``result`` is ``out`` alone, or ``(out, lse)`` when a sink made the kernel
+        return it: ``out`` is ``(T, H, Dh)`` and ``lse`` is ``(H, T)``.
+        """
+        if self.sink is None:
+            return self.merge(result)
+        out, lse = result
+        return self.merge(self.apply_sink(out, lse.transpose(0, 1)))
+
+    def sdpa_fallback(self, q, k, v, seq_info) -> torch.Tensor:
+        """Out-projected SDPA over either layout, for the backends that decline.
+
+        A packed batch is unsqueezed to ``(1, T, ...)`` and masked block-diagonally,
+        so it never attends across a document boundary.
+        """
+        if not seq_info.packed:
+            return self.merge(_sdpa_attend(self, q, k, v))
+        doc_id = _doc_ids(seq_info, q.shape[0], q.device)
+        q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+        return self.merge(_sdpa_attend(self, q, k, v, doc_id).squeeze(0))
+
     def attend_cached(self, x: torch.Tensor, posenc, cache) -> torch.Tensor:
         """Attend padded ``(B, S, dim)`` ``x`` over a :class:`LayerKVCache` prefix.
 
@@ -140,37 +165,27 @@ class VarlenAttention(BaseAttention):
         q, k, v = self.project(x, posenc)
         # The flash kernel takes fp16/bf16 packed only; anything else -> SDPA.
         if not seq_info.packed or v.dtype not in (torch.float16, torch.bfloat16):
-            if seq_info.packed:
-                doc_id = _doc_ids(seq_info, q.shape[0], q.device)
-                q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
-                return self.merge(_sdpa_attend(self, q, k, v, doc_id).squeeze(0))
-            return self.merge(_sdpa_attend(self, q, k, v))
+            return self.sdpa_fallback(q, k, v, seq_info)
 
         window = (
             (self.sliding_window - 1, 0) if self.sliding_window is not None else (-1, 0)
         )
         cu = seq_info.cu_seqlens
-        need_lse = self.sink is not None
-        result = varlen_attn(
-            q,
-            k,
-            v,
-            cu,
-            cu,
-            seq_info.max_seqlen,
-            seq_info.max_seqlen,
-            scale=self.scale,
-            window_size=window,
-            enable_gqa=self.kv_heads != self.heads,
-            return_aux=AuxRequest(lse=True) if need_lse else None,
+        return self.merge_varlen(
+            varlen_attn(
+                q,
+                k,
+                v,
+                cu,
+                cu,
+                seq_info.max_seqlen,
+                seq_info.max_seqlen,
+                scale=self.scale,
+                window_size=window,
+                enable_gqa=self.kv_heads != self.heads,
+                return_aux=AuxRequest(lse=True) if self.sink is not None else None,
+            )
         )
-        if need_lse:
-            # varlen_attn returns out as (T, H, Dh) but lse as (H, T).
-            out, lse = result
-            out = self.apply_sink(out, lse.transpose(0, 1))
-        else:
-            out = result
-        return self.merge(out)
 
 
 def _causal_mask(
@@ -221,11 +236,13 @@ def _sdpa_attend(module: BaseAttention, q, k, v, doc_id=None, q_offset=0):
     enable_gqa = module.kv_heads != module.heads
     q_len, kv_len = q.shape[-2], k.shape[-2]
 
+    # `is_causal` places query i at key i, which is only the truth at offset 0.
     if (
         module.sliding_window is None
         and module.sink is None
         and doc_id is None
         and q_len == kv_len
+        and q_offset == 0
     ):
         out = F.scaled_dot_product_attention(
             q, k, v, is_causal=True, scale=module.scale, enable_gqa=enable_gqa
@@ -289,31 +306,21 @@ class TritonVarlenAttention(BaseAttention):
             return self.attend_cached(x, posenc, cache)
         q, k, v = self.project(x, posenc)
         if not seq_info.packed or v.dtype not in (torch.float16, torch.bfloat16):
-            if seq_info.packed:
-                doc_id = _doc_ids(seq_info, q.shape[0], q.device)
-                q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
-                return self.merge(_sdpa_attend(self, q, k, v, doc_id).squeeze(0))
-            return self.merge(_sdpa_attend(self, q, k, v))
+            return self.sdpa_fallback(q, k, v, seq_info)
 
-        need_lse = self.sink is not None
-        result = triton_varlen_attn(
-            q,
-            k,
-            v,
-            seq_info.cu_seqlens,
-            seq_info.max_seqlen,
-            sm_scale=self.scale,
-            causal=True,
-            window=self.sliding_window,
-            return_lse=need_lse,
+        return self.merge_varlen(
+            triton_varlen_attn(
+                q,
+                k,
+                v,
+                seq_info.cu_seqlens,
+                seq_info.max_seqlen,
+                sm_scale=self.scale,
+                causal=True,
+                window=self.sliding_window,
+                return_lse=self.sink is not None,
+            )
         )
-        if need_lse:
-            # The kernel returns lse as (H, T); out is (T, H, Dh).
-            out, lse = result
-            out = self.apply_sink(out, lse.transpose(0, 1))
-        else:
-            out = result
-        return self.merge(out)
 
 
 @ATTENTION.register("mxfp8")
@@ -338,30 +345,21 @@ class MXFP8Attention(BaseAttention):
             and q.shape[-1] % BLOCK_SCALE == 0
         )
         if not usable:
-            if seq_info.packed:
-                doc_id = _doc_ids(seq_info, q.shape[0], q.device)
-                q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
-                return self.merge(_sdpa_attend(self, q, k, v, doc_id).squeeze(0))
-            return self.merge(_sdpa_attend(self, q, k, v))
+            return self.sdpa_fallback(q, k, v, seq_info)
 
-        need_lse = self.sink is not None
-        result = mxfp8_varlen_attn(
-            q,
-            k,
-            v,
-            seq_info.cu_seqlens,
-            seq_info.max_seqlen,
-            sm_scale=self.scale,
-            causal=True,
-            window=self.sliding_window,
-            return_lse=need_lse,
+        return self.merge_varlen(
+            mxfp8_varlen_attn(
+                q,
+                k,
+                v,
+                seq_info.cu_seqlens,
+                seq_info.max_seqlen,
+                sm_scale=self.scale,
+                causal=True,
+                window=self.sliding_window,
+                return_lse=self.sink is not None,
+            )
         )
-        if need_lse:
-            out, lse = result
-            out = self.apply_sink(out, lse.transpose(0, 1))
-        else:
-            out = result
-        return self.merge(out)
 
 
 @ATTENTION.register("sdpa")
@@ -378,12 +376,7 @@ class SDPAAttention(BaseAttention):
     ) -> torch.Tensor:
         if cache is not None:
             return self.attend_cached(x, posenc, cache)
-        q, k, v = self.project(x, posenc)
-        if seq_info.packed:
-            doc_id = _doc_ids(seq_info, q.shape[0], q.device)
-            q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
-            return self.merge(_sdpa_attend(self, q, k, v, doc_id).squeeze(0))
-        return self.merge(_sdpa_attend(self, q, k, v))
+        return self.sdpa_fallback(*self.project(x, posenc), seq_info)
 
 
 @ATTENTION.register("flex")

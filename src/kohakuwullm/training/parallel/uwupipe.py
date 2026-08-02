@@ -22,10 +22,11 @@ from kohakuwullm.training.parallel.pipeline import (
     LMStage,
     plan_for,
 )
-from kohakuwupipe import PipelineModule
+from kohakuwupipe import PipelineModule, get_logger
 
-# The adapter's public surface. `plan_for` is re-exported rather than defined
-# here: it needs the cost model, which lives beside `LMStage`.
+log = get_logger("uwupipe")
+
+# `plan_for` is re-exported; it is defined beside `LMStage` with the cost model.
 __all__ = [
     "LMPipelineModule",
     "PipelineStep",
@@ -60,12 +61,8 @@ def corpus_steps(loader, device):
     """Adapt a :class:`MicroBatchedStep` loader to :class:`PipelineStep`, endlessly.
 
     The loader names the layout ``seq_infos`` and reports ``trained`` per
-    microbatch; the loop wants ``layout`` and one host int.
-
-    Re-iterated rather than consumed once: the dataset advances its own pass
-    counter and reshuffles, so a stream that runs out continues instead of
-    ending the fit early and silently. ``max_steps`` is what stops a run.
-    See docs/internals/data.md.
+    microbatch; the loop wants ``layout`` and one host int. Re-iterated on
+    exhaustion, so only ``max_steps`` ends a run. See docs/internals/data.md.
     """
     while True:
         emitted = 0
@@ -108,10 +105,7 @@ def first_mismatch(signatures) -> int | None:
 def verify_same_batch(step: PipelineStep) -> None:
     """Raise unless every rank drew the identical step.
 
-    Each rank builds its own loader, so a divergence pairs the first stage's
-    tokens with the last stage's labels from a different batch -- a loss that is
-    wrong and entirely plausible. Collective; one sync, on one step.
-    See docs/internals/pipeline.md.
+    Collective; one sync, on one step. See docs/internals/pipeline.md.
     """
     if not (dist.is_available() and dist.is_initialized()):
         return
@@ -189,12 +183,11 @@ class LMPipelineModule(PipelineModule):
         self.mxfp8 = mxfp8
         self.mxfp8_moe = mxfp8_moe
         self.mxfp8_scope = mxfp8_scope
-        # "module" mode only: "model" prefixes every checkpoint key with
-        # `_orig_mod.`, which the stage-slice loader indexes by name.
+        # Compiled in place; a wrapped `torch.compile` would prefix every
+        # checkpoint key with `_orig_mod.`. See docs/internals/pipeline.md.
         self.compile_spec = compile_spec
         self.scheduler_config = scheduler_config
-        # Held so its stream position joins the checkpoint; a resume that restores
-        # the weights but not the position re-trains tokens it has already seen.
+        # Held so its stream position joins the checkpoint.
         self.loader = loader
         self.verify_data = verify_data
         self.inner: LMStage | None = None
@@ -224,8 +217,7 @@ class LMPipelineModule(PipelineModule):
                     f"compile_spec must be a dict of torch.compile kwargs, got "
                     f"{type(self.compile_spec).__name__} {self.compile_spec!r}"
                 )
-            # In place and over the whole stage: one graph per rank, and the
-            # checkpoint keys stay unprefixed. See docs/internals/pipeline.md.
+            # In place, over the whole stage: one graph per rank.
             inner.compile(**self.compile_spec)
         self.inner = inner
         if self.autocast_dtype is None:
@@ -284,8 +276,15 @@ class LMPipelineModule(PipelineModule):
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
         """Arm the loader to continue where the checkpoint stopped."""
-        if self.loader is not None and "loader" in checkpoint:
-            self.loader.load_state_dict(checkpoint["loader"])
+        if self.loader is None:
+            return
+        if "loader" not in checkpoint:
+            log.warning(
+                "checkpoint carries no loader position; this run re-reads the "
+                "corpus from the beginning and re-trains tokens it has seen"
+            )
+            return
+        self.loader.load_state_dict(checkpoint["loader"])
 
     def post_step(self, stage_module) -> dict[str, torch.Tensor]:
         """Refresh the fp8 copies and advance the routers; both per step."""

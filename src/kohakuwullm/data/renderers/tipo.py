@@ -50,6 +50,19 @@ def normalize_tags(tags) -> list[str]:
     return [normalize_tag(tag) for tag in (tags or []) if tag]
 
 
+def target_line(task: str | None, target_len: str) -> str:
+    """The ``target:`` value for a task: length-qualified only where it applies.
+
+    ``task`` of ``None`` is a plain length-conditioned continuation.
+    See docs/internals/data.md.
+    """
+    if task is None:
+        return f"<|{target_len}|>"
+    if task.startswith("tag_to") or "to_tag" in task:
+        return f"<|{target_len}|> <|{task}|>"
+    return f"<|{task}|>"
+
+
 def _random_choose(items: list, n: int, rng) -> list:
     """``n`` items sampled without replacement, original order preserved."""
     idx = list(range(len(items)))
@@ -112,12 +125,7 @@ def build_prompt(
         if value:
             before += f"{key}: {value}\n"
 
-    if task is None:
-        task_str = f"<|{target_len}|>"
-    else:
-        needs_length = task.startswith("tag_to") or "to_tag" in task
-        task_str = f"<|{target_len}|> <|{task}|>" if needs_length else f"<|{task}|>"
-
+    task_str = target_line(task, target_len)
     field = (task.split("_to_") if task else ["tag"])[0]
     seeded = ", ".join(normalize_tags(t.strip() for t in tags.split(",")))
     # A tag-first prompt ends mid-line: the model continues with ", <tag>".
@@ -266,8 +274,6 @@ class TIPORenderer:
 
         if tasks and rng.random() < (len(tasks) / (len(tasks) + 1)):
             task = rng.choice(tasks)
-            needs_length = task.startswith("tag_to") or "to_tag" in task
-            return task, (
-                f"<|{target_len}|> <|{task}|>" if needs_length else f"<|{task}|>"
-            )
-        return None, f"<|{target_len}|>"
+        else:
+            task = None
+        return task, target_line(task, target_len)

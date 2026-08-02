@@ -49,11 +49,12 @@ class RouterBiasSchedule(Callback):
 
 
 class SamplePreview(Callback):
-    """Generate completions through the schedule every ``every_n_steps``.
+    """Generate completions every ``every_n_steps`` and report them on rank 0.
 
-    Collective: every rank enters the schedule, and only rank 0 decodes. The
-    decode boundary is padded ``(rows, 1)`` and separate from the training one,
-    so the module must be in eval for the duration. See docs/guides/generation.md.
+    Collective. With ``local`` the model is gathered onto rank 0 and decoded
+    there; otherwise every rank drives a pipelined decode, whose padded
+    ``(rows, 1)`` boundary is separate from the training one. The module is in
+    eval for the duration. See docs/guides/generation.md.
 
     Args:
         module: the :class:`LMPipelineModule` being trained.
@@ -118,11 +119,16 @@ class SamplePreview(Callback):
         self.preview(loop, out.index)
 
     def preview(self, loop, step: int) -> None:
-        """One collective round per prompt. Every rank must reach every round."""
+        """Generate every prompt and report on rank 0. Collective; every rank calls.
+
+        ``local`` decodes on rank 0 after one gather; otherwise every rank runs
+        one pipelined decode round per prompt. See docs/guides/generation.md.
+        """
         began = time.perf_counter()
         was_training = loop.stage_module.training
         loop.stage_module.eval()
         rows = []
+        stops: list[tuple[int, bool]] = []
         gathered = self._gathered(loop) if self.local else None
         bar = tqdm(
             self.prompts,
@@ -133,7 +139,8 @@ class SamplePreview(Callback):
         )
         try:
             for name, text in bar:
-                if gathered is not None and self.ranks.rank:
+                # Gathered decode runs on rank 0 alone; the others are done.
+                if self.local and self.ranks.rank:
                     break
                 prompt_ids = self._encode(text)
                 generator = gathered or self._build()
@@ -148,23 +155,32 @@ class SamplePreview(Callback):
                 )
                 if self.ranks.rank:
                     continue
-                rows += [
-                    (
-                        name,
-                        text,
-                        index,
-                        self.tokenizer.decode(row.tolist(), skip_special_tokens=True),
+                eos = self.tokenizer.eos_token_id
+                prompt_len = prompt_ids.shape[1]
+                for index, row in enumerate(tokens):
+                    body = row[prompt_len:].tolist()
+                    hit = eos is not None and eos in body
+                    kept = body[: body.index(eos)] if hit else body
+                    stops.append((len(kept), hit))
+                    rows.append(
+                        (
+                            name,
+                            text,
+                            index,
+                            self.tokenizer.decode(kept, skip_special_tokens=True),
+                        )
                     )
-                    for index, row in enumerate(tokens)
-                ]
         finally:
             bar.close()
             loop.stage_module.train(was_training)
-        if self.ranks.rank == 0:
-            tokens_out = sum(len(r[3]) > 0 for r in rows)
+        if self.ranks.rank == 0 and stops:
+            lengths = [n for n, _ in stops]
+            on_eos = sum(hit for _, hit in stops)
             print(
                 f"[preview@{step}] {time.perf_counter() - began:.2f}s "
-                f"local={self.local} prompts={len(self.prompts)} rows={tokens_out}",
+                f"local={self.local} rows={len(stops)} "
+                f"len min/med/max={min(lengths)}/{sorted(lengths)[len(lengths) // 2]}/"
+                f"{max(lengths)} eos={on_eos}/{len(stops)}",
                 flush=True,
             )
         if self.ranks.rank == 0 and self.report is not None:

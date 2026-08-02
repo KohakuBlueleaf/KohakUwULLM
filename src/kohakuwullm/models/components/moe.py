@@ -34,6 +34,17 @@ _SCORE_FUNCS = {
 }
 
 
+def expert_counts(flat_idx: torch.Tensor, num_buckets: int) -> torch.Tensor:
+    """``(num_buckets,)`` int32 rows per bucket, from a flat ``(T * slots,)`` index.
+
+    The histogram :func:`~kohakuwullm.kernels.moe.moe_dispatch.expert_sort` needs.
+    """
+    # scatter_add, never bincount: bincount syncs. See docs/concepts/architecture.md.
+    counts = torch.zeros(num_buckets, dtype=torch.int32, device=flat_idx.device)
+    counts.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.int32))
+    return counts
+
+
 @ROUTER.register("topk")
 class TopKRouter(nn.Module):
     """Token -> expert assignment with aux-loss-free balancing.
@@ -187,10 +198,7 @@ class TopKRouter(nn.Module):
             if self.z_loss_weight > 0
             else None
         )
-        # scatter_add, never bincount: bincount syncs. See docs/concepts/architecture.md.
-        flat = topk_idx.reshape(-1)
-        counts = torch.zeros(self.num_experts, dtype=torch.int32, device=x.device)
-        counts.scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.int32))
+        counts = expert_counts(topk_idx.reshape(-1), self.num_experts)
 
         self.aux_loss = (
             self._aux_loss(scores, counts) if self.aux_loss_weight > 0 else None

@@ -39,9 +39,7 @@ class LMStagePlan(StagePlan):
 def _ffn_hidden(config, index: int | None = None) -> int:
     """Feed-forward width, read off a block the model builds on the meta device.
 
-    Not recomputed: ``resolve_hidden``'s GLU correction and its ``multiple_of``
-    ceiling both have to match what was constructed, and a second derivation
-    drifts. See docs/internals/pipeline.md.
+    See docs/internals/pipeline.md.
     """
     with torch.device("meta"):
         block = LMBackbone.build_block(
@@ -221,7 +219,7 @@ class LMStage(nn.Module):
 
         self.embed = backbone.embed if plan.has_embed else None
         self.embed_scale = backbone.embed_scale
-        # Parameterless (buffers only), so replicating per stage is free.
+        # Replicated on every stage; it holds buffers, not parameters.
         self.pos_enc = backbone.pos_enc
         self.blocks = nn.ModuleList(backbone.blocks[plan.start_layer : plan.end_layer])
         self.final_norm = backbone.final_norm if plan.has_head else None
@@ -232,8 +230,7 @@ class LMStage(nn.Module):
             if self.head.tie_embeddings:
                 self._untie_head(backbone)
 
-        # Stages hold different numbers of MoE layers, so a router that reduced
-        # over the pipeline group would hang. See docs/internals/pipeline.md.
+        # No cross-rank load reduction on a split model. See docs/internals/pipeline.md.
         if plan.num_stages > 1:
             for block in self.blocks:
                 router = getattr(block.mlp, "router", None)
@@ -270,8 +267,7 @@ class LMStage(nn.Module):
     def update_router_bias(self) -> dict[str, torch.Tensor]:
         """Advance this stage's MoE routers; call once per optimizer step.
 
-        Values stay on the device: reading them costs one stall per router.
-        See docs/internals/pipeline.md.
+        Values stay on the device. See docs/internals/pipeline.md.
         """
         ratios = [
             r
@@ -301,8 +297,7 @@ class LMStage(nn.Module):
     def set_bias_update_rate(self, rate: float) -> None:
         """Set every router's balancing step size. Zero freezes the bias.
 
-        The load counter and the imbalance metric keep running, so a frozen run
-        still reports what the routing is doing.
+        The load counter and the imbalance metric keep running either way.
         See docs/internals/moe-router-loss.md.
         """
         for block in self.blocks:
@@ -418,8 +413,7 @@ class LMStage(nn.Module):
         steps = x.shape[1] if x.dim() > 1 else x.shape[0]
         posenc = self.pos_enc.prepare(seq_info.position_ids, x.device, x.dtype)
         for offset, block in enumerate(self.blocks):
-            # Global index: the cache is sized for the whole model, this stage owns
-            # a contiguous slice of its layers.
+            # The cache is indexed against the whole model, not this slice.
             layer = (
                 None if cache is None else cache.layer(self.plan.start_layer + offset)
             )
@@ -429,7 +423,6 @@ class LMStage(nn.Module):
                 )
             else:
                 x = block(x, seq_info, posenc, layer)
-        # Every stage advances its own copy, so the next step's positions continue.
         if cache is not None:
             cache.advance(steps)
         if self.final_norm is not None:

@@ -81,7 +81,7 @@ class PipelinedLMTrainer(LMTrainer):
             autocast_dtype=self.autocast_dtype,
             param_dtype=self.param_dtype,
             seq_len=self.seq_len,
-            head_kwargs=getattr(self, "head_kwargs", None),
+            head_kwargs=self.head_kwargs,
         )
         inner = getattr(self.stage_module, "module", self.stage_module)
         # Everything inherited -- loss, param_summary, the fp8 refresh, the grad

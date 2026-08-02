@@ -79,6 +79,7 @@ class LMTrainer(pl.LightningModule):
         arch.vocab_size = vocab_size
         arch.grad_ckpt = grad_checkpointing
         self.arch = arch
+        self.head_kwargs = head_kwargs
         self.backbone = LMBackbone(arch, head_kwargs=head_kwargs)
         # Built from the uncompiled module, which still exposes the shape constants.
         self.flop_model = FlopCounter(self.backbone)
@@ -186,9 +187,7 @@ class LMTrainer(pl.LightningModule):
 
         totals = {"ce": 0.0, "n": 0}
         extra_logs: dict[str, float] = {}
-        # The router terms are means, the CE a sum; scaling them by the divisor
-        # this loop is about to apply lands them at the same scale, once per step
-        # rather than once per micro-batch.
+        # See docs/internals/moe-router-loss.md.
         router_scale = denom / len(micro)
         for chunk in micro:
             loss, logs = self.backbone.loss(
@@ -204,6 +203,11 @@ class LMTrainer(pl.LightningModule):
             for key in ("z_loss", "router_loss"):
                 if key in logs:
                     extra_logs[key] = extra_logs.get(key, 0.0) + logs[key].item()
+        # The z-loss arrives as a token sum, the router terms as per-token means.
+        if "z_loss" in extra_logs:
+            extra_logs["z_loss"] /= max(totals["n"], 1)
+        if "router_loss" in extra_logs:
+            extra_logs["router_loss"] /= len(micro)
 
         # Unscale before measuring, so the logged norm tracks the model not the scaler.
         unscale = getattr(self.trainer.precision_plugin, "unscale_gradients", None)
@@ -251,6 +255,7 @@ class LMTrainer(pl.LightningModule):
     ) -> None:
         """Log the step's loss and auxiliaries, plus progress on the interval.
 
+        ``extra_logs`` arrives already normalized and is logged as given.
         Collective: gated on the *reduced* ``empty_step`` flag.
         """
         if not empty_step:
@@ -267,7 +272,7 @@ class LMTrainer(pl.LightningModule):
             if grad_norm is not None:
                 self.log("train/grad_norm", grad_norm, sync_dist=True)
             for key, value in extra_logs.items():
-                self.log(f"train/{key}", value / max(totals["n"], 1), sync_dist=True)
+                self.log(f"train/{key}", value, sync_dist=True)
             for key, value in (moe_logs or {}).items():
                 self.log(f"train/{key}", value, sync_dist=True)
 
@@ -452,18 +457,11 @@ class LMTrainer(pl.LightningModule):
 
     # -- generation ------------------------------------------------------ #
 
-    def generate(
-        self,
-        prompt_ids: torch.Tensor,
-        max_new_tokens: int = 128,
-        temperature: float = 1.0,
-        top_p: float = 0.95,
-        eos_token_id: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> torch.Tensor:
+    def generate(self, prompt_ids: torch.Tensor, **kwargs) -> torch.Tensor:
         """Sample a continuation of ``prompt_ids``, for the preview callback.
 
-        Runs under the precision plugin's forward context. See docs/guides/training.md.
+        ``kwargs`` reach :meth:`PreviewSampler.generate` unchanged. Runs under the
+        precision plugin's forward context. See docs/guides/training.md.
         """
         context = (
             self._trainer.precision_plugin.forward_context()
@@ -471,12 +469,4 @@ class LMTrainer(pl.LightningModule):
             else contextlib.nullcontext()
         )
         with context:
-            return self.sampler.generate(
-                self.backbone,
-                prompt_ids,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                eos_token_id=eos_token_id,
-                generator=generator,
-            )
+            return self.sampler.generate(self.backbone, prompt_ids, **kwargs)

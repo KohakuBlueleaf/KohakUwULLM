@@ -7,14 +7,15 @@ Launched and configured by KohakuEngine; the script spawns its own ranks::
     kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py \
         --set MAX_STEPS=10 --set DATA_KIND=synthetic
 
-``GPUS`` sets the rank count. Running under ``torchrun`` still works: the
-launcher stands down when ``RANK`` is already set.
+``GPUS`` sets the rank count; the launcher stands down when ``RANK`` is already
+set, so an externally started rank group is used as-is.
 
 Every UPPER_CASE global is a knob a config may override; the defaults form a
 runnable synthetic smoke test. ``scripts/train/lm.py`` is the Lightning path and
 is unchanged. See docs/internals/pipeline.md and docs/guides/writing-configs.md.
 """
 
+import math
 import os
 import sys
 
@@ -150,7 +151,7 @@ SAMPLE_LOCAL = True
 # When SAMPLE_LOCAL is off: drive pipelined decode with a forward-only
 # send/recv pass instead of a training schedule.
 SAMPLE_FORWARD_ONLY = True
-# Ranks to launch when the script is run outside torchrun. 0 uses every GPU.
+# Ranks to launch when the caller started none. 0 uses every GPU.
 GPUS = 0
 
 
@@ -231,6 +232,9 @@ def build_reporter(name: str):
 
     def report(row: dict) -> None:
         step = int(row.get("step", 0))
+        # Perplexity is the LM's own metric; kohakuwupipe reports the loss.
+        if isinstance(row.get("loss"), float):
+            row = dict(row, ppl=math.exp(min(row["loss"], 20.0)))
         if run is not None:
             run.log({k: v for k, v in row.items() if k != "step"}, step=step)
         if CONSOLE_INTERVAL > 0 and step % CONSOLE_INTERVAL == 0:
@@ -250,6 +254,13 @@ def build_reporter(name: str):
     return report, report_samples
 
 
+def optional_int(value) -> int | None:
+    """``--set`` hands strings for a knob whose default is ``None``."""
+    if value is None or value == "" or value == "None":
+        return None
+    return int(value)
+
+
 def build_sample_prompts() -> list[tuple[str, str]]:
     """``(name, text)`` for each entry of ``SAMPLE_PROMPTS``.
 
@@ -266,7 +277,7 @@ def build_sample_prompts() -> list[tuple[str, str]]:
 
 
 def launch() -> None:
-    """Run ``main`` under torchrun when the caller did not.
+    """Spawn ``GPUS`` ranks and run ``main`` in each when the caller started none.
 
     ``kogine run`` starts one process; the Lightning path gets its ranks from
     the Trainer, and this path has no Trainer. See docs/internals/pipeline.md.
@@ -373,7 +384,7 @@ def main() -> None:
         LossLog(every_n_steps=LOG_INTERVAL, report=report),
     ]
     if PROGRESS_BAR:
-        callbacks.append(ProgressBar())
+        callbacks.append(ProgressBar(postfix=("moe/load_imbalance_max", "scale")))
     if BIAS_SCHEDULE:
         callbacks.append(
             RouterBiasSchedule(
@@ -399,7 +410,7 @@ def main() -> None:
                 every_n_steps=SAMPLE_INTERVAL,
                 samples=SAMPLE_COUNT,
                 report=report_samples,
-                max_new_tokens=SAMPLE_TOKENS,
+                max_new_tokens=optional_int(SAMPLE_TOKENS),
                 temperature=SAMPLE_TEMPERATURE,
                 top_p=SAMPLE_TOP_P,
                 top_k=SAMPLE_TOP_K,
