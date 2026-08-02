@@ -24,7 +24,6 @@ TIPO-style prompt-generation examples.
 - Training / bench / tokenizer scripts: `scripts/`
 - KohakuEngine config files: `configs/`
 - Docs: `docs/`
-- Tests: `tests/`
 - Max lines per file: 600 (hard max 1000). Split modules before they grow.
 - Highly modularized -- one responsibility per module.
 
@@ -58,7 +57,7 @@ Source is not a place to write documentation.
 - Target Python 3.10+. Modern type hints: `list`, `dict`, `tuple`, `X | None`.
   Never `List`, `Dict`, `Optional`, `Union` from `typing`.
 - Prefer `match-case` over deeply nested `if-elif-else`.
-- `black src/ scripts/ tests/` and `ruff check src/ scripts/ tests/` before commit.
+- `black src/ scripts/` and `ruff check src/ scripts/` before commit.
 
 ### The two architectural rules
 
@@ -77,8 +76,8 @@ trainer, so changing the objective never touches the trunk.
 - **Never trust a low-precision scalar reduction.** Summing 16k bf16 terms loses
   several percent. Reduce in fp32 -- `LMHead.token_loss` asks the fused CE for
   `reduction="none"` and reduces itself, precisely for this reason.
-- **Every Triton kernel needs a precision test** against an fp64 reference, in
-  *both* fp16 and bf16, forward and backward. See `tests/test_kernels.py`.
+- **Every Triton kernel needs a precision check** against an fp64 reference, in
+  *both* fp16 and bf16, forward and backward. See `docs/internals/kernel-dev.md`.
 - **Judge error in ULP, not absolutely.** An absolute tolerance that passes in
   fp32 is meaningless in bf16. Use `bench.timing.ulp_error`, and pick its mode:
   `"elementwise"` for elementwise kernels, `"rms"` for GEMMs and reductions
@@ -89,22 +88,31 @@ trainer, so changing the objective never touches the trunk.
 ### Post-impl tasks
 1. Verify the rules above, especially in-function imports.
 2. `black` and `ruff`.
-3. New behaviour gets a test that pins it; prefer extending an existing test
-   function over adding a new one.
-4. Logically separated commits.
+3. Logically separated commits.
+
+### Testing
+
+**`tests/` is removed for now and will be added back deliberately.** Do not
+recreate the directory, do not add test files, and do not treat a missing test
+as a blocker. Docs that cite `tests/test_*.py` name a specification, not a path
+(see `docs/README.md`).
+
+Verify with a throwaway script under `/tmp` instead, and hold it to the same bar:
+it must **fail on the unfixed code**. A check that passes before and after
+proves nothing.
 
 ### Audit loop (multi-step work: REQUIRED)
 
-Do not stop at "tests pass". Loop until it converges:
+Do not stop at "it runs". Loop until it converges:
 
 1. **Implement** the slice.
-2. **Write tests that pin it.** Negative cases (the bug you'd accidentally
-   introduce) count more than positive ones.
-3. **Run the suite + lint.**
+2. **Construct the negative case** -- the bug you'd accidentally introduce --
+   and confirm the current code is actually wrong on it.
+3. **Run lint.**
 4. **Audit the diff** for clear bugs (typos, off-by-ones), integrity bugs
    (invariants broken, state drifted), and behavior bugs (does what's typed but
    the wrong thing for the spec).
-5. **If a bug slipped past the tests, fix the test first**, confirm it fails on
+5. **If a bug slipped past a check, fix the check first**, confirm it fails on
    the unfixed code, then fix the bug.
 6. **Loop.**
 
@@ -141,9 +149,9 @@ that bench is re-run: it was measured without a per-iteration grad reset.
 
 The invariant that makes it correct: **attention must never cross a document
 boundary.** `varlen` gets this from the kernel; the SDPA and Flex fallbacks build
-an explicit block-diagonal mask. `tests/test_models.py::test_packed_attention_does_not_cross_documents`
-pins it, because a backend that forgets the boundary still trains -- just worse,
-for reasons nothing in the loss curve explains.
+an explicit block-diagonal mask. Nothing currently pins it, and a backend that
+forgets the boundary still trains -- just worse, for reasons nothing in the loss
+curve explains. Re-check it by hand after touching any attention backend.
 
 ### Hardware notes (RTX 5090, sm_120)
 
@@ -212,9 +220,7 @@ mistake. Run them after any kernel change:
 
 ```bash
 uv pip install -e ".[dev,bench]"
-.venv/bin/python -m pytest tests/ -q
 kogine run scripts/train/lm.py --config configs/lm/debug.py
 ```
 
-Never use `sys.path` hacks in scripts or tests; always import from the installed
-package.
+Never use `sys.path` hacks in scripts; always import from the installed package.

@@ -28,10 +28,13 @@ PR. Still worth a two-line message first.
 ```bash
 uv pip install -e ".[dev,bench]"
 
-ruff check src/ scripts/ tests/
-black --check src/ scripts/ tests/
-.venv/bin/python -m pytest tests/ -q
+ruff check src/ scripts/
+black --check src/ scripts/
 ```
+
+`tests/` is removed for now and will be added back deliberately. Do not recreate
+it. Verify a change with a throwaway script that **fails on the unfixed code**,
+and say so in the PR.
 
 If you touched a kernel, also run its benchmark and paste the before/after into
 the PR:
@@ -51,9 +54,10 @@ The full set lives in [CLAUDE.md](CLAUDE.md). The non-negotiables:
 - **Import grouping**: built-in, third-party, `kohakuwullm.*`; `import` before
   `from`; shorter dotted paths first; alphabetical.
 - **Max 600 lines per file** (hard cap 1000).
-- **Comments explain *why*, not *what*.** Where a decision was made against a
-  plausible alternative, say which alternative and why it lost -- that is the only
-  kind of comment that survives the code changing.
+- **Comments carry only *what*.** A docstring says what a thing is for plus its
+  caller contract; a comment names what a step is doing. Every *why*, *how*,
+  measurement, history and alternative-considered goes to `docs/`, and the code
+  gets at most `See docs/<file>.md`.
 - **Prefer `match-case`** over deep `if-elif-else`.
 - Never use `sys.path` hacks; import from the installed package.
 
@@ -63,13 +67,11 @@ The full set lives in [CLAUDE.md](CLAUDE.md). The non-negotiables:
 via `build(spec, REGISTRY)`. If you are adding an `if mode == ...` inside a
 training or sampling loop, it belongs in `__init__` instead.
 
-**Every Triton kernel needs a precision test and a benchmark row.** The test goes
-in the matching `tests/test_kernels*.py` (they are split by subject), compares
-against an fp64 reference in *both* fp16 and bf16, forward and backward, and
-states tolerance in ULP. If the kernel has a CPU fallback, that test goes in
-`tests/test_kernels_cpu_fallback.py`, the one file with no `requires CUDA` mark.
-The benchmark goes in `scripts/bench/kernel/kernels.py` against whatever the
-kernel replaces. A kernel that does not beat its baseline should be deleted, not
+**Every Triton kernel needs a precision check and a benchmark row.** The check
+compares against an fp64 reference in *both* fp16 and bf16, forward and backward,
+and states tolerance in ULP. `TRITON_INTERPRET=1` runs a kernel bit-exactly on
+CPU when no card is free. The benchmark goes in `scripts/bench/kernel/kernels.py`
+against whatever the kernel replaces. A kernel that does not beat its baseline should be deleted, not
 kept.
 
 **Never trust a low-precision scalar reduction.** Summing 16k bf16 terms loses
