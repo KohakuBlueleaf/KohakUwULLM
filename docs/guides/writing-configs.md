@@ -89,8 +89,10 @@ SOURCES = [
 ]
 ```
 
-One weighted pass over the full corpus is 13.478B tokens — 51,413 steps at a
-262144-token global batch. [data.md](../internals/data.md) covers the sources and the renderer.
+One **unweighted** (`repeat: 1`) pass over the full corpus is 13.478B tokens — 51,413
+steps at a 262144-token global batch. With the danbooru x3 / danbooru_tagger x2
+weighting every production config uses, one pass is **20.890B raw, ~18.9B trained**.
+[data.md](../internals/data.md) covers the sources and the renderer.
 
 ## 5. Overrides and sweeps
 

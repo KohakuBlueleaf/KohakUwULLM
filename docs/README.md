@@ -150,6 +150,10 @@ branch on a config value belongs in `__init__`.
 
 ## Where the corpus stands
 
-One weighted pass over the caption corpus is 13.478B raw tokens across 76.3M records,
-which is **51,413 optimizer steps** at a 262144-token global batch. `scripts/data/token_census.py`
-regenerates that count; the breakdown is in [data.md](internals/data.md).
+One **unweighted** pass over the caption corpus is 13.478B raw tokens across 76.3M
+records, which is **51,413 optimizer steps** at a 262144-token global batch. That
+count is `repeat: 1` on every source and includes `imagenet`, which no config trains
+on. Every production config weights danbooru x3 and danbooru_tagger x2, so one pass of
+the mixture actually trained is **20.890B raw, ~18.9B trained, about 79,700 steps**.
+`scripts/data/token_census.py` regenerates the unweighted count; the breakdown is in
+[data.md](internals/data.md).
