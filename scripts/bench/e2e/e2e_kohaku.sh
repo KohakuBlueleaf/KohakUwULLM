@@ -29,10 +29,10 @@ echo "start: $(date -Is)" | tee -a "$LOG"
 run() {
   local preset=$1 mode=$2 extra=$3 tag=$4 opt=${5:-muon}
   echo "=== $preset $tag ===" | tee -a "$LOG"
-  # Fresh torchrun per row: a previous strategy's allocator state makes the next row's
+  # Fresh process per row: a previous strategy's allocator state makes the next row's
   # peak-memory number meaningless, and that has produced a wrong answer here before.
-  timeout 2700 .venv/bin/torchrun --standalone --nproc_per_node=4 \
-    scripts/bench/e2e/step_throughput.py --preset "$preset" --mode "$mode" \
+  timeout 2700 .venv/bin/python scripts/bench/e2e/step_throughput.py --gpus 4 \
+    --preset "$preset" --mode "$mode" \
     --budget 262144 --micro-tokens 4096 8192 --param-dtype bf16 \
     --optimizer "$opt" --steps 32 --measure-last 16 \
     --out "$OUT" --tag "$tag" $extra 2>&1 \

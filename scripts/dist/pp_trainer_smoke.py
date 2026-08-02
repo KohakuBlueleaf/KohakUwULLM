@@ -1,6 +1,6 @@
 """Run PipelinedLMTrainer through a real Lightning Trainer, generating mid-run.
 
-    torchrun --standalone --nproc_per_node=2 scripts/dist/pp_trainer_smoke.py
+    .venv/bin/python scripts/dist/pp_trainer_smoke.py
 
 Checks the token counters and the per-stage FLOP shares against their closed
 forms, and previews from inside the loop, which is where generation must work.
@@ -13,6 +13,7 @@ import lightning.pytorch as pl
 import torch
 import torch.utils.data as data
 from lightning.pytorch.callbacks import Callback
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwullm.data.loader.microbatch import MicroBatchedStep
 from kohakuwullm.models.components.seqinfo import SeqInfo
@@ -25,6 +26,8 @@ N_MICRO = 4
 STEPS = 6
 PREVIEW_EVERY = 3
 WATCHDOG_SECONDS = 180.0
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 2
 
 
 class Steps(data.Dataset):
@@ -126,5 +129,23 @@ def main() -> None:
     print(f"[rank{trainer.global_rank}] DONE", flush=True)
 
 
+def launch() -> None:
+    """Run ``main`` on ``GPUS`` spawned ranks, or in place when ranks exist."""
+    if os.environ.get("RANK") is not None:
+        main()
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=GPUS or torch.cuda.device_count(),
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="pp_trainer_smoke",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)()
+
+
 if __name__ == "__main__":
-    main()
+    launch()

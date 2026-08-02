@@ -17,12 +17,14 @@ smoke test for the *shipping* configuration, and `tipo_500m.py` /
 
 **A config belongs to one script.** The globals below are `scripts/train/lm.py`'s.
 A model split across cards runs `scripts/train/lm_pipe.py`, which declares its own
-set — `MICRO_TOKENS`, `NUM_MICROBATCHES`, `LAYERS`, `MXFP8`, `DATA_KIND` — and is
-launched under torchrun rather than by `kogine` alone:
+set — `MICRO_TOKENS`, `NUM_MICROBATCHES`, `LAYERS`, `MXFP8`, `DATA_KIND`,
+`PARAM_DTYPE` / `AUTOCAST_DTYPE`, `COMPILE_STAGE`, and the preview selectors
+`SAMPLE_LOCAL` / `SAMPLE_FORWARD_ONLY` (see
+[generation.md](generation.md#pipelined-generation)) — and
+spawns its own ranks, `GPUS` of them:
 
 ```bash
-torchrun --standalone --nproc_per_node=4 $(which kogine) run \
-    scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py
+kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py
 ```
 
 `--set` coerces from the script's declared default and does **not** parse a list
@@ -222,6 +224,8 @@ ARCH_OVERRIDES = {
 | `DDP_COMPRESS_HOOK` | `"bf16"` | `fp16` \| `None` |
 | `COMPILE` | `None` | `{"mode": "module", "dynamic": True}` \| `{"mode": "model"}` |
 | `GRAD_CKPT` | `False` | ~30% slower, most activation memory back |
+| `PARALLEL` | `"ddp"` | `"pipeline"` splits the model one stage per card; needs `LOADER_KIND="pipeline"` |
+| `PIPELINE_KWARGS` | `{"micro_tokens": 8192, "num_microbatches": 32, "schedule": "1f1b", "param_dtype": "bf16", "autocast_dtype": "bf16"}` | read only when `PARALLEL="pipeline"`; that path owns its own precision, so `PRECISION` does not apply |
 
 ### Optimizer / schedule
 
@@ -268,6 +272,9 @@ the beginning and says so at startup.
 | `WANDB_PROJECT` / `WANDB_OFFLINE` / `NAME` | `"KohakUwULLM"` / `True` / `"lm-debug"` |
 | `LOG_INTERVAL` / `CKPT_INTERVAL` | `10` / `5000` |
 | `SAMPLE_INTERVAL` / `SAMPLE_PROMPTS` | `1000` / `None` |
+| `SAMPLE_TOKENS` | `None` -- every row runs to EOS or to the context limit |
+| `SAMPLE_TEMPERATURE` | `0.8` |
+| `SAMPLE_TOP_P` / `SAMPLE_TOP_K` / `SAMPLE_MIN_P` | `0.95` / `0` (off) / `0.0` (off) |
 | `THROUGHPUT_INTERVAL` | `50` |
 
 `LOG_INTERVAL` drives the token counters and rates (`train/tokens_seen`,

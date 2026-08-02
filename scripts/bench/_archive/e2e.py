@@ -20,9 +20,9 @@ a 5090 has 32. So the honest comparison is: DDP wins until it OOMs, and the
 plot's job is to show what pipelining costs when DDP still fits, and that it
 runs at all where DDP does not.
 
-Launch with torchrun for the multi-GPU strategies:
+``--gpus`` sets the rank count for the multi-GPU strategies:
 
-    torchrun --standalone --nproc_per_node=4 scripts/bench/_archive/e2e.py \\
+    .venv/bin/python scripts/bench/_archive/e2e.py --gpus 4 \\
         --out out/bench/train/e2e --presets Nano-500M MoE-3B-A500M
 
 Single-process (runs the `single` strategy only, plus the memory model):
@@ -37,6 +37,7 @@ import time
 
 import torch
 import torch.distributed as dist
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwullm.bench import (
     Palette,
@@ -55,6 +56,8 @@ from kohakuwullm.training.parallel.pipeline import (
 from kohakuwupipe import describe
 
 BYTES_PER_PARAM_ADAMW = 4 + 4 + 4 + 2  # fp32 master + 2 moments + bf16 copy
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 1
 
 
 def env_int(name, default=0):
@@ -342,8 +345,9 @@ def plot(rows, out_dir, args):
     save_figure(fig, os.path.join(out_dir, "e2e.png"))
 
 
-def main():
+def parse_args():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--gpus", type=int, default=GPUS)
     ap.add_argument("--out", default="out/bench/train/e2e")
     ap.add_argument(
         "--presets", nargs="+", default=["Nano-200M", "Nano-500M", "MoE-1B-A200M"]
@@ -372,8 +376,10 @@ def main():
         default=["ddp", "pipeline", "pp+ckpt"],
         help="multi-GPU strategies to measure; drop 'pipeline' to skip it",
     )
-    args = ap.parse_args()
+    return ap.parse_args()
 
+
+def main(args):
     rank = env_int("RANK", 0)
     world = env_int("WORLD_SIZE", 1)
     local_rank = env_int("LOCAL_RANK", 0)
@@ -482,5 +488,25 @@ def main():
         dist.destroy_process_group()
 
 
+def launch() -> None:
+    """Run ``main`` on ``--gpus`` spawned ranks, or in place for a single one."""
+    args = parse_args()
+    nproc = args.gpus or torch.cuda.device_count()
+    if os.environ.get("RANK") is not None or nproc <= 1:
+        main(args)
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=nproc,
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="e2e",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)(args)
+
+
 if __name__ == "__main__":
-    main()
+    launch()

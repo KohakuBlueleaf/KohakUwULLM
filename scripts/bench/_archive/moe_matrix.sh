@@ -20,8 +20,7 @@ echo "HEAD FIGURE DONE" >>"$LOG"
 run() {
   local preset=$1 mode=$2 micro=$3 extra=$4 tag=$5
   echo "=== $preset $tag ($micro) ===" >>"$LOG"
-  timeout 2400 .venv/bin/torchrun --standalone --nproc_per_node=4 \
-    scripts/bench/e2e/step_throughput.py \
+  timeout 2400 .venv/bin/python scripts/bench/e2e/step_throughput.py --gpus 4 \
     --preset "$preset" --mode "$mode" --budget "$BUDGET" \
     --micro-tokens $micro --warmup 2 --iters 3 \
     --out "$OUT" --tag "$tag" $extra >>"$LOG" 2>&1

@@ -1,21 +1,23 @@
 """Three multi-stream pipelines that work, and the caveat each one hits.
 
-    torchrun --standalone --nproc_per_node=4 scripts/kohakuwupipe/streams_demo.py --case aux
-    torchrun --standalone --nproc_per_node=4 scripts/kohakuwupipe/streams_demo.py --case dit
-    torchrun --standalone --nproc_per_node=4 scripts/kohakuwupipe/streams_demo.py --case unet
+    .venv/bin/python scripts/kohakuwupipe/streams_demo.py --case aux
+    .venv/bin/python scripts/kohakuwupipe/streams_demo.py --case dit
+    .venv/bin/python scripts/kohakuwupipe/streams_demo.py --case unet
 
 * ``aux``  -- every stage adds its own auxiliary loss to an accumulator stream.
 * ``dit``  -- every stage cross-attends the same text context, carried as a stream.
 * ``unet`` -- an early stage's activation is carried to a later one as a skip.
 
 Pseudo-models, real boundaries: each asserts the gradient its caveat is about.
-See docs/streams.md.
+See docs/kohakuwupipe/streams.md.
 """
 
 import argparse
+import os
 
 import torch
 import torch.nn as nn
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 from torch.distributed.pipelining import PipelineStage, ScheduleGPipe
 
 from kohakuwupipe import get_logger, init_pipeline, shutdown
@@ -23,6 +25,8 @@ from kohakuwupipe.parallel.streams import GradCarrier, reduce_accumulator
 
 log = get_logger("streams_demo")
 DIM, ROWS, CTX = 64, 32, 8
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 0
 
 
 class AuxStage(nn.Module):
@@ -105,13 +109,15 @@ class UNetStage(nn.Module):
 CASES = {"aux": AuxStage, "dit": DiTStage, "unet": UNetStage}
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", choices=sorted(CASES), default="aux")
     ap.add_argument("--microbatches", type=int, default=4)
     ap.add_argument("--no-carrier", dest="carrier", action="store_false", default=True)
-    args = ap.parse_args()
+    return ap.parse_args()
 
+
+def main(args: argparse.Namespace) -> None:
     ranks = init_pipeline()
     first, last = ranks.rank == 0, ranks.rank == ranks.world - 1
     module = CASES[args.case](first=first, last=last, carrier=args.carrier)
@@ -164,5 +170,24 @@ def main() -> None:
     shutdown()
 
 
+def launch() -> None:
+    """Run ``main`` on ``GPUS`` spawned ranks, or in place when ranks exist."""
+    args = parse_args()
+    if os.environ.get("RANK") is not None:
+        main(args)
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=GPUS or torch.cuda.device_count(),
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="streams_demo",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)(args)
+
+
 if __name__ == "__main__":
-    main()
+    launch()

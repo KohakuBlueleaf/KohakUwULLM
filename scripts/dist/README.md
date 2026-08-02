@@ -1,7 +1,7 @@
 # scripts/dist
 
 Multi-process correctness harnesses. These are **not** benchmarks and **not** pytest
-tests: each spawns real ranks with `torchrun` and checks that a distributed path agrees
+tests: each spawns its own real ranks and checks that a distributed path agrees
 with a reference, so they cannot run inside a test process and they measure nothing.
 
 | script | checks |
@@ -11,6 +11,9 @@ with a reference, so they cannot run inside a test process and they measure noth
 
 They lived in `tests/` and pytest never collected them, so a harness that silently
 stopped working would have looked exactly like one that was passing. Benchmarks that
-happen to use `torchrun` belong in `scripts/bench/e2e/` instead.
+happen to spawn ranks belong in `scripts/bench/e2e/` instead.
 
-    torchrun --standalone --nproc_per_node=4 scripts/dist/parallel_equivalence.py
+Run one directly; its `GPUS` global sets how many ranks it spawns, and an existing
+rank group (`RANK` in the environment) is used as-is.
+
+    .venv/bin/python scripts/dist/parallel_equivalence.py

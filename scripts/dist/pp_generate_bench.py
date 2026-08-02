@@ -1,6 +1,6 @@
 """Does pipelining actually overlap decode work, and what is the real ceiling?
 
-    torchrun --standalone --nproc_per_node=4 scripts/dist/pp_generate_bench.py \
+    .venv/bin/python scripts/dist/pp_generate_bench.py \
         --preset Kohaku-MoE-3B --requests 1 2 4 8 16 32
 
 Every microbatch is ONE request, so raising the count adds independent work
@@ -20,6 +20,7 @@ import time
 
 import torch
 import torch.distributed as dist
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwullm.bench.model.ladder import census
 from kohakuwullm.generation import PipelineGenerator
@@ -31,6 +32,8 @@ PEAK_GBPS = 1791.0
 HOP_LATENCY_S = 22.2e-6
 BROADCAST_S = 47.3e-6
 SEED = 1234
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 0
 
 
 def stage_bytes(rung, stages: int, batch: int, context: int, elem: int) -> float:
@@ -74,7 +77,7 @@ def timed(fn, iters: int = 3):
     return samples[len(samples) // 2]
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--preset", default="Kohaku-MoE-3B")
     ap.add_argument("--vocab", type=int, default=65536)
@@ -82,8 +85,10 @@ def main() -> None:
     ap.add_argument("--prompt", type=int, default=16)
     ap.add_argument("--new-tokens", type=int, default=16)
     ap.add_argument("--out", default="out/bench/gen/pipeline")
-    args = ap.parse_args()
+    return ap.parse_args()
 
+
+def main(args: argparse.Namespace) -> None:
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     local = int(os.environ["LOCAL_RANK"])
@@ -203,5 +208,24 @@ def main() -> None:
     dist.destroy_process_group()
 
 
+def launch() -> None:
+    """Run ``main`` on ``GPUS`` spawned ranks, or in place when ranks exist."""
+    args = parse_args()
+    if os.environ.get("RANK") is not None:
+        main(args)
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=GPUS or torch.cuda.device_count(),
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="pp_generate_bench",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)(args)
+
+
 if __name__ == "__main__":
-    main()
+    launch()

@@ -1,4 +1,4 @@
-"""Launch one isolated torchrun per (preset, strategy), then aggregate + plot.
+"""Launch one isolated process group per (preset, strategy), then aggregate + plot.
 
 Every combination gets its own process. Two reasons, both learned by failure:
 
@@ -29,11 +29,9 @@ import time
 def run_one(preset, strategy, args) -> bool:
     cmd = [
         sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        f"--nproc_per_node={args.gpus}",
         "scripts/bench/_archive/e2e.py",
+        "--gpus",
+        str(args.gpus),
         "--out",
         args.out,
         "--presets",

@@ -31,8 +31,8 @@ echo "cards free, starting: $(date -Is)" | tee -a "$LOG"
 run() {
   local preset=$1 mode=$2 extra=$3 tag=$4
   echo "=== $preset $tag ===" | tee -a "$LOG"
-  timeout 2700 .venv/bin/torchrun --standalone --nproc_per_node=4 \
-    scripts/bench/e2e/step_throughput.py --preset "$preset" --mode "$mode" \
+  timeout 2700 .venv/bin/python scripts/bench/e2e/step_throughput.py --gpus 4 \
+    --preset "$preset" --mode "$mode" \
     --budget 262144 --micro-tokens 4096 8192 --param-dtype bf16 \
     --optimizer muon --mxfp8 --steps 32 --measure-last 16 \
     --out "$OUT" --tag "$tag" $extra 2>&1 \

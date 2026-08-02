@@ -12,8 +12,8 @@ mkdir -p out/bench/train/matrix
 
 run() {
   echo "=== $1 counts=$2 optim=$3 ckpt=$4 ===" | tee -a "$LOG"
-  timeout 3000 .venv/bin/torchrun --standalone --nproc_per_node=4 \
-    scripts/bench/e2e/step_throughput.py --preset "$1" --mode pipeline --budget 262144 \
+  timeout 3000 .venv/bin/python scripts/bench/e2e/step_throughput.py --gpus 4 \
+    --preset "$1" --mode pipeline --budget 262144 \
     --micro-counts $2 --param-dtype bf16 --optimizer "$3" $4 \
     --warmup 2 --iters 3 --out out/bench/train/matrix --tag "pp4_micro_$3$5" 2>&1 \
     | grep -aE "pp4 +[0-9]|budget|OOM$|Error" | tee -a "$LOG"

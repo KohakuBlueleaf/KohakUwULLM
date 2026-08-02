@@ -1,6 +1,6 @@
 """Does a pipelined model generate the same tokens as the whole model?
 
-    torchrun --standalone --nproc_per_node=4 scripts/dist/pp_generate_equivalence.py
+    .venv/bin/python scripts/dist/pp_generate_equivalence.py
 
 Greedy decode, so the two must agree token for token. The fixture is
 deliberately chaotic: at the default init the model repeats one token and every
@@ -12,6 +12,7 @@ import os
 
 import torch
 import torch.distributed as dist
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwullm.generation import LocalGenerator, PipelineGenerator
 from kohakuwullm.models import LMBackbone, get_preset
@@ -23,6 +24,8 @@ PROMPT = 12
 NEW = 24
 SEED = 7
 WATCHDOG_SECONDS = 240.0
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 0
 
 
 def main() -> None:
@@ -95,5 +98,23 @@ def main() -> None:
     dist.destroy_process_group()
 
 
+def launch() -> None:
+    """Run ``main`` on ``GPUS`` spawned ranks, or in place when ranks exist."""
+    if os.environ.get("RANK") is not None:
+        main()
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=GPUS or torch.cuda.device_count(),
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="pp_generate_equivalence",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)()
+
+
 if __name__ == "__main__":
-    main()
+    launch()

@@ -17,9 +17,9 @@ construction, and the last stage's `loss_fn` unpacks it.
 ranks and asserts the gradient each one is about:
 
 ```bash
-torchrun --standalone --nproc_per_node=4 scripts/kohakuwupipe/streams_demo.py --case aux
-torchrun --standalone --nproc_per_node=4 scripts/kohakuwupipe/streams_demo.py --case dit
-torchrun --standalone --nproc_per_node=4 scripts/kohakuwupipe/streams_demo.py --case unet
+.venv/bin/python scripts/kohakuwupipe/streams_demo.py --case aux
+.venv/bin/python scripts/kohakuwupipe/streams_demo.py --case dit
+.venv/bin/python scripts/kohakuwupipe/streams_demo.py --case unet
 ```
 
 ## The accumulator

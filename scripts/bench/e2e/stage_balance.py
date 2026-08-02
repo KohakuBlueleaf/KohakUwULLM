@@ -60,6 +60,7 @@ def time_stage(backbone, plan, cfg, info, per_micro, device, args):
 
     def fwd_bwd(stage=stage):
         stage.zero_grad(set_to_none=True)
+        inp.grad = None
         out = fwd_only()
         (out if plan.has_head else out.float().sum()).backward()
 

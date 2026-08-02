@@ -47,7 +47,7 @@ strategy are.
 
 ## The split is cost-balanced, not layer-balanced
 
-`plan_stages(config, num_stages)` charges each piece its real cost:
+`plan_for(config, num_stages)` charges each piece its real cost:
 
 - a **block** costs its attention projections + the quadratic attention term +
   its feed-forward (with MoE experts counted at `top_k + num_shared`, since that
@@ -61,22 +61,32 @@ full share of blocks, and every other stage would idle waiting for it. The
 planner gives the last stage fewer blocks instead.
 
 ```python
+from kohakuwupipe.parallel.plan import describe
 from kohakuwullm.models import get_preset
-from kohakuwullm.training import plan_stages, describe_plan
+from kohakuwullm.training import plan_for
 
 config = get_preset("Kohaku-MoE-3B", vocab_size=65536)
-plans = plan_stages(config, num_stages=4)
-print(describe_plan(plans, config))
+plans = plan_for(config, num_stages=4)
+print(describe(plans))
 ```
+
+`plan_for` is the LM-aware entry point: it turns a `config` into the per-layer and
+head costs and hands them to the generic `plan_stages(depth, num_stages,
+layer_cost, head_cost, ...)` in `kohakuwupipe.parallel.plan`. Call `plan_for`;
+`plan_stages` does not take a config. `describe` takes only the plans.
 
 ```
 pipeline split: 4 stages over 27 layers
-  stage     layers    n        extra  cost share
-      0     0..7       8        embed       25.3%
-      1     8..15      8            -       25.3%
-      2    16..23      8            -       25.3%
-      3    24..26      3         head       24.2%
+  stage      layers    n         ends  cost share
+      0        0..7    8        first       25.3%
+      1       8..15    8            -       25.3%
+      2      16..23    8            -       25.3%
+      3      24..26    3         last       24.2%
 ```
+
+The cost-share column above has **not been re-run** against the current cost
+model; the columns are `describe`'s current ones and the split is the shape the
+prose below depends on, but treat the percentages as illustrative.
 
 The last stage gets 3 blocks where the others get 8. That gap *is* the head:
 at vocab 65536 a `dim x vocab` GEMM per token costs more than five of this
@@ -96,7 +106,8 @@ one.
 
 ### The tie-break is memory, not cost
 
-`_partition` is a dynamic program over contiguous splits: `f[s][i]` is the best
+`partition` (in `kohakuwupipe.parallel.plan`) is a dynamic program over
+contiguous splits: `f[s][i]` is the best
 achievable bottleneck for placing blocks `i..depth` over `s` remaining stages, so
 the head's fixed cost is carried by the last stage *during* the recursion rather
 than corrected afterwards.
@@ -105,12 +116,13 @@ Minimizing the bottleneck alone is under-determined once one stage dominates --
 any arrangement of the rest ties. The tie is broken on **parameter count**
 (minimizing the sum of squared per-stage parameter counts), not on cost, because
 that is what decides whether a card runs out of memory: compute counts only the
-experts that route, while memory holds all of them. `_block_params` therefore
-counts every expert, not the `top_k` that run.
+experts that route, while memory holds all of them. `_block_params` (in
+`training/parallel/pipeline.py`, feeding `plan_stages(layer_params=...)`)
+therefore counts every expert, not the `top_k` that run.
 
 ## Equal FLOPs are not equal milliseconds
 
-`plan_stages` charges cost in FLOPs, but blocks and the head reach very different
+`plan_for` charges cost in FLOPs, but blocks and the head reach very different
 fractions of peak. The head is one huge `dim x vocab` GEMM; a block is a stack of
 smaller ones, and the two respond differently to dtype, autocast and vocabulary
 size. `head_scale` is the correction:
@@ -127,7 +139,7 @@ when the head implementation changes** -- the 15.2 row is what the chunked path
 gave, because it never reached the tensor cores at all.
 
 `measure_head_scale` does that calibration at startup: it times one block and the
-head and returns the ratio of measured to predicted head cost, so `plan_stages`
+head and returns the ratio of measured to predicted head cost, so `plan_for`
 plans against milliseconds instead of FLOPs. Two things keep it cheap enough to
 run every time:
 
@@ -254,25 +266,26 @@ activation the pipeline exists to minimise.
 
 `LMStage` unties it into a stage-local copy and warns. Set `tie_embeddings=False`
 in the arch config to make that cost explicit rather than discovering it in a
-warning. `plan_stages` already accounts for it: `head_params` is zero when the
+warning. `plan_for` already accounts for it: `head_params` is zero when the
 config says tied, so the memory tie-break does not double-charge a matrix that
 only exists once.
 
 ## Running one
 
 `scripts/train/lm_pipe.py` is the production pipeline trainer, on the
-`kohakuwupipe` loop. It is a KohakuEngine script launched under torchrun, so one
-config file drives it and every knob is reachable:
+`kohakuwupipe` loop. It is a KohakuEngine script that spawns its own ranks, so
+one config file drives it and every knob is reachable:
 
 ```bash
-torchrun --standalone --nproc_per_node=4 $(which kogine) run \
-    scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py
+kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py
 
 # ten steps, no network, synthetic data, one checkpoint
-torchrun --standalone --nproc_per_node=4 $(which kogine) run \
-    scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py \
+kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py \
     --set MAX_STEPS=10 --set DATA_KIND=synthetic --set WANDB_PROJECT=
 ```
+
+`GPUS` sets the rank count (0, the default, uses every GPU); a rank group the
+caller already started — `RANK` in the environment — is used as-is.
 
 `DATA_KIND="corpus"` reads KohakuVault through the `pipeline` loader;
 `"synthetic"` is the benchmark stream and reuses one packed batch, which is what
@@ -344,11 +357,11 @@ import torch.distributed as dist
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 
 from kohakuwullm.models import LMBackbone, get_preset
-from kohakuwullm.training import LMStage, plan_stages
+from kohakuwullm.training import LMStage, plan_for
 
 config = get_preset("Kohaku-MoE-3B", vocab_size=65536)
 backbone = LMBackbone(config)
-plans = plan_stages(config, num_stages=dist.get_world_size())
+plans = plan_for(config, num_stages=dist.get_world_size())
 stage_module = LMStage(backbone, plans[dist.get_rank()]).cuda()
 
 stage = PipelineStage(
@@ -376,7 +389,7 @@ and fail with `'PipelineStage' object is not subscriptable` when handed one.
 Offering them as a `SCHEDULE` value was advertising a knob that could only
 crash, so `SCHEDULES` now holds `1f1b` and `gpipe` and an unknown name raises
 with the pair it does have. Reinstating interleaving means assigning each rank
-several non-contiguous chunks, which `plan_stages` does not model.
+several non-contiguous chunks, which `plan_for` does not model.
 
 Each stage owns a disjoint parameter set, so its optimizer is genuinely local:
 there is no cross-rank reduction to arrange.
@@ -458,6 +471,25 @@ parameters, so there is nothing to merge, and a rank loading another stage's
 moments fails loudly -- `loaded state dict contains a parameter group that doesn't
 match the size of optimizer's group` is what a resume did before this landed.
 
+**The `kohakuwupipe` loop has moved past that, and the Lightning path has not.**
+`kohakuwupipe/io/checkpoint.py` now stores optimizer state under whole-model
+*parameter names* (`named_optimizer_state`), gathered and merged the same way the
+weights are, so a file written at `pp=4` resumes into `pp=2`, into DDP, or on one
+GPU. The per-rank list above is still read when it is the only thing in the file,
+and is never written by that loop -- but reading it now **raises** unless this
+run has the world size that wrote it, instead of handing rank *r* some other
+split's stage *r* and letting torch report a param-group size mismatch.
+
+Note what that means for a run in flight: the layout a process writes is the one
+it imported at startup, so a job launched before the change keeps producing
+`pipeline_stage_optimizer_states` files until it is restarted, and those files
+resume only at their own rank count. Check a file before planning a re-split.
+
+`PipelineOnlyStrategy` -- the table above -- still writes
+`pipeline_stage_optimizer_states`, so a Lightning-pipeline checkpoint remains
+split-locked. See
+[../kohakuwupipe/checkpoint.md](../kohakuwupipe/checkpoint.md#optimizer-state-is-keyed-by-whole-model-parameter-name).
+
 The renumbering is the part worth stating explicitly. A stage numbers its blocks
 from zero; the backbone numbers them from `plan.start_layer`. `LMStage.global_names`
 is the one place that mapping exists, and both directions go through it:
@@ -490,18 +522,36 @@ stops without training and the weights must come back bit-identical:
 Note which ranks report which names -- that is the assertion. A resume that gave
 every rank stage 0's slice would print the same range twice.
 
-## Sample previews go through the schedule
+## Sample previews are collective, whichever path they take
 
-They work, and they are **collective**. `PipelinedLMTrainer.generate` runs the same
-cached-decode schedule as `PipelineGenerator`, so every rank must enter it the same
-number of times -- the rank-0-only guard that a preview callback would normally use
-is what hangs the run.
+Whatever else changes, the invariant does not: **every rank must enter a preview
+the same number of times.** The rank-0-only guard a preview callback would
+normally use is what hangs the run.
+
+There are now three paths, and the default is no longer the schedule.
+
+| path | selected by | what a decode step costs |
+|---|---|---|
+| **gather + local decode** (default) | `SamplePreview(local=True)`, `SAMPLE_LOCAL = True` | one `all_gather_object` per preview, then no pipeline at all |
+| forward-only pipelined | `local=False`, `SAMPLE_FORWARD_ONLY = True` | one `dist.send`/`recv` hop per stage per token |
+| schedule pipelined | `local=False`, `SAMPLE_FORWARD_ONLY = False` | a full `ScheduleGPipe` step per token |
+
+The default gathers every stage's slice onto rank 0, loads it into a whole
+`LMBackbone`, and decodes there with `LocalGenerator`. Only the gather is
+collective; the decode is not. Previewing by pipelining every token cost one
+pipeline traversal per token, which is what this replaced.
+
+`PipelinedLMTrainer.generate` (the Lightning path) does not gather. It builds a
+`PipelineGenerator` with `microbatches=1` and takes that generator's default
+`forward_only_decode=True`, so it too no longer runs the schedule.
 
 `SampleLogCallback` reads `generate_is_collective` off the module: when it is set,
 every rank runs the generation loop and only rank 0 decodes and prints. Without it,
 the callback keeps the old behaviour and disables itself with a warning.
+`PipelinedLMTrainer` sets it; the `kohakuwupipe` loop uses `SamplePreview`
+instead, which is collective by construction.
 
-Two details that are easy to get wrong:
+Two details that are easy to get wrong on either pipelined path:
 
 - **The decode stage is not the training stage.** `PipelineStage` freezes its
   boundary at construction, and training declares a packed `(micro_tokens,)` one
@@ -509,7 +559,7 @@ Two details that are easy to get wrong:
   over the *same module*, so it carries the trained weights and allocates no
   second copy.
 - **The head runs outside the stage forward.** `AutocastStage` wraps `forward` and
-  `loss`, but the generator calls `head.logits` itself, between schedule steps. It
+  `loss`, but the generator calls `head.logits` itself, between decode steps. It
   therefore takes the stage's autocast dtype and re-enters it; without that, an
   fp32 hidden meets a bf16 projection and the last rank raises while every other
   rank has already returned.

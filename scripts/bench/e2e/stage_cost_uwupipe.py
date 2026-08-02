@@ -1,6 +1,6 @@
 """Per-stage cost of a pipeline split, each stage timed on its own card.
 
-    torchrun --standalone --nproc_per_node=4 scripts/bench/e2e/stage_cost_uwupipe.py
+    .venv/bin/python scripts/bench/e2e/stage_cost_uwupipe.py
 
 Each rank builds only its own stage and times a forward+backward over its own
 boundary shape, with no send/recv in the window. The spread across stages is
@@ -8,10 +8,12 @@ the imbalance the schedule then waits on. See docs/internals/pipeline.md.
 """
 
 import argparse
+import os
 import time
 
 import torch
 import torch.distributed as dist
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwullm.bench import make_info
 from kohakuwullm.models import get_preset
@@ -19,9 +21,11 @@ from kohakuwullm.training.parallel.uwupipe import LMPipelineModule, plan_for
 from kohakuwupipe import get_logger, init_pipeline, shutdown
 
 log = get_logger("stage_cost")
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 0
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--preset", default="Kohaku-MoE-1B")
     ap.add_argument("--vocab", type=int, default=65536)
@@ -29,8 +33,10 @@ def main() -> None:
     ap.add_argument("--mxfp8", action="store_true")
     ap.add_argument("--iters", type=int, default=12)
     ap.add_argument("--layers", default="")
-    args = ap.parse_args()
+    return ap.parse_args()
 
+
+def main(args: argparse.Namespace) -> None:
     ranks = init_pipeline()
     config = get_preset(
         args.preset,
@@ -64,6 +70,7 @@ def main() -> None:
             loss = out.float().sum()
         loss.backward()
         module.stage_module.zero_grad(set_to_none=True)
+        x.grad = None
 
     for _ in range(3):
         step()
@@ -105,5 +112,24 @@ def main() -> None:
     shutdown()
 
 
+def launch() -> None:
+    """Run ``main`` on ``GPUS`` spawned ranks, or in place when ranks exist."""
+    args = parse_args()
+    if os.environ.get("RANK") is not None:
+        main(args)
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=GPUS or torch.cuda.device_count(),
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="stage_cost_uwupipe",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)(args)
+
+
 if __name__ == "__main__":
-    main()
+    launch()

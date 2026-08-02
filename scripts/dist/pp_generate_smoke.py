@@ -1,12 +1,15 @@
 """Pipelined generation across stages, independent of the training loop.
 
-torchrun --standalone --nproc_per_node=2 scripts/dist/pp_generate_smoke.py
+The script spawns its own ranks::
+
+    .venv/bin/python scripts/dist/pp_generate_smoke.py
 """
 
 import os
 
 import torch
 import torch.distributed as dist
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwullm.generation import PipelineGenerator
 from kohakuwullm.models import get_preset
@@ -16,6 +19,8 @@ VOCAB = 2048
 ROWS = 4
 PROMPT = 8
 NEW = 6
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 2
 
 
 def main() -> None:
@@ -48,5 +53,23 @@ def main() -> None:
     dist.destroy_process_group()
 
 
+def launch() -> None:
+    """Run ``main`` on ``GPUS`` spawned ranks, or in place when ranks exist."""
+    if os.environ.get("RANK") is not None:
+        main()
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=GPUS or torch.cuda.device_count(),
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="pp_generate_smoke",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)()
+
+
 if __name__ == "__main__":
-    main()
+    launch()

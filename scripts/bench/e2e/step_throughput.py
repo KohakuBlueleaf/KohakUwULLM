@@ -19,9 +19,9 @@ microbatch therefore holds the same token count -- required, since the boundary
 activation shape is fixed at stage-build time -- while the documents inside it
 differ, which is what exercises the varlen attention path.
 
-Usage:
+Usage (``--gpus`` sets the rank count; 0 uses every GPU):
     .venv/bin/python scripts/bench/e2e/step_throughput.py --preset Nano-1B
-    torchrun --standalone --nproc_per_node=4 scripts/bench/e2e/step_throughput.py \
+    .venv/bin/python scripts/bench/e2e/step_throughput.py --gpus 4 \
         --preset Nano-1B --out out/bench/train/step
 """
 
@@ -34,6 +34,7 @@ import time
 
 import torch
 import torch.distributed as dist
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 from torch.nn.parallel import DistributedDataParallel
 
 from kohakuwullm.bench import make_packs, make_tokens, trained_tokens
@@ -50,6 +51,8 @@ AUTOCAST_DTYPES = {
     "bf16": torch.bfloat16,
     "fp16": torch.float16,
 }
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 1
 
 
 def _scope(args) -> tuple[str, ...] | None:
@@ -438,8 +441,9 @@ def report(tag, row):
     )
 
 
-def main():
+def parse_args():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--gpus", type=int, default=GPUS)
     ap.add_argument("--out", default="out/bench/train/step")
     ap.add_argument("--preset", default="Nano-1B")
     ap.add_argument("--vocab", type=int, default=65536)
@@ -510,7 +514,10 @@ def main():
         args.micro_tokens = sorted({args.budget // n for n in args.micro_counts})
     if args.uniform:
         args.len_min = args.len_max = min(args.len_max, min(args.micro_tokens))
+    return args
 
+
+def main(args):
     world = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local = int(os.environ.get("LOCAL_RANK", "0"))
@@ -563,5 +570,25 @@ def main():
         dist.destroy_process_group()
 
 
+def launch() -> None:
+    """Run ``main`` on ``--gpus`` spawned ranks, or in place for a single one."""
+    args = parse_args()
+    nproc = args.gpus or torch.cuda.device_count()
+    if os.environ.get("RANK") is not None or nproc <= 1:
+        main(args)
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=nproc,
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="step_throughput",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)(args)
+
+
 if __name__ == "__main__":
-    main()
+    launch()

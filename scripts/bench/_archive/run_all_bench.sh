@@ -18,8 +18,8 @@ echo "### MODULES DONE ###" >>"$LOG"
 echo "### E2E MATRIX ###" >>"$LOG"
 run() {
   echo "=== $1 $5 ($3) ===" >>"$LOG"
-  timeout 2400 .venv/bin/torchrun --standalone --nproc_per_node=4 \
-    scripts/bench/e2e/step_throughput.py --preset "$1" --mode "$2" --budget 262144 \
+  timeout 2400 .venv/bin/python scripts/bench/e2e/step_throughput.py --gpus 4 \
+    --preset "$1" --mode "$2" --budget 262144 \
     --micro-tokens $3 --warmup 2 --iters 3 --out out/bench/train/matrix --tag "$5" $4 \
     >>"$LOG" 2>&1
   sleep 5

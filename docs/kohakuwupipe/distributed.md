@@ -8,8 +8,9 @@ ranks = init_pipeline()      # .rank, .world, .device
 shutdown()
 ```
 
-`init_pipeline` reads torchrun's environment, initializes NCCL, sets the CUDA
-device, and configures the logger with this rank's id.
+`init_pipeline` reads the launcher's environment (`RANK`, `WORLD_SIZE`,
+`LOCAL_RANK`), initializes NCCL, sets the CUDA device, and configures the logger
+with this rank's id.
 
 ## `device_id` is omitted deliberately
 

@@ -1,6 +1,6 @@
 """Resume and generation on the kohakuwupipe trainer, at production shape.
 
-    torchrun --standalone --nproc_per_node=4 scripts/dist/uwupipe_gen_resume.py \
+    .venv/bin/python scripts/dist/uwupipe_gen_resume.py \
         --ckpt /tmp/kwp_moe1b/last.ckpt
 
 Restores a whole-model checkpoint into the split model, checks every rank got
@@ -9,8 +9,10 @@ its own slice bit-exactly, then generates through the pipeline schedule.
 
 import argparse
 import faulthandler
+import os
 
 import torch
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwullm.generation import PipelineGenerator
 from kohakuwullm.models import get_preset
@@ -24,9 +26,11 @@ from kohakuwupipe import PipelineTrainer, get_logger, init_pipeline, shutdown
 
 log = get_logger("uwupipe_gen_resume")
 WATCHDOG = 600.0
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 0
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--preset", default="Kohaku-MoE-1B")
     ap.add_argument("--vocab", type=int, default=65536)
@@ -39,8 +43,10 @@ def main() -> None:
     # Makes the training boundary a tuple while decode's stays a bare tensor.
     ap.add_argument("--aux-loss-weight", type=float, default=0.0)
     ap.add_argument("--router-z-loss-weight", type=float, default=0.0)
-    args = ap.parse_args()
+    return ap.parse_args()
 
+
+def main(args: argparse.Namespace) -> None:
     faulthandler.dump_traceback_later(WATCHDOG, exit=True)
     ranks = init_pipeline()
     config = get_preset(
@@ -114,5 +120,24 @@ def main() -> None:
     shutdown()
 
 
+def launch() -> None:
+    """Run ``main`` on ``GPUS`` spawned ranks, or in place when ranks exist."""
+    args = parse_args()
+    if os.environ.get("RANK") is not None:
+        main(args)
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=GPUS or torch.cuda.device_count(),
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="uwupipe_gen_resume",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)(args)
+
+
 if __name__ == "__main__":
-    main()
+    launch()

@@ -2,9 +2,9 @@
 # Run the whole benchmark suite and regenerate every figure under out/bench/.
 #
 # Single-GPU stages pin GPU 0 and must own it: a contended run does not fail, it
-# reads low, and nothing in the numbers says so. The end-to-end stage uses all four
-# via torchrun. Each stage writes its own JSON next to its PNG, so a stage that
-# fails leaves the others' figures intact.
+# reads low, and nothing in the numbers says so. The end-to-end stage uses all four,
+# spawning its own ranks. Each stage writes its own JSON next to its PNG, so a stage
+# that fails leaves the others' figures intact.
 #
 #   bash scripts/bench/run_all.sh              # everything
 #   bash scripts/bench/run_all.sh e2e          # one stage
@@ -68,7 +68,7 @@ for stage in $STAGES; do
       run data $PY scripts/bench/data/data.py --out "$OUT/data" \
         --roots /xg7/caption-datasets /Yamiyoru/caption-datasets ;;
     e2e)
-      # The Kohaku sweep drives step_throughput itself, one torchrun per row, so it
+      # The Kohaku sweep drives step_throughput itself, one process per row, so it
       # takes no --presets: the ladder is the point and a subset is not a ladder.
       run e2e bash scripts/bench/e2e/e2e_kohaku_mxfp8.sh ;;
     *)

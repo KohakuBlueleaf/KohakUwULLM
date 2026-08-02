@@ -16,8 +16,8 @@ mkdir -p out/bench/train/matrix
 run() {
   local preset=$1 mode=$2 micro=$3 dtype=$4 optim=$5 extra=$6 tag=$7
   echo "=== $preset $tag micro=$micro ===" | tee -a "$LOG"
-  timeout 2400 .venv/bin/torchrun --standalone --nproc_per_node=4 \
-    scripts/bench/e2e/step_throughput.py --preset "$preset" --mode "$mode" \
+  timeout 2400 .venv/bin/python scripts/bench/e2e/step_throughput.py --gpus 4 \
+    --preset "$preset" --mode "$mode" \
     --budget "$BUDGET" --micro-tokens $micro --param-dtype "$dtype" \
     --optimizer "$optim" --warmup 2 --iters 3 \
     --out out/bench/train/matrix --tag "$tag" $extra 2>&1 \

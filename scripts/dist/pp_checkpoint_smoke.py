@@ -1,6 +1,6 @@
 """Does a pipeline run produce a checkpoint holding every stage's weights?
 
-    torchrun --standalone --nproc_per_node=2 scripts/dist/pp_checkpoint_smoke.py
+    .venv/bin/python scripts/dist/pp_checkpoint_smoke.py
 
 Each rank owns a disjoint slice of the model, so a rank-0-only save keeps only
 stage 0. This trains a few steps, then counts what actually landed in the file
@@ -14,6 +14,7 @@ import lightning.pytorch as pl
 import torch
 import torch.utils.data as data
 from lightning.pytorch.callbacks import ModelCheckpoint
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwullm.data.loader.microbatch import MicroBatchedStep
 from kohakuwullm.models import LMBackbone, get_preset
@@ -28,6 +29,8 @@ STEPS = 4
 WATCHDOG_SECONDS = 180.0
 PRESET = "Nano-25M"
 OVERRIDES = {"tie_embeddings": False, "max_position": 1024}
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 2
 
 
 class Steps(data.Dataset):
@@ -160,5 +163,23 @@ def main() -> None:
     print("[ckpt] OK: whole model, global block indices, loads into LMBackbone")
 
 
+def launch() -> None:
+    """Run ``main`` on ``GPUS`` spawned ranks, or in place when ranks exist."""
+    if os.environ.get("RANK") is not None:
+        main()
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=GPUS or torch.cuda.device_count(),
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="pp_checkpoint_smoke",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)()
+
+
 if __name__ == "__main__":
-    main()
+    launch()

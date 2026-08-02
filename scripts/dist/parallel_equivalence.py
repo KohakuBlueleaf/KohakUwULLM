@@ -19,9 +19,9 @@ Normalization is what makes the three comparable. Every path computes a
 * pipeline: each stage backwards its microbatches; gradients accumulate locally
   because a stage's parameters live on exactly one rank.
 
-Run:
-    torchrun --standalone --nproc_per_node=3 scripts/dist/parallel_equivalence.py
-    torchrun --standalone --nproc_per_node=3 scripts/dist/parallel_equivalence.py --mode ddp
+Run (the script spawns its own ranks):
+    .venv/bin/python scripts/dist/parallel_equivalence.py
+    .venv/bin/python scripts/dist/parallel_equivalence.py --mode ddp
 """
 
 import argparse
@@ -30,6 +30,7 @@ import os
 
 import torch
 import torch.distributed as dist
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwullm.models import LMBackbone, get_preset
 from kohakuwullm.models.components.seqinfo import SeqInfo
@@ -40,6 +41,8 @@ from kohakuwullm.training.parallel.pipeline_lightning import (
 )
 
 IGNORE = -100
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 3
 
 
 def build_batches(cfg, n_micro, per_micro, device, seed=0):
@@ -215,7 +218,7 @@ def compare_ddp(cfg, micro, device, rank, world):
     return worst, checked, 0
 
 
-def main():
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="pipeline", choices=["pipeline", "ddp"])
     ap.add_argument("--preset", default="Nano-25M")
@@ -223,8 +226,10 @@ def main():
     ap.add_argument("--microbatches", type=int, default=6)
     ap.add_argument("--per-microbatch", type=int, default=256)
     ap.add_argument("--tol", type=float, default=2e-4)
-    args = ap.parse_args()
+    return ap.parse_args()
 
+
+def main(args):
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     local = int(os.environ["LOCAL_RANK"])
@@ -258,5 +263,26 @@ def main():
     return 0 if verdict.item() else 1
 
 
+def launch() -> int:
+    """Run ``main`` on ``GPUS`` spawned ranks, or in place when ranks exist.
+
+    Returns the worst exit status any rank reported.
+    """
+    args = parse_args()
+    if os.environ.get("RANK") is not None:
+        return main(args)
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=GPUS or torch.cuda.device_count(),
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="parallel_equivalence",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    return max(elastic_launch(config, main)(args).values())
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(launch())

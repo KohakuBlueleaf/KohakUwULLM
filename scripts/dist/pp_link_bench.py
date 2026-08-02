@@ -1,6 +1,6 @@
 """What one pipeline seam costs: per-hop latency and bandwidth around the chain.
 
-    torchrun --standalone --nproc_per_node=4 scripts/dist/pp_link_bench.py
+    .venv/bin/python scripts/dist/pp_link_bench.py
 
 Decode ships a few kB per token per seam, so the seam's *latency* sets the step,
 not its bandwidth. A token is circulated 0->1->..->N-1->0 and the time divided by
@@ -13,10 +13,13 @@ import time
 
 import torch
 import torch.distributed as dist
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 SIZES = [4 << 10, 24 << 10, 96 << 10, 1 << 20, 16 << 20, 128 << 20]
 ITERS = 100
 WARMUP = 20
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 0
 
 
 def ring_hop(buf: torch.Tensor, rank: int, world: int, iters: int) -> float:
@@ -113,5 +116,23 @@ def main() -> None:
     dist.destroy_process_group()
 
 
+def launch() -> None:
+    """Run ``main`` on ``GPUS`` spawned ranks, or in place when ranks exist."""
+    if os.environ.get("RANK") is not None:
+        main()
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=GPUS or torch.cuda.device_count(),
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="pp_link_bench",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)()
+
+
 if __name__ == "__main__":
-    main()
+    launch()

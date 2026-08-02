@@ -11,8 +11,8 @@ as-is produces a result that cannot be compared against anything current.
 
 | file | what it measured | superseded by |
 |---|---|---|
-| `e2e.py` | four parallelism strategies (single / ddp / pipeline / pp+ckpt) in one torchrun | `e2e/step_throughput.py`, which fixes the *step* rather than the microbatch |
-| `e2e_driver.py` | one isolated torchrun per (preset, strategy), then aggregate | `e2e/e2e_kohaku.sh` — same isolation-per-row rule, Kohaku presets |
+| `e2e.py` | four parallelism strategies (single / ddp / pipeline / pp+ckpt) in one rank group | `e2e/step_throughput.py`, which fixes the *step* rather than the microbatch |
+| `e2e_driver.py` | one isolated process group per (preset, strategy), then aggregate | `e2e/e2e_kohaku.sh` — same isolation-per-row rule, Kohaku presets |
 | `e2e_real.sh` | dense + MoE, pipeline + DDP, at 262144 tok/step | `e2e/e2e_kohaku.sh` |
 | `e2e_full.sh` | microbatch size first, then dtype and optimizer at the winner | `e2e/e2e_kohaku.sh` (bf16 + Muon settled) and `e2e/dtype_speed.sh` |
 | `e2e_micro.sh` | microbatch sweep by *count*, off the powers of two | folded into `e2e/step_throughput.py --micro-counts` |

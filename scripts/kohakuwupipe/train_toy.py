@@ -1,6 +1,6 @@
 """Train a model you wrote yourself across pipeline stages, with kohakuwupipe.
 
-    torchrun --standalone --nproc_per_node=4 scripts/kohakuwupipe/train_toy.py
+    .venv/bin/python scripts/kohakuwupipe/train_toy.py
 
 Nothing here imports ``kohakuwullm``: this is the template for using
 ``kohakuwupipe`` from another repository. Subclass :class:`PipelineModule` with
@@ -9,10 +9,12 @@ the loss -- and :class:`PipelineTrainer` runs it.
 """
 
 import argparse
+import os
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwupipe import (
     Checkpoint,
@@ -28,6 +30,8 @@ from kohakuwupipe import (
 )
 
 log = get_logger("train_toy")
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 0
 
 
 @dataclass
@@ -95,7 +99,7 @@ class ToyModule(PipelineModule):
         return torch.optim.AdamW(self.stage_module.parameters(), lr=self.lr)
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--vocab", type=int, default=4096)
     ap.add_argument("--dim", type=int, default=512)
@@ -104,8 +108,10 @@ def main() -> None:
     ap.add_argument("--microbatches", type=int, default=8)
     ap.add_argument("--steps", type=int, default=40)
     ap.add_argument("--ckpt", default="")
-    args = ap.parse_args()
+    return ap.parse_args()
 
+
+def main(args: argparse.Namespace) -> None:
     ranks = init_pipeline()
     plans = plan_stages(
         depth=args.depth,
@@ -149,5 +155,24 @@ def main() -> None:
     shutdown()
 
 
+def launch() -> None:
+    """Run ``main`` on ``GPUS`` spawned ranks, or in place when ranks exist."""
+    args = parse_args()
+    if os.environ.get("RANK") is not None:
+        main(args)
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=GPUS or torch.cuda.device_count(),
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="train_toy",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)(args)
+
+
 if __name__ == "__main__":
-    main()
+    launch()

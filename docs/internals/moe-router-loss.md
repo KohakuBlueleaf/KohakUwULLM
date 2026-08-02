@@ -60,8 +60,7 @@ nominal shape: that table is the Lightning loop, this one is kohakuwupipe. Only
 the deltas within this table mean anything.
 
 ```bash
-torchrun --standalone --nproc_per_node=4 $(which kogine) run \
-    scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py \
+kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py \
     --set MAX_STEPS=24 --set AUX_LOSS_WEIGHT=1e-3
 ```
 
@@ -281,8 +280,7 @@ Tensors for P2P must be non-overlapping and dense
 
 `(stream * torch.ones_like(stream)).sum()` is the same value with a materialized
 gradient. Widening the stream and calling `.contiguous()` both fail — the
-non-dense tensor is the *gradient*, not the stream. `docs/streams.md` in
-kohakuwupipe has the bisection that found it.
+non-dense tensor is the *gradient*, not the stream. [kohakuwupipe/streams.md](../kohakuwupipe/streams.md) has the bisection that found it.
 
 **The stream is training-only.** Generation builds its own `PipelineStage` with a
 decode-shaped boundary and runs under `eval()`, where there is no loss to add a
@@ -327,7 +325,7 @@ kind, z-loss included, and reported the run as "remarkably stable".
 ```bash
 .venv/bin/python -m pytest tests/test_kernels.py -k auxiliary -q     # kernel, fp16+bf16
 .venv/bin/python -m pytest tests/test_training.py -k router_loss -q  # the stream
-torchrun --standalone --nproc_per_node=4 scripts/kohakuwupipe/streams_demo.py --case aux
+.venv/bin/python scripts/kohakuwupipe/streams_demo.py --case aux
 ```
 
 The kernel test runs the terms at `aux_loss_weight=50.0`, far above any training

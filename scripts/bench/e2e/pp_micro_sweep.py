@@ -1,6 +1,6 @@
 """Microbatch-count sweep: bubble rate against fixed per-boundary latency.
 
-torchrun --standalone --nproc_per_node=4 scripts/bench/e2e/pp_micro_sweep.py
+.venv/bin/python scripts/bench/e2e/pp_micro_sweep.py
 """
 
 import os
@@ -8,6 +8,7 @@ import time
 
 import torch
 import torch.distributed as dist
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwullm.models import get_preset
 from kohakuwullm.models.components.seqinfo import SeqInfo
@@ -17,6 +18,9 @@ from kohakuwullm.training.parallel.pipeline_lightning import (
     run_step,
     stage_local_optimizer,
 )
+
+# Ranks to spawn when the caller started none. 0 uses every GPU.
+GPUS = 0
 
 
 def main() -> None:
@@ -93,5 +97,23 @@ def main() -> None:
     dist.destroy_process_group()
 
 
+def launch() -> None:
+    """Run ``main`` on ``GPUS`` spawned ranks, or in place when ranks exist."""
+    if os.environ.get("RANK") is not None:
+        main()
+        return
+    config = LaunchConfig(
+        min_nodes=1,
+        max_nodes=1,
+        nproc_per_node=GPUS or torch.cuda.device_count(),
+        rdzv_backend="c10d",
+        rdzv_endpoint="localhost:0",
+        run_id="pp_micro_sweep",
+        max_restarts=0,
+        start_method="spawn",
+    )
+    elastic_launch(config, main)()
+
+
 if __name__ == "__main__":
-    main()
+    launch()
