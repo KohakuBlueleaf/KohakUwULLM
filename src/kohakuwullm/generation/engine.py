@@ -56,13 +56,11 @@ def sample(
     """
     if temperature <= 0:
         return logits.argmax(-1, keepdim=True)
-    # fp32: top-p sums the whole vocabulary, and 65536 fp16 terms lose percent-
-    # level accuracy. See docs/guides/generation.md.
+    # Filter and normalize in fp32. See docs/guides/generation.md.
     logits = logits.float()
     probs = torch.softmax(filter_top_k(logits, top_k) / temperature, dim=-1)
     probs = filter_min_p(filter_top_p(probs, top_p), min_p)
     probs = probs / probs.sum(-1, keepdim=True).clamp_min(1e-12)
-    # multinomial asserts on the device; a finite check here names the cause.
     if not torch.isfinite(probs).all():
         raise RuntimeError(
             "sampling probabilities are not finite; logits carried inf/nan "
@@ -72,8 +70,10 @@ def sample(
 
 
 def token_budget(max_new_tokens: int | None, prompt_len: int, max_position: int) -> int:
-    """Tokens to generate. ``None`` fills the model's context; anything past it is
-    clamped, because RoPE and the KV cache are only defined inside it."""
+    """Tokens to generate, clamped to the room left inside ``max_position``.
+
+    ``max_new_tokens=None`` asks for the whole remaining context.
+    """
     room = max(max_position - prompt_len, 0)
     return room if max_new_tokens is None else min(max_new_tokens, room)
 
@@ -81,9 +81,8 @@ def token_budget(max_new_tokens: int | None, prompt_len: int, max_position: int)
 def advance(tokens, nxt, finished, eos_token_id):
     """Append one sampled token per row, holding already-finished rows at EOS.
 
-    Returns ``(tokens, finished)``. Without the hold, a row that emitted EOS keeps
-    sampling, so no batch ever satisfies an all-rows stop.
-    See docs/guides/generation.md.
+    Returns ``(tokens, finished)``. ``eos_token_id=None`` appends without ever
+    marking a row finished. See docs/guides/generation.md.
     """
     if eos_token_id is not None:
         nxt = torch.where(finished, torch.full_like(nxt, eos_token_id), nxt)
@@ -168,8 +167,6 @@ class LocalGenerator(Generator):
             )
             step = tokens
             for _ in range(budget):
-                # New iteration for cudagraph trees; see docs/guides/generation.md.
-                torch.compiler.cudagraph_mark_step_begin()
                 hidden = self.backbone(step, cache=cache)
                 logits = self.backbone.head.logits(hidden[:, -1]).float()
                 nxt = self._choose(
@@ -237,10 +234,8 @@ class PipelineGenerator(Generator):
     def forward_only(self, step, rows: int):
         """One forward across the stages: recv, run this rank's layers, send.
 
-        Returns the last stage's hidden and ``None`` elsewhere. Carries no
-        autograd state and builds no schedule, so a decode step costs one hop per
-        stage rather than a training step's bookkeeping.
-        See docs/guides/generation.md.
+        Returns the last stage's hidden and ``None`` elsewhere. Builds no
+        schedule and carries no autograd state. See docs/guides/generation.md.
         """
         last = self.world - 1
         dim = self.head_module.config.dim
@@ -274,12 +269,10 @@ class PipelineGenerator(Generator):
 
     @torch.no_grad()
     def prepare(self, chunks: int, rows: int, device) -> None:
-        """Build the schedule for ``chunks`` microbatches and take its first step.
+        """Build the schedule for ``chunks`` microbatches and take its first step
+        against throwaway caches.
 
-        The step runs against throwaway caches, so the extra forward a schedule
-        makes when it first runs never reaches the caches :meth:`generate`
-        decodes from. Collective, and a no-op once built.
-        See docs/guides/generation.md.
+        Collective, and a no-op once built. See docs/guides/generation.md.
         """
         if self.schedule is not None and self._chunks == chunks:
             return
@@ -310,11 +303,10 @@ class PipelineGenerator(Generator):
     ) -> torch.Tensor:
         """Sample a continuation of ``prompt_ids`` ``(B, S)`` across the stages.
 
-        Cached decode: one token per step, so the pipeline boundary shape is
-        constant, which is what ``PipelineStage`` freezes. Every rank must call
-        this the same number of times with the same shapes.
-        ``max_new_tokens=None`` runs until every row has emitted EOS or the
-        model's context is full.
+        Cached decode, one token per step. Every rank must call this the same
+        number of times with the same shapes. ``max_new_tokens=None`` runs until
+        every row has emitted EOS or the model's context is full.
+        See docs/guides/generation.md.
         """
         device = prompt_ids.device
         last = self.world - 1
@@ -337,8 +329,7 @@ class PipelineGenerator(Generator):
             tokens = prompt_ids.clone()
             finished = torch.zeros(rows, 1, dtype=torch.bool, device=device)
             for pos in range(total - 1):
-                # `clone`, not `contiguous`: a one-element slice reports itself
-                # contiguous while keeping the source row stride.
+                # `clone`, not `contiguous`. See docs/guides/generation.md.
                 step = tokens[:, pos : pos + 1].clone(
                     memory_format=torch.contiguous_format
                 )
@@ -367,8 +358,6 @@ class PipelineGenerator(Generator):
                     )
                 if dist.is_available() and dist.is_initialized():
                     dist.broadcast(nxt, src=last)
-                # Every rank sees the same `nxt`, so every rank stops on the same
-                # step without another collective.
                 tokens, finished = advance(tokens, nxt, finished, eos_token_id)
                 if bool(finished.all()):
                     break

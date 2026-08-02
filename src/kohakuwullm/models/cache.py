@@ -69,8 +69,7 @@ class KVCache:
         self.dtype = dtype
         self.length = 0
         self.static = static
-        # Device-side, so a compiled decode step carries no Python int and its
-        # graph stays capturable. See docs/guides/generation.md.
+        # The write position, device-side. See docs/guides/generation.md.
         self.pos = torch.zeros((), dtype=torch.long, device=device or "cpu")
         self.keys: list[torch.Tensor | None] = [None] * layers
         self.values: list[torch.Tensor | None] = [None] * layers
@@ -140,8 +139,7 @@ class KVCache:
             self._allocate(index, k)
         keys, values = self.keys[index], self.values[index]
         if self.static:
-            # Scatter at a device-side offset and hand back the whole buffer, so
-            # the shape a compiled step sees never moves.
+            # Scatter at a device-side offset; return the whole buffer.
             at = self.pos + torch.arange(steps, device=keys.device)
             keys.index_copy_(1, at, k.to(keys.dtype))
             values.index_copy_(1, at, v.to(values.dtype))
@@ -163,8 +161,8 @@ class KVCache:
     def key_mask(self, steps: int) -> torch.Tensor:
         """``(1, 1, steps, max_length)`` -- which cached keys each query may see.
 
-        Causal within the step and bounded by the committed prefix, so a query
-        never reads a slot that has not been written.
+        Causal within the step and bounded by the committed prefix: no query
+        reads a slot past its own absolute position.
         """
         keys = torch.arange(self.max_length, device=self.pos.device)
         queries = self.pos + torch.arange(steps, device=self.pos.device)
@@ -183,6 +181,9 @@ class KVCache:
                 f"cached generation takes padded (B, S) tokens, got {tuple(tokens.shape)}"
             )
         batch, steps = tokens.shape
+        # `seq_info` runs before the first `append`, so the device lands here too.
+        if self.pos.device != tokens.device:
+            self.pos = self.pos.to(tokens.device)
         base = self.pos if self.static else self.length
         pos = base + torch.arange(steps, device=tokens.device)
         return SeqInfo(

@@ -47,6 +47,17 @@ The generator owns a **private RNG stream**, seeded from `SAMPLE_SEED`, not the
 default one. A preview that drew from the default stream would change the data
 order, so turning logging on would change the run.
 
+**`sample` casts logits to fp32 first.** Top-p cumulates over the whole
+vocabulary, and summing 65536 fp16 terms loses percent-level accuracy — the same
+rule as every other reduction in this repo. The finite check before
+`torch.multinomial` is there because `multinomial` only asserts device-side, many
+launches later, with an unrelated frame blamed for it.
+
+`PreviewSampler` (`training/loop/sampling.py`) is a `LocalGenerator` that takes
+its backbone per call instead of holding one. It exists so the training loop does
+not have to construct a generator per preview; it adds no decode logic of its
+own, and defaults to `static=False`.
+
 ## The KV cache
 
 ```python
@@ -61,6 +72,13 @@ hidden = model(next_token, cache=cache) # decode; one token, positions continue
 The cache is **padded-layout only**. Packed varlen is a training concern, and a
 cache that tried to serve both would need per-document offsets it has no way to
 carry. It raises rather than guessing.
+
+`static=True` — what `LocalGenerator` passes by default — writes with
+`index_copy_` at a device-side position and returns the whole buffer instead of a
+growing prefix slice, so every decode step has one shape. That is what makes the
+step compilable; see [The static KV cache](#the-static-kv-cache-is-what-made-that-possible)
+below. `static=False` keeps the growing-slice layout and is what
+`PipelineGenerator` builds.
 
 Cached and cache-free generation produce **identical tokens** under greedy
 decoding; `tests/test_generation.py` pins that, along with the traps that make a
@@ -85,20 +103,49 @@ constant.
 from kohakuwullm.generation import PipelineGenerator
 from kohakuwullm.training.parallel.pipeline_lightning import build_stage
 
-# `decode=True` declares the padded single-token boundary; the third-to-last
-# argument is rows *per microbatch*, not the whole batch.
+# `decode=True` makes `boundary_example` declare a padded `(rows, 1)` boundary,
+# so the `microbatch_tokens` positional is read as rows *per microbatch* here,
+# not as a token count and not as the whole batch.
 module, stage, plan, _ = build_stage(
     config, rank, world, device, 1, seq_len=1024, decode=True
 )
 inner = getattr(module, "module", module)
 
-gen = PipelineGenerator(stage, inner, rank, world)
+# `microbatches=1` is not optional; see below.
+gen = PipelineGenerator(stage, inner, rank, world, microbatches=1)
 out = gen.generate(prompt, max_new_tokens=64, temperature=0.0)
 ```
 
 Every rank must call `generate` the same number of times with the same shapes.
 Only stage 0 needs the prompt and only the last stage produces logits; the
 sampled token is broadcast back so stage 0 can feed the next step.
+
+**`microbatches` defaults to `None`, which means one row per microbatch — and
+that combination is currently broken.** `generate` computes
+`chunks = self.microbatches or rows`, then allocates `chunks` caches of
+`rows // chunks` rows each. Under the default decode path (below) there is
+exactly *one* forward per step, not `chunks` of them, so a batch of 8 rows meets
+a cache built for 1 and `KVCache.append` raises
+`cache holds batch 1, got 8` on the first step. Pass `microbatches=1` explicitly.
+Both trainers already do; `scripts/dist/pp_generate_smoke.py` does not, so it is
+expected to fail at its default 2 rows.
+
+### The default decode path does not use the schedule
+
+`PipelineGenerator(forward_only_decode=True)` — the default — drives each decode
+step with a plain `dist.recv` / stage forward / `dist.send` chain
+(`PipelineGenerator.forward_only`). It builds no schedule and carries no autograd
+state, so a decode step costs one hop per stage instead of a training step's
+bookkeeping.
+
+Passing `forward_only_decode=False` restores the old path, which runs the token
+through a `ScheduleGPipe` built once in `prepare`. Only that path is subject to
+the extra-forward hazard at the end of this page.
+
+**The per-step token slice is `clone`d, not `contiguous()`d.** A one-element
+slice `tokens[:, pos:pos+1]` reports itself contiguous while keeping the source
+row stride, so `contiguous()` is a no-op on it and the send would carry the wrong
+stride to the next stage.
 
 **The microbatch split is frozen at stage construction.** `build_stage` declares
 the boundary as `(rows_per_microbatch, 1)`, so how the batch divides is a
@@ -121,42 +168,160 @@ trip, so splitting 8 rows into 8 microbatches multiplies the sequential round
 trips by 8 while shrinking every GEMM to a single row. There is no compute left to
 overlap. `PipelinedLMTrainer.generate` passes `microbatches=1` for this reason.
 
-Run `scripts/dist/pp_generate_smoke.py` under `torchrun --nproc_per_node=2` to
+Run `scripts/dist/pp_generate_smoke.py`, which spawns its own two ranks, to
 check a split model generates, and `pp_generate_bench.py` to reproduce the table.
+
+### Four ranks, from `configs/lm/pipegen_bench.py`
+
+`configs/lm/pipegen_bench.py` runs Kohaku-MoE-1B over four ranks with the
+pipelined preview selected — `SAMPLE_LOCAL = False`, `SAMPLE_FORWARD_ONLY =
+True` — so one short run reports both the decode path and what the training loop
+around it does.
+
+Preview decode through `PipelineGenerator.forward_only`, fp16, 4 rows x 64 new
+tokens:
+
+| | wall | ms/token | tok/s |
+|---|---|---|---|
+| steady state | 1.31 s | 20.5 | 195 |
+| first preview, cold | 2.96 s | — | — |
+
+The cold preview costs 2.3x the steady one, so a preview interval short enough
+that the first one dominates will misreport the path.
+
+Training in the same run, **uncompiled**, `NUM_MICROBATCHES = 8` and
+`MICRO_TOKENS = 16384` (131k tokens per step), synthetic data:
+
+| ms/step | tok/s | trained_frac | trained tokens/day |
+|---|---|---|---|
+| 502.3 | 261k | 0.9969 | 22.5B |
+
+**Neither figure has a JSON artifact.** Both were read from the run's console
+output; there is no file under `out/bench*/` to cite for either, and no plot
+script regenerates them. Re-run the config to reproduce them.
 
 ## Speed
 
-Decode is **memory-bound**: each step reads the active parameters once, so the
-ceiling is `active_bytes / 1791 GB/s`, amortized across the batch.
+Decode *should* be **memory-bound**: each step reads the active parameters once,
+so the ceiling is `active_bytes / 1791 GB/s`, amortized across the batch.
 `scripts/bench/gen/decode.py` reports achieved bandwidth against that ceiling.
 
-The single largest lever measured so far is graph capture:
+It is not. Kohaku-MoE-1B, bf16, 197M active
+(`out/bench_old/gen/decode/Kohaku-MoE-1B.json`):
 
-| | ms/token | tok/s | |
+| batch | tok/s | GB/s | % of roofline |
 |---|---|---|---|
-| eager | 26.10 | 38 | 0.8% of roofline |
-| `torch.compile(mode="reduce-overhead")` | **0.97** | **1035** | **27x** |
-| raw CUDA graph replay | 1.34 | 749 | 19.6x |
+| 1 | 35.1 | 13.9 | 0.78% |
+| 4 | 141.3 | 14.0 | 0.78% |
+| 16 | 567.7 | 14.4 | 0.80% |
 
-Eager decode issues **1646 device ops per token** and spends 275 ms of host time
-against 37 ms of device time — it is launch-bound, not bandwidth-bound. Compile
-beats a raw graph because Inductor also fuses the pointwise chains. MoE routing
-captures without trouble.
+Read the last column, not the second. Achieved bandwidth is **flat** across a 16x
+batch, and tok/s scales exactly with the batch, so a decode step costs the same
+wall time whether it carries 1 row or 16. A bandwidth-bound step would not do
+that. The per-step cost is dispatch, not DRAM: decode here is **launch-bound**,
+and the batch is free until something else binds.
 
-Swapping the RoPE implementation is worth 1.07x by itself, which is the ceiling
-its 11% share of host time allows. The gap was never one kernel; it was 1646 of
-them. See [../performance/benchmarking.md](../performance/benchmarking.md) for
-how these are measured.
+### `torch.compile` is worth 4.1x, once the decode step has one shape
+
+`scripts/tools/sample.py` is the only harness in the tree that compiles the decode
+step: `--set COMPILE=<mode>` calls `model.compile(mode=...)` and `--set
+BENCH_STEPS=N` times N greedy steps, best of 3 after a warmup call, with the EOS
+stop disabled so every arm does identical work.
+
+Kohaku-MoE-1B at step 64000, fp16 parameters and fp16 autocast, MXFP8 **off**,
+8 rows x 64 steps (`out/bench/gen/decode/compile_modes.json`):
+
+| arm | ms/step | tok/s | vs eager |
+|---|---|---|---|
+| eager | 35.80 | 223 | 1.00x |
+| `mode="reduce-overhead"` | 9.88 | 810 | 3.6x |
+| `mode="default"` | **8.66** | **923** | **4.1x** |
+
+```bash
+kogine run scripts/tools/sample.py --config configs/lm/tipo_moe_1b_uwupipe.py \
+    --set CKPT=out/ckpt/tipo-moe-1b-uwupipe/step-64000.ckpt \
+    --set SAMPLE_COUNT=8 --set BENCH_STEPS=64 --set MXFP8=False \
+    --set COMPILE=default
+```
+
+**The win is not CUDA graphs.** `reduce-overhead` is the mode that captures them,
+and it is the *slower* of the two compiled arms. What compile buys here is one
+traced kernel set that every step reuses, which collapses the per-step dispatch
+the roofline table above identified as the binding cost.
+
+`model.compile(...)` is `nn.Module.compile` — compilation applied in place —
+not `torch.compile(model)`, which returns a wrapper and prefixes every checkpoint
+key with `_orig_mod.`.
+
+### The static KV cache is what made that possible
+
+A compiled decode step is only reusable if its shapes never move, and the cache
+was what moved them. `KVCache.append` returned `keys[:, :end]`, one token longer
+every step, so Inductor re-traced per token and paid more in compilation than it
+saved.
+
+`KVCache(static=True)` — the default for `LocalGenerator` — removes the moving
+dimension:
+
+- the write is `index_copy_` at `self.pos`, a **device-side** scalar, so no Python
+  int enters the graph;
+- the read hands back the **whole** `(B, max_length, kv_heads, head_dim)` buffer
+  rather than a prefix slice;
+- `key_mask(steps)` is what makes that correct: `(1, 1, steps, max_length)`,
+  causal within the step and bounded by the committed prefix, so a query can never
+  read a slot that has not been written. `window_mask` does the same for the
+  sliding-window case;
+- buffers are allocated with `torch.zeros` rather than `torch.empty`, since the
+  unwritten tail is now inside every attention's key axis;
+- `seq_info` reads positions from `pos` and declares `max_seqlen = max_length`.
+
+`PipelineGenerator` does **not** use it: `_caches` builds its `KVCache` without
+`static=`, so pipelined decode keeps the growing-slice layout. Only the local path
+is compiled today.
+
+> **Superseded logs.** `out/sample_arms.log`, `sample_arms2.log`, `gen_speed.log`
+> and `arm_compiled.log` hold an eager spread of 28.43-35.14 ms/step and a single
+> surviving `reduce-overhead` run at 31.40 ms/step, alongside three
+> `RuntimeError: accessing tensor output of CUDAGraphs that has been overwritten
+> by a subsequent run` aborts raised from `models/block.py`. **Those predate both
+> the static cache and whole-model compilation** — the aborts came from compiling
+> per block — and must not be pooled with the table above.
+
+> **Unreproduced.** An earlier revision of this page reported eager 26.10
+> ms/token against 0.97 ms/token compiled (27x), a raw CUDA-graph replay at 1.34
+> ms/token, "1646 device ops per token", "275 ms of host time against 37 ms of
+> device time", and a 1.07x RoPE-swap win. **No harness in the tree produces any
+> of those numbers**, and the measured compile win above is 4.1x, not 27x.
+> `scripts/bench/gen/decode.py` and `scripts/bench/model/generate.py` never
+> compile; nothing counts device ops; there is no raw-graph decode arm and no RoPE
+> decode A/B. Treat every one of those figures as unsourced.
 
 **Pipelining decode is slower than not pipelining it, and that is the expected
-result.** At Kohaku-500M the pipelined path reaches 2.1% of roofline against a
-single card's ~23% compiled. Splitting a model across stages adds serialization
+result.** At Kohaku-500M, pp=2, the pipelined path reaches 2.1% of its own
+roofline. There is no single-card Kohaku-500M decode figure in the tree to put
+beside it — `decode.py` has only been run at Kohaku-MoE-1B — so treat the ratio
+between the two paths as unmeasured, and the argument below as the reason to
+expect it rather than as a result. Splitting a model across
+stages adds serialization
 without adding parallelism: one token must still traverse every stage in order, so
 the stages take turns rather than working at once. Pipelined generation exists so
 that a model too large for one card can be previewed **at all** — not to make
 generation faster. If the model fits on one card, use `LocalGenerator`.
 
+Both training loops now take that further and **do not pipeline previews at all
+by default**. `SamplePreview(local=True)` — the default, and what
+`scripts/train/lm_pipe.py` ships as `SAMPLE_LOCAL = True` — `all_gather_object`s
+every stage's slice onto rank 0, loads it into a whole `LMBackbone`, and decodes
+there with `LocalGenerator`. The gather is collective and every rank must reach
+it; only rank 0 holds the merged model and decodes. `SAMPLE_LOCAL = False` falls
+back to pipelined decode, with `SAMPLE_FORWARD_ONLY` choosing between the
+forward-only path and the schedule.
+
 ## The schedule's first step runs an extra forward
+
+This applies only to `forward_only_decode=False`, which is no longer the default
+decode path. It is kept because the hazard is invisible when you hit it and the
+schedule path is still reachable.
 
 `PipelineStage` supports two metadata modes. Given both `input_args` and
 `output_args` it is *static* and knows every boundary shape up front. Given
