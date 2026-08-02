@@ -8,6 +8,9 @@ it is truncated, and how much of it is duplicated somewhere else.
         --root /xg7/datasets/distill-codex/data --out out/data/census
 
 Streams every shard, so peak memory is the dedup table rather than the corpus.
+
+``dup_frac`` is measured over non-empty rows only, and ``empty_response_frac``
+over all rows, so the two are disjoint and compose by multiplication.
 See docs/internals/data.md.
 """
 
@@ -37,19 +40,31 @@ def shards(root: str):
                     yield category, source, os.path.join(src_dir, name)
 
 
+REPLY_KEYS = (
+    "response",
+    "output",
+    "completion",
+    "answer",
+    "content",
+    "text",
+    "assistant",
+)
+PROMPT_KEYS = ("instruction", "prompt", "input", "question", "query", "user")
+
+
 def row_text(row: dict) -> str:
     """The response-ish field, whatever this source happens to call it."""
-    for key in ("response", "output", "completion", "answer", "content", "text"):
+    for key in REPLY_KEYS:
         value = row.get(key)
-        if isinstance(value, str):
+        if isinstance(value, str) and value.strip():
             return value
     return ""
 
 
 def prompt_text(row: dict) -> str:
-    for key in ("instruction", "prompt", "input", "question", "query"):
+    for key in PROMPT_KEYS:
         value = row.get(key)
-        if isinstance(value, str):
+        if isinstance(value, str) and value.strip():
             return value
     return ""
 
@@ -77,6 +92,7 @@ def census(root: str, dedup: bool, limit: int) -> dict:
                 "fields": collections.Counter(),
                 "truncated": 0,
                 "empty_response": 0,
+                "nonempty_rows": 0,
                 "dup_rows": 0,
                 "dup_against": collections.Counter(),
                 "source_dataset": collections.Counter(),
@@ -102,14 +118,16 @@ def census(root: str, dedup: bool, limit: int) -> dict:
                         entry["source_dataset"][str(tag)] += 1
                 body = row_text(row)
                 entry["chars"] += len(body)
-                if not body:
+                empty = not body.strip()
+                if empty:
                     entry["empty_response"] += 1
                 if (
                     len(body) >= TRUNCATION_CAP
                     or len(prompt_text(row)) >= TRUNCATION_CAP
                 ):
                     entry["truncated"] += 1
-                if dedup:
+                if dedup and not empty:
+                    entry["nonempty_rows"] += 1
                     mark = fingerprint(row)
                     owner = seen.get(mark)
                     if owner is None:
@@ -138,7 +156,8 @@ def report(stats: dict, out_dir: str) -> None:
             "mean_response_chars": round(e["chars"] / max(e["rows"], 1), 1),
             "truncated_frac": round(e["truncated"] / max(e["rows"], 1), 4),
             "empty_response_frac": round(e["empty_response"] / max(e["rows"], 1), 4),
-            "dup_frac": round(e["dup_rows"] / max(e["rows"], 1), 4),
+            "dup_frac": round(e["dup_rows"] / max(e["nonempty_rows"], 1), 4),
+            "usable_rows": e["nonempty_rows"] - e["dup_rows"],
             "dup_against": dict(e["dup_against"].most_common(5)),
             "fields": sorted(e["fields"]),
             "source_dataset": dict(e["source_dataset"].most_common(5)),
@@ -148,18 +167,21 @@ def report(stats: dict, out_dir: str) -> None:
 
     rows = sorted(payload.values(), key=lambda r: -r["rows"])
     total = sum(r["rows"] for r in rows)
+    usable = sum(r["usable_rows"] for r in rows)
     lines = [
-        f"# Census: {len(rows)} sources, {total:,} rows",
+        f"# Census: {len(rows)} sources, {total:,} rows, "
+        f"{usable:,} usable ({100 * usable / max(total, 1):.1f}%)",
         "",
-        "| source | category | rows | share | GiB | trunc | dup | mean chars |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
+        "| source | category | rows | usable | GiB | trunc | empty | dup | mean chars |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for r in rows:
         lines.append(
             f"| `{r['source']}` | {r['category']} | {r['rows']:,} | "
-            f"{100 * r['rows'] / max(total, 1):.1f}% | {r['gib']:.2f} | "
-            f"{100 * r['truncated_frac']:.1f}% | {100 * r['dup_frac']:.1f}% | "
-            f"{r['mean_response_chars']:.0f} |"
+            f"{r['usable_rows']:,} | {r['gib']:.2f} | "
+            f"{100 * r['truncated_frac']:.1f}% | "
+            f"{100 * r['empty_response_frac']:.0f}% | "
+            f"{100 * r['dup_frac']:.1f}% | {r['mean_response_chars']:.0f} |"
         )
     with open(os.path.join(out_dir, "census.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
