@@ -144,7 +144,7 @@ def _rmsnorm_mx_kernel(
 
 
 def rmsnorm_mx(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
-    """RMSNorm as ``(e4m3 (M,K), ue8m0 (M, K//32))``; K a power of two, >= 32."""
+    """RMSNorm as ``(e4m3 (M,K), ue8m0 (M, K//32))``; K a multiple of 32."""
     if x.shape[-1] % BLOCK_SCALE:
         raise ValueError(f"K={x.shape[-1]} must be a multiple of {BLOCK_SCALE}")
     x = x.contiguous()

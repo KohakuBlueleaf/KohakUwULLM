@@ -62,7 +62,6 @@ def _fwd_kernel(
     stride_od,
     stride_lh,
     stride_lt,
-    H: tl.constexpr,
     GQA_GROUP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_SUB: tl.constexpr,

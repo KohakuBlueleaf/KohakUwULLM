@@ -76,7 +76,7 @@ def _occupancy(dev: Device, est_regs: int, smem: int, warps: int) -> int:
     return max(min(by_reg, by_smem, by_thread), 0)
 
 
-def _candidates(elem_bytes: int):
+def _candidates():
     for bm in BLOCK_M:
         for bn in BLOCK_N:
             for bk in BLOCK_K:
@@ -186,7 +186,7 @@ def plan_topk(
     dev.validate()
     scored = [
         p
-        for p in (score(m, n, k, dev, elem_bytes, *c) for c in _candidates(elem_bytes))
+        for p in (score(m, n, k, dev, elem_bytes, *c) for c in _candidates())
         if p is not None
     ]
     if not scored:

@@ -157,7 +157,7 @@ def _check(low: torch.Tensor, other: torch.Tensor, seed: int, rng_offset: int) -
     if rng_offset < 0:
         raise ValueError(f"rng_offset must be non-negative, got {rng_offset}")
     # Per-tensor addressing is 32-bit; the RNG counter is int64 and is not the limit.
-    if n > 2**31:
+    if n >= 2**31:
         raise ValueError(f"numel {n} exceeds the 32-bit addressing limit")
     if seed < 0:
         raise ValueError(f"seed must be non-negative, got {seed}")

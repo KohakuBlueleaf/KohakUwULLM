@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from kohakuwullm.kernels.optim.stochastic_round import _format_of, _sr_round
+
 
 @triton.jit
 def _adamw16_kernel(
@@ -27,6 +29,11 @@ def _adamw16_kernel(
     r_scale,
     seed,
     STOCHASTIC: tl.constexpr,
+    K_NORMAL: tl.constexpr,
+    MIN_EXP: tl.constexpr,
+    TINY_BITS: tl.constexpr,
+    TAIL_SCALE: tl.constexpr,
+    SUBNORMAL_GAP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """One AdamW step. ``r`` holds ``sqrt(v)``; ``m_scale``/``r_scale`` debias.
@@ -52,14 +59,15 @@ def _adamw16_kernel(
     p = p - lr * (update + wd * p)
 
     if STOCHASTIC:
-        # Uniform noise across the bits the narrowing cast discards. bf16 only.
-        rnd = tl.randint(seed, offs)
-        p_bits = p.to(tl.int32, bitcast=True) + (rnd.to(tl.int32) >> 16)
-        p_out = (p_bits & 0xFFFF0000).to(tl.float32, bitcast=True)
-        m_bits = m.to(tl.int32, bitcast=True) + (
-            tl.randint(seed + 1, offs).to(tl.int32) >> 16
+        # Bitcast: the truncation mask inside `_sr_round` is negative.
+        draw_p = tl.randint(seed, offs).to(tl.int32, bitcast=True)
+        draw_m = tl.randint(seed + 1, offs).to(tl.int32, bitcast=True)
+        p_out = _sr_round(
+            p, draw_p, K_NORMAL, MIN_EXP, TINY_BITS, TAIL_SCALE, SUBNORMAL_GAP
         )
-        m_out = (m_bits & 0xFFFF0000).to(tl.float32, bitcast=True)
+        m_out = _sr_round(
+            m, draw_m, K_NORMAL, MIN_EXP, TINY_BITS, TAIL_SCALE, SUBNORMAL_GAP
+        )
     else:
         p_out = p
         m_out = m
@@ -80,7 +88,10 @@ def _adamw16_eager(
     eps: float,
     weight_decay: float,
 ) -> None:
-    """The same update in torch ops, for devices Triton does not serve."""
+    """The same update in torch ops, for devices Triton does not serve.
+
+    The writeback rounds to nearest; there is no stochastic path here.
+    """
     beta1, beta2 = betas
     g = grad.float()
     p = param.float()
@@ -127,6 +138,10 @@ def adamw16_step(
         )
         return
     n = param.numel()
+    if not n:
+        return
+    # Compiled out unless STOCHASTIC; the rounding target is always bf16.
+    fmt = _format_of(torch.bfloat16)
     grid = lambda meta: (triton.cdiv(n, meta["BLOCK"]),)  # noqa: E731
     _adamw16_kernel[grid](
         param,
@@ -143,6 +158,11 @@ def adamw16_step(
         1.0 / (1.0 - beta2**step) ** 0.5,
         seed + step,
         STOCHASTIC=stochastic,
+        K_NORMAL=fmt.k_normal,
+        MIN_EXP=fmt.min_exp,
+        TINY_BITS=fmt.tiny_bits,
+        TAIL_SCALE=fmt.tail_scale,
+        SUBNORMAL_GAP=fmt.subnormal_gap,
         BLOCK=1024,
         num_warps=4,
     )

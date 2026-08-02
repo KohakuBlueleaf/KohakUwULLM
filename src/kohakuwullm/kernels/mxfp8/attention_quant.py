@@ -84,8 +84,12 @@ def quantize_heads(x: torch.Tensor, mu: torch.Tensor | None = None, block_m: int
     ``mu`` is an ``(H, D)`` fp32 mean subtracted before quantizing.
     """
     t, heads, head_dim = x.shape
-    if head_dim % BLOCK_SCALE:
-        raise ValueError(f"head_dim={head_dim} must be a multiple of {BLOCK_SCALE}")
+    groups = head_dim // BLOCK_SCALE
+    if head_dim % BLOCK_SCALE or groups & (groups - 1):
+        raise ValueError(
+            f"head_dim={head_dim} must be {BLOCK_SCALE} times a power of two; "
+            "the scale-group count reaches tl.arange"
+        )
     q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     s = torch.empty(
         t, heads, head_dim // BLOCK_SCALE, device=x.device, dtype=torch.uint8

@@ -83,6 +83,17 @@ Roughly a 15x error multiplier over bf16, which is what three mantissa bits on
 both score operands buys. Smoothing is worth about 2.5x of it on a K with a large
 channel mean.
 
+> **The multiplier is set by the control, and the two controls in the tree
+> disagree.** The table above has no JSON artifact. The one that does --
+> `out/bench/kernel/attention/attention.json`, `precision` -- measures the same
+> forward at **3.15e-2 for `mxfp8` against 5.57e-3 for `varlen`, a 5.7x
+> multiplier**, not 15x. The `mxfp8` numerator agrees between the two (0.034 vs
+> 0.0315); what differs is the bf16 denominator, 0.002 here against 0.0056
+> there, so the discrepancy is in the control's shape and reference rather than
+> in the kernel. Quote 5.7x, which is reproducible, and treat 15x as pending a
+> harness. The ranking the section exists to establish -- `V` and `dO` in
+> 16-bit, `Q`/`K` in e4m3 -- is unaffected either way.
+
 ## 4. Why the tiles are autotuned, not planned
 
 An earlier version shipped an analytic tile planner (`attn_plan.py`) and a

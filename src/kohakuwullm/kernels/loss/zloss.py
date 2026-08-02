@@ -19,7 +19,6 @@ def _chunk_rows(n: int, vocab: int, dim: int) -> int:
 
 
 class _LogSumExpSquare(torch.autograd.Function):
-    # Casts the float arguments to the autocast dtype. See docs/internals/kernels.md.
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
     def forward(ctx, hidden, weight, labels, ignore_index):

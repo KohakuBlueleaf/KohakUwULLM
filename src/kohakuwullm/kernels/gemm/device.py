@@ -63,7 +63,7 @@ class Device:
 
     @classmethod
     def from_json(cls, path: str) -> "Device":
-        """Load a card description written by `scripts/bench/kernel/gemm_probe.py`."""
+        """Load a card description written by `to_json`."""
         with open(path) as fh:
             raw = json.load(fh)
         raw["bar_tax"] = tuple(raw["bar_tax"])

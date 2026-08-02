@@ -3,8 +3,8 @@
 One program owns a block of queries and streams the keys it attends to, keeping the
 running softmax state in registers so the ``(M, N)`` probability matrix never reaches
 memory. The log-sum-exp is written out because both backward kernels recompute ``p``
-from it. The leaf module of the three: ``NEG_INF`` lives here because both others
-read it.
+from it. The leaf module: ``NEG_INF`` lives here, and the backward and the MXFP8
+kernels import it.
 
 See docs/internals/kernels.md.
 """
@@ -57,7 +57,6 @@ def _fwd_kernel(
     stride_od,
     stride_lh,
     stride_lt,
-    H: tl.constexpr,
     GQA_GROUP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,

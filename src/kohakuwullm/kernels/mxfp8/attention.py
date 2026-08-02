@@ -77,7 +77,6 @@ class _MXFP8VarlenAttn(torch.autograd.Function):
             out.stride(2),
             lse.stride(0),
             lse.stride(1),
-            H=heads,
             GQA_GROUP=gqa_group,
             HEAD_DIM=head_dim,
             BLOCK_SUB=BLOCK_SCALE,
@@ -245,10 +244,14 @@ def mxfp8_varlen_attn(
 
     ``window`` is the *inclusive* left span (``w`` means a query attends to itself
     and the ``w-1`` tokens before it), matching ``VarlenAttention``'s convention.
-    ``head_dim`` must be a multiple of the 32-element scale block.
+    ``head_dim`` must be the 32-element scale block times a power of two.
     """
-    if q.shape[-1] % BLOCK_SCALE:
-        raise ValueError(f"head_dim={q.shape[-1]} must be a multiple of {BLOCK_SCALE}")
+    groups = q.shape[-1] // BLOCK_SCALE
+    if q.shape[-1] % BLOCK_SCALE or groups & (groups - 1):
+        raise ValueError(
+            f"head_dim={q.shape[-1]} must be {BLOCK_SCALE} times a power of two; "
+            "the scale-group count reaches tl.arange"
+        )
     sm_scale = sm_scale or q.shape[-1] ** -0.5
     out, lse = _MXFP8VarlenAttn.apply(
         q.contiguous(),

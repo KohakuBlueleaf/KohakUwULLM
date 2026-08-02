@@ -60,7 +60,6 @@ class _TritonVarlenAttn(torch.autograd.Function):
             out.stride(2),
             lse.stride(0),
             lse.stride(1),
-            H=heads,
             GQA_GROUP=gqa_group,
             HEAD_DIM=head_dim,
             IS_CAUSAL=causal,

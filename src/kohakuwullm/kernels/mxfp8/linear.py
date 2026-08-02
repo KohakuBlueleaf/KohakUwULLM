@@ -69,7 +69,7 @@ class _MXFP8Linear(torch.autograd.Function):
         d2d = dout.reshape(-1, shape[-1]).to(x2d.dtype).contiguous()
         dq, ds = quantize_mx_vendor(ctx.pad_k(d2d))
         dx = mxfp8_mm_swizzled(dq, ds, wq_d, ws_d, ctx.x_dtype)
-        # 16-bit, and unpadded: the padded axis is this product's N.
+        # 16-bit, and unpadded: `out_features` is this product's M, not its K.
         dw = d2d.t() @ x2d
         return dx.reshape(*shape[:-1], dx.shape[-1]), dw, None, None, None, None, None
 

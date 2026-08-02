@@ -89,6 +89,7 @@ class GroupedWriteback:
         self._build(params, updates)
 
     def _validate(self, params, updates) -> None:
+        device = params[0].device
         for param, update in zip(params, updates):
             if param.dtype is not self.dtype:
                 raise ValueError(
@@ -102,7 +103,7 @@ class GroupedWriteback:
                 )
             if not param.is_contiguous() or not update.is_contiguous():
                 raise ValueError("grouped writeback needs contiguous tensors")
-            if param.device != updates[0].device:
+            if param.device != device or update.device != device:
                 raise ValueError("every tensor must live on one device")
 
     def _build(self, params, updates) -> None:
@@ -110,7 +111,7 @@ class GroupedWriteback:
         numels = [p.numel() for p in params]
         total = sum(numels)
         # Per-tensor addressing is 32-bit; the whole-model RNG counter is int64.
-        oversized = [n for n in numels if n > 2**31]
+        oversized = [n for n in numels if n >= 2**31]
         if oversized:
             raise ValueError(
                 f"tensor of {oversized[0]} elements exceeds 32-bit addressing"
