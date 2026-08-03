@@ -301,7 +301,14 @@ class PathKeyedRecords:
 
 
 def load_records(name: str, root: str = DEFAULT_ROOT, **kwargs):
-    """``name`` -> a record source. ``"danbooru"`` is the ground-truth one."""
+    """``name`` -> a record source. ``"danbooru"`` is the ground-truth one.
+
+    A ``"<category>/<dataset>"`` name resolves to the general-pretrain corpus.
+    """
+    if "/" in name:
+        from kohakuwullm.data.sources.corpus import CorpusRecords
+
+        return CorpusRecords(name, **kwargs)
     if name == "danbooru":
         return DanbooruRecords(root=root, **kwargs)
     return PathKeyedRecords(name, root=root, **kwargs)

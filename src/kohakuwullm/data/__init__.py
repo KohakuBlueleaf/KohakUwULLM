@@ -43,7 +43,9 @@ from kohakuwullm.data.packing import (
     encode_sample,
     split_packed,
 )
+from kohakuwullm.data.renderers.plain import ChatRenderer, PlainRenderer
 from kohakuwullm.data.renderers.tipo import SPECIAL_TOKENS, TIPORenderer
+from kohakuwullm.data.sources.corpus import CorpusRecords
 from kohakuwullm.data.sources.vault import (
     DEFAULT_ROOT,
     PATH_KEYED,
@@ -85,24 +87,54 @@ def build_dataset(
     return WeightedConcatDataset(datasets, repeats)
 
 
+class _Fraction:
+    """The evenly-strided first ``frac`` of a source, as a view.
+
+    Strided rather than truncated, so a partial pass spans the whole source
+    instead of whichever shards happen to sort first.
+    """
+
+    def __init__(self, source, frac: float) -> None:
+        self.source = source
+        self.count = max(1, int(len(source) * frac))
+        self.step = len(source) / self.count
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __getitem__(self, index: int):
+        return self.source[min(int(index * self.step), len(self.source) - 1)]
+
+
 class _ConcatRepeated:
     """Indexable view over several record sources with per-source repeats.
 
     A view, not a list: the sources are lazy and must stay that way. A repeat
-    lists the source again rather than duplicating its records. See docs/internals/data.md.
+    lists the source again rather than duplicating its records, and a fractional
+    repeat takes a strided share of one pass. See docs/internals/data.md.
     """
 
-    def __init__(self, sources: list[dict], root: str) -> None:
+    def __init__(self, sources: list[dict], root: str, snapshot=None) -> None:
         self.parts = []
+        snapshot = snapshot or {}
         bounds = [0]
         for spec in sources:
             opts = dict(spec)
             name = opts.pop("name")
-            repeat = int(opts.pop("repeat", 1))
+            repeat = float(opts.pop("repeat", 1))
+            if repeat <= 0:
+                continue
+            if name in snapshot:
+                opts["snapshot"] = snapshot[name]
             source = load_records(name, root=root, **opts)
-            for _ in range(repeat):
+            whole, frac = int(repeat), repeat - int(repeat)
+            for _ in range(whole):
                 self.parts.append(source)
                 bounds.append(bounds[-1] + len(source))
+            if frac > 1e-9:
+                part = _Fraction(source, frac)
+                self.parts.append(part)
+                bounds.append(bounds[-1] + len(part))
         self.bounds = bounds
 
     def __len__(self) -> int:
@@ -115,9 +147,9 @@ class _ConcatRepeated:
         return self.parts[part][index - self.bounds[part]]
 
 
-def build_records(sources: list[dict], root: str = DEFAULT_ROOT):
+def build_records(sources: list[dict], root: str = DEFAULT_ROOT, snapshot=None):
     """Indexable record view for the iterative loader, honouring repeats."""
-    return _ConcatRepeated(sources, root)
+    return _ConcatRepeated(sources, root, snapshot)
 
 
 def build_loader(
@@ -138,10 +170,12 @@ def build_loader(
 
 
 @LOADER.register("iterative")
-def _iterative_loader(sources, tokenizer, renderer="tipo", root=DEFAULT_ROOT, **kwargs):
+def _iterative_loader(
+    sources, tokenizer, renderer="tipo", root=DEFAULT_ROOT, snapshot=None, **kwargs
+):
     """Token-budget varlen batches, single process."""
     return build_iterative_loader(
-        build_records(sources, root=root),
+        build_records(sources, root=root, snapshot=snapshot),
         build(renderer, RENDERER),
         tokenizer,
         **kwargs,
@@ -149,10 +183,12 @@ def _iterative_loader(sources, tokenizer, renderer="tipo", root=DEFAULT_ROOT, **
 
 
 @LOADER.register("ddp")
-def _ddp_loader(sources, tokenizer, renderer="tipo", root=DEFAULT_ROOT, **kwargs):
+def _ddp_loader(
+    sources, tokenizer, renderer="tipo", root=DEFAULT_ROOT, snapshot=None, **kwargs
+):
     """Token-budget varlen batches, one disjoint shard per rank, resumable."""
     return build_ddp_loader(
-        build_records(sources, root=root),
+        build_records(sources, root=root, snapshot=snapshot),
         build(renderer, RENDERER),
         tokenizer,
         **kwargs,
@@ -160,10 +196,12 @@ def _ddp_loader(sources, tokenizer, renderer="tipo", root=DEFAULT_ROOT, **kwargs
 
 
 @LOADER.register("pipeline")
-def _pipeline_loader(sources, tokenizer, renderer="tipo", root=DEFAULT_ROOT, **kwargs):
+def _pipeline_loader(
+    sources, tokenizer, renderer="tipo", root=DEFAULT_ROOT, snapshot=None, **kwargs
+):
     """Fixed-size microbatch steps for a pipeline schedule, resumable."""
     return build_pipeline_loader(
-        build_records(sources, root=root),
+        build_records(sources, root=root, snapshot=snapshot),
         build(renderer, RENDERER),
         tokenizer,
         **kwargs,
@@ -176,6 +214,7 @@ def _map_loader(
     tokenizer,
     renderer="tipo",
     root=DEFAULT_ROOT,
+    snapshot=None,
     max_length: int = 2048,
     seed: int = 0,
     layout: str = "packed",
@@ -183,7 +222,7 @@ def _map_loader(
 ):
     """Map-style, fixed sample count per batch; the measured-best online loader."""
     return build_fast_loader(
-        build_records(sources, root=root),
+        build_records(sources, root=root, snapshot=snapshot),
         build(renderer, RENDERER),
         tokenizer,
         max_length=max_length,
@@ -196,6 +235,9 @@ def _map_loader(
 __all__ = [
     "build_dataset",
     "build_loader",
+    "ChatRenderer",
+    "CorpusRecords",
+    "PlainRenderer",
     "build_records",
     "load_records",
     "DanbooruRecords",

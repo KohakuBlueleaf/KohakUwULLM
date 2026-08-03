@@ -219,6 +219,9 @@ def build_ddp_loader(
     pin_memory: bool = True,
     drop_last: bool = False,
     batches_per_epoch: int | None = None,
+    val_frac: float = 0.0,
+    split: str = "train",
+    doc_filter=None,
     pad_to_multiple: int = 0,
     max_retry: int = 64,
 ) -> ResumableLoader:
@@ -251,6 +254,9 @@ def build_ddp_loader(
         max_retry=max_retry,
         drop_last=drop_last,
         batches_per_epoch=batches_per_epoch,
+        val_frac=val_frac,
+        split=split,
+        doc_filter=doc_filter,
         pad_to_multiple=pad_to_multiple,
     )
     loader = make_loader(dataset, num_workers, prefetch_factor, pin_memory)

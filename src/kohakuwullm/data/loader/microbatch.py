@@ -141,6 +141,9 @@ class MicroBatchedDataset(TokenBudgetIterableDataset):
         world_size: int = 1,
         max_retry: int = 64,
         batches_per_epoch: int | None = None,
+        val_frac: float = 0.0,
+        split: str = "train",
+        doc_filter=None,
     ) -> None:
         if num_microbatches < 1:
             raise ValueError("num_microbatches must be >= 1")
@@ -158,6 +161,9 @@ class MicroBatchedDataset(TokenBudgetIterableDataset):
             max_retry=max_retry,
             drop_last=False,
             batches_per_epoch=batches_per_epoch,
+            val_frac=val_frac,
+            split=split,
+            doc_filter=doc_filter,
             # Rounding up to the budget itself makes every microbatch exactly k.
             pad_to_multiple=k,
         )
@@ -205,6 +211,9 @@ def build_pipeline_loader(
     pin_memory: bool = True,
     batches_per_epoch: int | None = None,
     max_retry: int = 64,
+    val_frac: float = 0.0,
+    split: str = "train",
+    doc_filter=None,
 ) -> ResumableLoader:
     """Loader of :class:`MicroBatchedStep`, resumable, for pipeline schedules.
 
@@ -233,6 +242,9 @@ def build_pipeline_loader(
         world_size=world_size,
         max_retry=max_retry,
         batches_per_epoch=batches_per_epoch,
+        val_frac=val_frac,
+        split=split,
+        doc_filter=doc_filter,
     )
     loader = make_loader(dataset, num_workers, prefetch_factor, pin_memory)
     return ResumableLoader(

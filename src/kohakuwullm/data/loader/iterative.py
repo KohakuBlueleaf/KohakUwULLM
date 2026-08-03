@@ -17,6 +17,7 @@ from itertools import chain
 import numpy as np
 import torch.utils.data as data
 
+from kohakuwullm.data.filters import build_filter
 from kohakuwullm.data.packing import PackedBatch, collate_packed, encode_sample
 
 
@@ -86,14 +87,37 @@ def pack_to_budget(
             return
 
 
+def held_out(indices: np.ndarray, seed: int, val_frac: float) -> np.ndarray:
+    """Boolean mask of the validation side, from the index alone.
+
+    Epoch-independent by construction, so the split cannot drift between
+    epochs. See docs/internals/data.md.
+    """
+    x = indices.astype(np.uint64) ^ np.uint64(seed & 0xFFFFFFFF)
+    x = (x * np.uint64(0x9E3779B97F4A7C15)) & np.uint64(0xFFFFFFFFFFFFFFFF)
+    x ^= x >> np.uint64(29)
+    x = (x * np.uint64(0xBF58476D1CE4E5B9)) & np.uint64(0xFFFFFFFFFFFFFFFF)
+    x ^= x >> np.uint64(32)
+    return (x % np.uint64(1_000_000)) < np.uint64(int(val_frac * 1_000_000))
+
+
 def shard_indices(
-    n: int, shard_id: int, num_shards: int, seed: int, epoch: int
+    n: int,
+    shard_id: int,
+    num_shards: int,
+    seed: int,
+    epoch: int,
+    val_frac: float = 0.0,
+    split: str = "train",
 ) -> np.ndarray:
     """Indices owned by one shard: a shared permutation of ``(seed, epoch)``,
     strided. See docs/internals/data.md."""
     order = np.random.default_rng((seed, epoch)).permutation(
         np.arange(n, dtype=np.int64 if n > 2**31 else np.int32)
     )
+    if val_frac > 0.0:
+        mask = held_out(order, seed, val_frac)
+        order = order[mask if split == "val" else ~mask]
     return np.ascontiguousarray(order[shard_id::num_shards])
 
 
@@ -138,6 +162,9 @@ class TokenBudgetIterableDataset(data.IterableDataset):
         drop_last: bool = False,
         batches_per_epoch: int | None = None,
         pad_to_multiple: int = 0,
+        val_frac: float = 0.0,
+        split: str = "train",
+        doc_filter=None,
     ) -> None:
         if k <= 0 or m < 0 or ctx_max <= 0:
             raise ValueError("k and ctx_max must be positive and m non-negative")
@@ -160,6 +187,9 @@ class TokenBudgetIterableDataset(data.IterableDataset):
         self.drop_last = drop_last
         self.batches_per_epoch = batches_per_epoch
         self.pad_to_multiple = pad_to_multiple
+        self.val_frac = val_frac
+        self.split = split
+        self.doc_filter = build_filter(doc_filter)
         self._pass = 0
         self._resume: dict[int, dict] = {}
 
@@ -190,8 +220,11 @@ class TokenBudgetIterableDataset(data.IterableDataset):
             rec = self.records[index]
             if progress is not None:
                 progress[0] = start + offset
-            # A missing row is skipped: this path has no length to preserve.
+            # A missing or rejected row is skipped: this path has no length to
+            # preserve, and the packer simply draws the next document.
             if rec is None:
+                continue
+            if self.doc_filter is not None and self.doc_filter(rec):
                 continue
             # Same derivation as RenderedDataset, so a given (seed, epoch,
             # index) renders the identical example in either path.
@@ -231,7 +264,13 @@ class TokenBudgetIterableDataset(data.IterableDataset):
         self._pass += 1
 
         indices = shard_indices(
-            len(self.records), shard_id, num_shards, self.seed, epoch
+            len(self.records),
+            shard_id,
+            num_shards,
+            self.seed,
+            epoch,
+            val_frac=self.val_frac,
+            split=self.split,
         )
         # Insertion-ordered, so `tuple(outstanding)` comes out in draw order.
         outstanding: dict[int, None] = {}
@@ -324,6 +363,9 @@ def build_iterative_loader(
     batches_per_epoch: int | None = None,
     pad_to_multiple: int = 0,
     max_retry: int = 64,
+    val_frac: float = 0.0,
+    split: str = "train",
+    doc_filter=None,
 ) -> data.DataLoader:
     """DataLoader over :class:`TokenBudgetIterableDataset`, single-process.
 
@@ -343,5 +385,8 @@ def build_iterative_loader(
         drop_last=drop_last,
         batches_per_epoch=batches_per_epoch,
         pad_to_multiple=pad_to_multiple,
+        val_frac=val_frac,
+        split=split,
+        doc_filter=doc_filter,
     )
     return make_loader(dataset, num_workers, prefetch_factor, pin_memory)
