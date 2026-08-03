@@ -27,10 +27,10 @@ RENDERER = "plain"
 
 # 400k steps x 262144 tokens = 104.9B; one pass over this list delivers it.
 SOURCES = [
-    {"name": "en/nemotron-cc-v2.1-hq-syn", "repeat": 0.560},
+    {"name": "en/nemotron-cc-v2.1-hq-syn", "repeat": 0.616},
     {"name": "en/nemotron-cc-v2.1-hq", "repeat": 1.000},
     {"name": "ja/fineweb-2-edu-japanese-10bt", "repeat": 1.000},
-    {"name": "ja/fineweb-2-edu-japanese-extra", "repeat": 0.355},
+    {"name": "ja/fineweb-2-edu-japanese-extra", "repeat": 0.430},
     {"name": "en/nemotron-cc-v2.1-hq-dqa", "repeat": 1.000},
     {"name": "zh-tw/finepdfs-zh-zhtw", "repeat": 1.000},
     {"name": "zh-tw/ultra-fineweb-l3", "repeat": 1.000},
