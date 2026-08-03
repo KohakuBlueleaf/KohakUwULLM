@@ -154,7 +154,8 @@ class KohakuMoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         flat = x.reshape(-1, shape[-1])
-        scores = self.score(self.gate(flat.float()).float())
+        # Router runs wholly in fp32, matching training.
+        scores = self.score(F.linear(flat.float(), self.gate.weight.float()))
         index = (scores + self.expert_bias).topk(self.top_k, dim=-1).indices
         weight = scores.gather(1, index)
         if self.norm_topk_prob and self.top_k > 1:

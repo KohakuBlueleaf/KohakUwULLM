@@ -27,7 +27,18 @@ TOKENIZER = "models/tokenizer"
 VOCAB_SIZE = 65536
 PRESET = "Kohaku-MoE-1B"
 ARCH_OVERRIDES: dict = {}
-OUT_DTYPE = "bfloat16"
+PARAM_DTYPE = ""
+# Empty follows the checkpoint's own PARAM_DTYPE; set it only to override.
+OUT_DTYPE = ""
+
+_DTYPE_ALIAS = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}
+
+
+def _resolve_dtype() -> str:
+    """Export dtype: ``OUT_DTYPE`` if set, else the config's ``PARAM_DTYPE``."""
+    name = OUT_DTYPE or PARAM_DTYPE or "bfloat16"
+    return _DTYPE_ALIAS.get(name, name)
+
 
 _EXPORT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -133,7 +144,7 @@ def write_config(path: str, config) -> None:
         "rms_norm_eps": config.norm_eps,
         "qk_norm": config.qk_norm,
         "tie_word_embeddings": config.tie_embeddings,
-        "dtype": OUT_DTYPE,
+        "dtype": _resolve_dtype(),
     }
     with open(os.path.join(path, "config.json"), "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
@@ -146,7 +157,7 @@ def main() -> None:
     os.makedirs(OUT, exist_ok=True)
 
     tensors = convert(load_state(CKPT), config)
-    dtype = getattr(torch, OUT_DTYPE)
+    dtype = getattr(torch, _resolve_dtype())
     tensors = {k: v.to(dtype).contiguous() for k, v in tensors.items()}
     save_file(
         tensors, os.path.join(OUT, "model.safetensors"), metadata={"format": "pt"}
