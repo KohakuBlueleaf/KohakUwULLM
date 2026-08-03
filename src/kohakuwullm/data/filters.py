@@ -53,17 +53,29 @@ def is_degenerate(
     return max_repeat_run(seq, max_n)[0] >= threshold
 
 
-def ngram_repeat(field: str = "text", **kwargs):
-    """Filter rejecting documents with long consecutive n-gram repeats."""
+class NGramRepeat:
+    """Rejects documents with long consecutive n-gram repeats.
 
-    def predicate(rec: dict) -> bool:
-        text = rec.get(field)
-        return bool(text) and is_degenerate(text, **kwargs)
+    A class rather than a closure: DataLoader workers pickle the filter, and a
+    local function cannot be pickled.
+    """
 
-    return predicate
+    def __init__(
+        self,
+        field: str = "text",
+        max_n: int = DEFAULT_MAX_N,
+        threshold: int = DEFAULT_THRESHOLD,
+    ) -> None:
+        self.field = field
+        self.max_n = max_n
+        self.threshold = threshold
+
+    def __call__(self, rec: dict) -> bool:
+        text = rec.get(self.field)
+        return bool(text) and is_degenerate(text, self.max_n, self.threshold)
 
 
-FILTERS = {"ngram": ngram_repeat}
+FILTERS = {"ngram": NGramRepeat}
 
 
 def build_filter(spec):

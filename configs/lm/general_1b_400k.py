@@ -14,29 +14,31 @@ Smoke, ten steps, no network::
     kogine run scripts/train/lm_pipe.py --config configs/lm/general_1b_400k.py \\
         --set MAX_STEPS=10 --set CKPT_INTERVAL=0 --set SAMPLE_INTERVAL=0
 
-DRAFT: `repeat` weights are placeholders until the vault conversion finishes and
-the real document counts are known. Do not launch without re-deriving them.
+Weights are derived by scripts/data/mixture.py from measured mean document
+length, so one pass delivers 104.9B tokens: en 68.1%, ja 22.7%, zh-TW 8.0%,
+stem 1.2%. Korean and the 15-language `multi` set are absent -- they had not
+finished converting, and this run validates the corpus path rather than the
+multilingual hypothesis. Re-derive after adding a source.
 """
 
 DATA_KIND = "corpus"
 DATA_ROOT = "/Iolite/text-dataset/_vault"
 RENDERER = "plain"
 
-# 400k steps x 262144 tokens = 104.9B. Shares target the 100B row of
-# internal/general-pretrain-datasets.md section 2; `repeat` is set so one pass
-# over this list lands near that split.
+# 400k steps x 262144 tokens = 104.9B; one pass over this list delivers it.
 SOURCES = [
-    {"name": "en/nemotron-cc-v2.1-hq", "repeat": 1},
-    {"name": "en/nemotron-cc-v2.1-hq-syn", "repeat": 1},
-    {"name": "en/nemotron-cc-v2.1-hq-dqa", "repeat": 1},
-    {"name": "multi/nemotron-cc-v2-trans-dqa", "repeat": 1},
-    {"name": "ja/fineweb-2-edu-japanese-10bt", "repeat": 1},
-    {"name": "zh-tw/finepdfs-zh-zhtw", "repeat": 1},
-    {"name": "zh-tw/ultra-fineweb-l3", "repeat": 1},
-    {"name": "zh-tw/wiki-zhtw", "repeat": 1},
-    {"name": "zh-tw/ptt-zhtw", "repeat": 1},
-    {"name": "ko/hplt3-kor-hang", "repeat": 1},
-    {"name": "stem/nemotron-specialized", "repeat": 1},
+    {"name": "en/nemotron-cc-v2.1-hq-syn", "repeat": 0.560},
+    {"name": "en/nemotron-cc-v2.1-hq", "repeat": 1.000},
+    {"name": "ja/fineweb-2-edu-japanese-10bt", "repeat": 1.000},
+    {"name": "ja/fineweb-2-edu-japanese-extra", "repeat": 0.355},
+    {"name": "en/nemotron-cc-v2.1-hq-dqa", "repeat": 1.000},
+    {"name": "zh-tw/finepdfs-zh-zhtw", "repeat": 1.000},
+    {"name": "zh-tw/ultra-fineweb-l3", "repeat": 1.000},
+    {"name": "en/nemotron-cc-v2.1-hq-trans", "repeat": 1.000},
+    {"name": "stem/nemotron-specialized", "repeat": 1.000},
+    {"name": "zh-tw/wiki-zhtw", "repeat": 1.000},
+    {"name": "zh-tw/finepdfs-zh-zhtw-classical", "repeat": 1.000},
+    {"name": "zh-tw/ptt-zhtw", "repeat": 1.000},
 ]
 
 LOADER_KWARGS = {
@@ -64,8 +66,11 @@ ARCH_OVERRIDES = {
 AUX_LOSS_WEIGHT = 0.0
 ROUTER_Z_LOSS_WEIGHT = 0.0
 
-MICRO_TOKENS = 16384
-NUM_MICROBATCHES = 16
+# Corpus documents average ~870 tokens against TIPO's ~195, and packed varlen
+# activation scales with the sum of squared document lengths, so the same token
+# budget costs several times the memory. 8192 x 32 keeps 262144 tokens/step.
+MICRO_TOKENS = 8192
+NUM_MICROBATCHES = 32
 LAYERS = []
 SCHEDULE = "1f1b"
 PARAM_DTYPE = "fp16"
