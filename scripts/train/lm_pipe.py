@@ -138,6 +138,9 @@ PROGRESS_BAR = True
 SAMPLE_INTERVAL = 0
 # Each is kwargs for `tipo.build_prompt`; a bare tag string is off-distribution.
 SAMPLE_PROMPTS: list | None = None
+# Cut previews from the batch under training instead of fixed prompts.
+SAMPLE_FROM_BATCH = 0
+SAMPLE_PREFIX_FRAC = 0.25
 SAMPLE_COUNT = 16
 # None runs every row to EOS or to the model's context limit.
 SAMPLE_TOKENS: int | None = None
@@ -422,6 +425,8 @@ def main() -> None:
                 tokenizer,
                 ranks,
                 prompts=build_sample_prompts(),
+                from_batch=SAMPLE_FROM_BATCH,
+                prefix_frac=SAMPLE_PREFIX_FRAC,
                 every_n_steps=SAMPLE_INTERVAL,
                 samples=SAMPLE_COUNT,
                 report=report_samples,
