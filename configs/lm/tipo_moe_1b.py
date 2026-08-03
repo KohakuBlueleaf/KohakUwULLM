@@ -5,10 +5,8 @@ experts, the aux-loss-free router balancing, Muon, packed varlen, in-training sa
 previews and the step-based progress bar -- which is the point: integration bugs only
 appear when the pieces run together.
 
-Measured 13.82 B tokens/day for this rung. This config batches by document count
-(`SAMPLES_PER_BATCH`, the `torch` loader), so tokens per step vary with document
-length -- it is not the 262144-token fixed budget the pipeline configs use, and a
-step count here does not convert to tokens without measuring.
+At the measured 13.82 B tokens/day for this rung, 100k steps of 262144 tokens is 26.2B
+tokens in a little under two days, or ~1.25 raw weighted passes of the corpus.
 
 **bf16 parameters, not fp16.** Gradients here are ~1.26e-7 RMS and `dpre` is stored in
 the parameter dtype, so fp16 flushes 18.9% of its entries to zero against bf16's none.
@@ -39,10 +37,15 @@ SOURCES = [
     {"name": "cc12m", "repeat": 1},
     {"name": "nozomi", "repeat": 1},
 ]
-MAX_LENGTH = 2048
-SAMPLES_PER_BATCH = 64
-NUM_WORKERS = 24
-PREFETCH_FACTOR = 6
+RENDERER = "tipo"
+LOADER_KIND = "iterative"
+LOADER_KWARGS = {
+    "k": 262144,
+    "ctx_max": 2048,
+    "num_workers": 12,
+    "prefetch_factor": 4,
+    "batches_per_epoch": 100_000,
+}
 
 GPUS = [0, 1, 2, 3]
 GRAD_ACC = 1

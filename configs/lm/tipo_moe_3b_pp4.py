@@ -30,10 +30,6 @@ SOURCES = [
     {"name": "cc12m", "repeat": 1},
     {"name": "nozomi", "repeat": 1},
 ]
-MAX_LENGTH = 2048
-NUM_WORKERS = 16
-PREFETCH_FACTOR = 4
-
 GPUS = [0, 1, 2, 3]
 PARALLEL = "pipeline"
 PIPELINE_KWARGS = {

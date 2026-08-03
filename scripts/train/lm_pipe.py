@@ -194,6 +194,20 @@ def build_stream(ranks, tokenizer):
         raise ValueError(
             f"DATA_KIND must be 'corpus' or 'synthetic', got {DATA_KIND!r}"
         )
+    # The corpus keeps growing while a run trains, so the shard view is pinned
+    # once and reused on resume. See docs/internals/data.md.
+    snapshot = None
+    if any("/" in spec["name"] for spec in SOURCES):
+        from kohakuwullm.data.sources.corpus import read_manifest, write_manifest
+
+        path = os.path.join(CKPT_DIR, "corpus-manifest.json") if CKPT_DIR else ""
+        if path and os.path.exists(path):
+            snapshot = read_manifest(path)["sources"]
+            log.info("corpus manifest reused", path=path, sources=len(snapshot))
+        elif path and ranks.rank == 0:
+            snapshot = write_manifest(SOURCES, path)["sources"]
+            log.info("corpus manifest written", path=path, sources=len(snapshot))
+
     # rank/world_size describe the *data-parallel* group; a pure pipeline has
     # none, so every rank iterates the identical stream.
     loader = build_loader(
@@ -208,6 +222,7 @@ def build_stream(ranks, tokenizer):
             "seed": SEED,
             "rank": 0,
             "world_size": 1,
+            "snapshot": snapshot,
             **LOADER_KWARGS,
         },
     )
