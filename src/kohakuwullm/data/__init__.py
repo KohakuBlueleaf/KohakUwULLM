@@ -16,7 +16,6 @@ from kohakuwullm.data.loader.iterative import (
     TokenBudgetIterableDataset,
     build_iterative_loader,
     pack_to_budget,
-    shard_indices,
 )
 from kohakuwullm.data.loader.microbatch import (
     MicroBatchedDataset,
@@ -28,6 +27,7 @@ from kohakuwullm.data.loader.padded import (
     padding_fraction,
     split_padded,
 )
+from kohakuwullm.data.loader.permute import ShardIndices, held_out, shard_indices
 from kohakuwullm.data.loader.resume import (
     ResumableLoader,
     ResumablePackedDataset,
@@ -263,6 +263,8 @@ __all__ = [
     "TokenBudgetIterableDataset",
     "pack_to_budget",
     "shard_indices",
+    "ShardIndices",
+    "held_out",
     "BatchRenderedDataset",
     "GroupSampler",
     "split_padded",

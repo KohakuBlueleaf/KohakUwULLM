@@ -14,10 +14,10 @@ from collections import deque
 from collections.abc import Iterable, Iterator
 from itertools import chain
 
-import numpy as np
 import torch.utils.data as data
 
 from kohakuwullm.data.filters import build_filter
+from kohakuwullm.data.loader.permute import ShardIndices
 from kohakuwullm.data.packing import PackedBatch, collate_packed, encode_sample
 
 
@@ -85,40 +85,6 @@ def pack_to_budget(
             yield batch
         if exhausted and not carry:
             return
-
-
-def held_out(indices: np.ndarray, seed: int, val_frac: float) -> np.ndarray:
-    """Boolean mask of the validation side, from the index alone.
-
-    Epoch-independent by construction, so the split cannot drift between
-    epochs. See docs/internals/data.md.
-    """
-    x = indices.astype(np.uint64) ^ np.uint64(seed & 0xFFFFFFFF)
-    x = (x * np.uint64(0x9E3779B97F4A7C15)) & np.uint64(0xFFFFFFFFFFFFFFFF)
-    x ^= x >> np.uint64(29)
-    x = (x * np.uint64(0xBF58476D1CE4E5B9)) & np.uint64(0xFFFFFFFFFFFFFFFF)
-    x ^= x >> np.uint64(32)
-    return (x % np.uint64(1_000_000)) < np.uint64(int(val_frac * 1_000_000))
-
-
-def shard_indices(
-    n: int,
-    shard_id: int,
-    num_shards: int,
-    seed: int,
-    epoch: int,
-    val_frac: float = 0.0,
-    split: str = "train",
-) -> np.ndarray:
-    """Indices owned by one shard: a shared permutation of ``(seed, epoch)``,
-    strided. See docs/internals/data.md."""
-    order = np.random.default_rng((seed, epoch)).permutation(
-        np.arange(n, dtype=np.int64 if n > 2**31 else np.int32)
-    )
-    if val_frac > 0.0:
-        mask = held_out(order, seed, val_frac)
-        order = order[mask if split == "val" else ~mask]
-    return np.ascontiguousarray(order[shard_id::num_shards])
 
 
 class TokenBudgetIterableDataset(data.IterableDataset):
@@ -263,7 +229,7 @@ class TokenBudgetIterableDataset(data.IterableDataset):
         epoch = self.epoch + self._pass
         self._pass += 1
 
-        indices = shard_indices(
+        indices = ShardIndices(
             len(self.records),
             shard_id,
             num_shards,
