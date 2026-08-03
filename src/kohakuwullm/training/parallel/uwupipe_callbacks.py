@@ -5,6 +5,7 @@ a tokenizer or a sampler lives here. See docs/internals/pipeline.md.
 """
 
 import time
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -91,6 +92,8 @@ class SamplePreview(Callback):
         min_p: float = 0.0,
         local: bool = True,
         forward_only: bool = True,
+        from_batch: int = 0,
+        prefix_frac: float = 0.25,
     ) -> None:
         self.module = module
         self.tokenizer = tokenizer
@@ -109,6 +112,9 @@ class SamplePreview(Callback):
         self.min_p = min_p
         self.local = local
         self.forward_only = forward_only
+        self.from_batch = from_batch
+        self.prefix_frac = prefix_frac
+        self._batch_rows: list | None = None
         self._generator = None
         self._local_model = None
 
@@ -116,6 +122,20 @@ class SamplePreview(Callback):
         first = self.at_start and batch_idx == 0
         if not first and (self.every_n_steps <= 0 or out.index % self.every_n_steps):
             return
+        self._batch_rows = None
+        if self.from_batch and batch is not None:
+            from kohakuwullm.data.preview import prompts_from_batch
+
+            try:
+                self._batch_rows = prompts_from_batch(
+                    batch,
+                    self.tokenizer,
+                    count=self.from_batch,
+                    prefix_frac=self.prefix_frac,
+                    seed=out.index,
+                )
+            except Exception as exc:
+                warnings.warn(f"batch preview unavailable: {exc}", stacklevel=2)
         self.preview(loop, out.index)
 
     def preview(self, loop, step: int) -> None:
@@ -130,8 +150,14 @@ class SamplePreview(Callback):
         rows = []
         stops: list[tuple[int, bool]] = []
         gathered = self._gathered(loop) if self.local else None
+        rows_in = (
+            [(n, t) for n, t, _ in self._batch_rows]
+            if self._batch_rows
+            else self.prompts
+        )
+        references = {n: r for n, _, r in self._batch_rows} if self._batch_rows else {}
         bar = tqdm(
-            self.prompts,
+            rows_in,
             desc=f"preview@{step}",
             unit="prompt",
             leave=False,
@@ -162,14 +188,11 @@ class SamplePreview(Callback):
                     hit = eos is not None and eos in body
                     kept = body[: body.index(eos)] if hit else body
                     stops.append((len(kept), hit))
-                    rows.append(
-                        (
-                            name,
-                            text,
-                            index,
-                            self.tokenizer.decode(kept, skip_special_tokens=True),
-                        )
-                    )
+                    generated = self.tokenizer.decode(kept, skip_special_tokens=True)
+                    reference = references.get(name)
+                    if reference is not None:
+                        generated = f"{generated}\n--- TRUE ---\n{reference}"
+                    rows.append((name, text, index, generated))
         finally:
             bar.close()
             loop.stage_module.train(was_training)

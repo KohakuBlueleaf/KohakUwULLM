@@ -277,11 +277,38 @@ class LMStage(nn.Module):
         ]
         if not ratios:
             return {}
+        # Columns are (max/mean, min/mean, dead). See docs/internals/pipeline.md.
         stacked = torch.stack(ratios)
+        high, low, dead = stacked[:, 0], stacked[:, 1], stacked[:, 2]
         return {
-            "moe/load_imbalance_max": stacked.max(),
-            "moe/load_imbalance_mean": stacked.mean(),
+            "moe/load_imbalance_max": high.max(),
+            "moe/load_imbalance_mean": high.mean(),
+            "moe/load_starved_min": low.min(),
+            "moe/dead_experts_max": dead.max(),
+            "moe/dead_experts_total": dead.sum(),
         }
+
+    def router_health(self) -> dict[str, torch.Tensor]:
+        """Router collapse statistics; weights only, no data. Per step is fine."""
+        from kohakuwullm.training.loop.health import router_similarity
+
+        sims, spreads = [], []
+        for block in self.blocks:
+            router = getattr(block.mlp, "router", None)
+            if router is None:
+                continue
+            weight = getattr(router, "weight", None)
+            if weight is not None:
+                sims.append(router_similarity(weight.detach()))
+            bias = getattr(router, "expert_bias", None)
+            if bias is not None:
+                spreads.append(float(bias.max() - bias.min()))
+        out = {}
+        if sims:
+            out["moe/router_sim_max"] = torch.tensor(max(sims))
+        if spreads:
+            out["moe/expert_bias_spread"] = torch.tensor(max(spreads))
+        return out
 
     def bias_update_rate(self) -> float | None:
         """The balancing step size this stage's routers currently hold.

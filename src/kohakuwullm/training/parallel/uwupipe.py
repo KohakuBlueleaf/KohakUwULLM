@@ -290,4 +290,6 @@ class LMPipelineModule(PipelineModule):
         """Refresh the fp8 copies and advance the routers; both per step."""
         if self.mxfp8_modules:
             refresh_mxfp8_weights(self.inner)
-        return self.inner.update_router_bias()
+        metrics = self.inner.update_router_bias()
+        metrics.update(self.inner.router_health())
+        return metrics
