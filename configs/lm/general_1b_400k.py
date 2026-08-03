@@ -60,17 +60,20 @@ ARCH_OVERRIDES = {
     "qk_norm": True,
     # A tied head cannot span two ranks; the stage would untie it and warn.
     "tie_embeddings": False,
+    # 1.21x throughput and half the peak memory at a fixed shape; the memory is
+    # what lets the microbatch below be 16384. See docs/internals/mxfp8.md.
+    "mxfp8": True,
 }
 # Aux-loss-free balancing carries the load; no head z-loss, which costs 1.59x
 # end to end. See docs/internals/moe-router-loss.md.
 AUX_LOSS_WEIGHT = 0.0
 ROUTER_Z_LOSS_WEIGHT = 0.0
 
-# Corpus documents average ~870 tokens against TIPO's ~195, and packed varlen
-# activation scales with the sum of squared document lengths, so the same token
-# budget costs several times the memory. 8192 x 32 keeps 262144 tokens/step.
-MICRO_TOKENS = 8192
-NUM_MICROBATCHES = 32
+# 262144 tokens/step either way. Measured over 60 steps: 16384 x 16 runs at
+# 255.9k tok/s against 8192 x 32's 232.1k, the wider microbatch outweighing its
+# larger 1F1B bubble. Peak is 16.0 GiB of 31.4.
+MICRO_TOKENS = 16384
+NUM_MICROBATCHES = 16
 LAYERS = []
 SCHEDULE = "1f1b"
 PARAM_DTYPE = "fp16"
