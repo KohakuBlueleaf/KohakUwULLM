@@ -14,23 +14,41 @@ from kohakuwullm.data.sources.corpus import CorpusRecords
 FILLER_MIN_TOKENS = 32
 
 
+def _batch_fields(batch):
+    """``(tokens, labels, [SeqInfo])`` from a packed batch, a step, or a pipeline step.
+
+    Accepts all three field spellings the trainers use: ``PackedBatch.seq_info``,
+    ``MicroBatchedStep.seq_infos``, and ``PipelineStep``'s
+    ``inputs`` / ``target`` / ``layout``.
+    """
+    tokens = getattr(batch, "tokens", None)
+    if tokens is None:
+        tokens, labels = batch.inputs, batch.target
+    else:
+        labels = batch.labels
+    infos = getattr(batch, "seq_infos", None)
+    if infos is None:
+        infos = getattr(batch, "layout", None)
+    if infos is None:
+        infos = batch.seq_info
+    if not isinstance(infos, (list, tuple)):
+        infos = [infos]
+    return tokens, labels, list(infos)
+
+
 def _documents(batch):
     """``[(tokens, labels)]`` per document, from a packed batch or a step."""
-    seq_infos = getattr(batch, "seq_infos", None)
-    if seq_infos is None:
-        seq_infos = [batch.seq_info]
-        width = int(batch.tokens.numel())
-    else:
-        width = int(batch.microbatch_tokens)
+    tokens, labels, infos = _batch_fields(batch)
+    width = int(tokens.numel()) // len(infos)
     out = []
-    for micro, info in enumerate(seq_infos):
+    for micro, info in enumerate(infos):
         base = micro * width
         bounds = info.cu_seqlens.tolist()
         for start, stop in zip(bounds, bounds[1:]):
             out.append(
                 (
-                    batch.tokens[base + start : base + stop],
-                    batch.labels[base + start : base + stop],
+                    tokens[base + start : base + stop],
+                    labels[base + start : base + stop],
                 )
             )
     return out
