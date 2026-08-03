@@ -173,19 +173,26 @@ class _ChunkedLinearCE(torch.autograd.Function):
         ctx.ignore_index = ignore_index
         ctx.plan = plan
         ctx.consumed = False
+        ctx.grads = None
         return loss
 
     @staticmethod
     def backward(ctx, dloss):
         x, weight, target, lse, cache = ctx.saved_tensors
         plan = ctx.plan
-        # The epilogue overwrites cached tiles through a raw Triton pointer, which
-        # does not bump autograd's version counter.
-        if plan.cached and ctx.consumed:
-            raise RuntimeError(
-                "chunked_linear_cross_entropy: backward called twice with "
-                "retain > 0; the cached logit tiles were consumed in place. "
-                "Use retain=0.0 if the graph must be replayed."
+        # A split backward asks for the input grad and the weight grad in two
+        # calls, and the epilogue has already overwritten the cached tiles by the
+        # end of the first. Both were computed then, so replay serves the cache.
+        if ctx.grads is not None:
+            dx_held, dw_held = ctx.grads
+            return (
+                dx_held if ctx.needs_input_grad[0] else None,
+                dw_held if ctx.needs_input_grad[1] else None,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
         ctx.consumed = True
         T, D = x.shape
@@ -243,15 +250,9 @@ class _ChunkedLinearCE(torch.autograd.Function):
                 if last_chunk:
                     dw[v0 : v0 + cols].copy_(acc)
 
-        return (
-            dx.to(x.dtype) if need_dx else None,
-            dw,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        dx_out = dx.to(x.dtype) if need_dx else None
+        ctx.grads = (dx_out, dw)
+        return (dx_out, dw, None, None, None, None, None)
 
 
 def chunked_linear_cross_entropy(

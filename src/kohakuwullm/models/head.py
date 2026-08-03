@@ -36,8 +36,8 @@ class LMHead(nn.Module):
         chunk: rows per logit tile for ``chunked_ce``.
         vocab_block: columns per logit tile; also bounds the fp32 ``dW``
             accumulator.
-        retain: fraction of forward logit tiles cached for backward. Any value
-            above 0 makes a second backward on the same graph raise.
+        retain: fraction of forward logit tiles cached for backward. A second
+            backward on the same graph replays from the cached gradients.
         compute_dtype: dtype the ``chunked_ce`` GEMMs run in.
     """
 

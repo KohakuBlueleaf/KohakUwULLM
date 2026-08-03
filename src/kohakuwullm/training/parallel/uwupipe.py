@@ -191,6 +191,8 @@ class LMPipelineModule(PipelineModule):
         self.loader = loader
         self.verify_data = verify_data
         self.inner: LMStage | None = None
+        # Keyed by stage index, so a rank holding several chunks keeps them apart.
+        self.inners: dict[int, LMStage] = {}
         self.mxfp8_modules = 0
 
     def configure_model(self, plan, rank, world, device):
@@ -220,6 +222,7 @@ class LMPipelineModule(PipelineModule):
             # In place, over the whole stage: one graph per rank.
             inner.compile(**self.compile_spec)
         self.inner = inner
+        self.inners[plan.index] = inner
         if self.autocast_dtype is None:
             return inner
         return AutocastStage(inner, dtype=self.autocast_dtype)
@@ -240,7 +243,8 @@ class LMPipelineModule(PipelineModule):
         hidden = torch.zeros(
             self.micro_tokens, self.config.dim, dtype=self.param_dtype, device=device
         )
-        if not self.inner.router_stream:
+        inner = self.inners.get(plan.index, self.inner)
+        if not inner.router_stream:
             return hidden
         return hidden, torch.zeros(1, dtype=torch.float32, device=device)
 
@@ -287,9 +291,23 @@ class LMPipelineModule(PipelineModule):
         self.loader.load_state_dict(checkpoint["loader"])
 
     def post_step(self, stage_module) -> dict[str, torch.Tensor]:
-        """Refresh the fp8 copies and advance the routers; both per step."""
-        if self.mxfp8_modules:
-            refresh_mxfp8_weights(self.inner)
-        metrics = self.inner.update_router_bias()
-        metrics.update(self.inner.router_health())
+        """Refresh the fp8 copies and advance the routers, over every chunk."""
+        metrics: dict[str, torch.Tensor] = {}
+        for index in sorted(self.inners):
+            inner = self.inners[index]
+            if self.mxfp8_modules:
+                refresh_mxfp8_weights(inner)
+            chunk = inner.update_router_bias()
+            chunk.update(inner.router_health())
+            for name, value in chunk.items():
+                # Several chunks report the same names; keep the worse reading.
+                metrics[name] = (
+                    value
+                    if name not in metrics
+                    else (
+                        torch.minimum(metrics[name], value)
+                        if name.endswith("_min")
+                        else torch.maximum(metrics[name], value)
+                    )
+                )
         return metrics

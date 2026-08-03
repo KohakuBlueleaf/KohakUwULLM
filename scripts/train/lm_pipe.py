@@ -51,6 +51,7 @@ from kohakuwupipe import (
     init_pipeline,
     shutdown,
 )
+from kohakuwupipe.training.trainer import stages_per_rank
 
 torch.set_float32_matmul_precision("high")
 log = get_logger("lm_pipe")
@@ -95,6 +96,8 @@ LAYERS: list = []
 AUTOTUNE = True
 AUTOTUNE_DOC_LEN = 325
 SCHEDULE = "1f1b"
+# Chunks per rank for the interleaved schedules; the "v" ones always take two.
+VIRTUAL_STAGES = 2
 PARAM_DTYPE = "bf16"
 AUTOCAST_DTYPE = "bf16"
 MXFP8 = False
@@ -367,7 +370,7 @@ def main() -> None:
             log.info(costs.summary())
     plans = plan_for(
         config,
-        ranks.world,
+        ranks.world * stages_per_rank(SCHEDULE, virtual=VIRTUAL_STAGES),
         seq_len=MICRO_TOKENS,
         layers=LAYERS or None,
         costs=costs,

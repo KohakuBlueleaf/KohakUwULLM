@@ -136,6 +136,32 @@ class PipelineModule(nn.Module):
         )
         return self.stage_module
 
+    def setup_chunks(self, plans, rank: int, world: int, device) -> nn.Module:
+        """Build every chunk this rank owns, held behind one :class:`ChunkedStage`.
+
+        ``plans`` is this rank's own subset, ascending by stage index. The
+        returned module is what the loop drives; the per-chunk modules stay
+        reachable as ``.chunks``.
+        """
+        from kohakuwupipe.training.chunks import ChunkedStage
+
+        self.plan = plans[0]
+        self.plans_local = list(plans)
+        self.rank = rank
+        self.world = world
+        chunks = [self.configure_model(plan, rank, world, device) for plan in plans]
+        self.stage_module = ChunkedStage(chunks, plans)
+        for plan, chunk in zip(plans, chunks):
+            log.info(
+                "chunk built",
+                stage=plan.index,
+                layers=f"{plan.start_layer}..{plan.end_layer - 1}",
+                first=plan.is_first,
+                last=plan.is_last,
+                params=sum(p.numel() for p in chunk.parameters()),
+            )
+        return self.stage_module
+
     def forward(self, *args, **kwargs):
         """Delegates to the stage, so the module is usable as one."""
         return self.stage_module(*args, **kwargs)

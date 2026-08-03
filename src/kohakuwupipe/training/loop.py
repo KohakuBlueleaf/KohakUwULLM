@@ -111,6 +111,8 @@ class PipelineLoop:
         grad_clip: float = 0.0,
         post_step: Callable[[Any], dict[str, torch.Tensor]] | None = None,
         callbacks: Iterable[Callback] = (),
+        is_first: bool | None = None,
+        is_last: bool | None = None,
     ) -> None:
         self.stage_module = stage_module
         self.schedule = schedule
@@ -136,8 +138,10 @@ class PipelineLoop:
         self.tokens_trained = 0
         self._elapsed_offset = 0.0
         self._clock_start: float | None = None
-        self.is_first = rank == 0
-        self.is_last = rank == world - 1
+        # Which ends this rank carries. Under a V placement one rank holds both,
+        # so neither follows from the rank. See docs/kohakuwupipe/schedules.md.
+        self.is_first = (rank == 0) if is_first is None else bool(is_first)
+        self.is_last = (rank == world - 1) if is_last is None else bool(is_last)
         self._set_layout = getattr(stage_module, "set_seq_info", None)
         self.module = None
 
