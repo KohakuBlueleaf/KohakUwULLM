@@ -43,6 +43,7 @@ from kohakuwullm.data.packing import (
     encode_sample,
     split_packed,
 )
+from kohakuwullm.data.renderers.chatml import ChatMLRenderer, QAChatMLRenderer
 from kohakuwullm.data.renderers.plain import ChatRenderer, PlainRenderer
 from kohakuwullm.data.renderers.tipo import SPECIAL_TOKENS, TIPORenderer
 from kohakuwullm.data.sources.corpus import CorpusRecords
@@ -87,6 +88,25 @@ def build_dataset(
     return WeightedConcatDataset(datasets, repeats)
 
 
+RENDER_KEY = "__render__"
+
+
+@RENDERER.register("per_source")
+class PerSourceRenderer:
+    """Render each record with the renderer its source spec named.
+
+    ``build_records`` stamps the resolved callable under ``RENDER_KEY``; records
+    from a source that named none fall back to ``default``.
+    """
+
+    def __init__(self, default="plain") -> None:
+        self.default = build(default, RENDERER)
+
+    def __call__(self, rec: dict, rng=None, **kwargs) -> tuple[str, str]:
+        render_fn = rec.get(RENDER_KEY, self.default)
+        return render_fn(rec, rng=rng, **kwargs)
+
+
 class _Fraction:
     """The evenly-strided first ``frac`` of a source, as a view.
 
@@ -116,12 +136,16 @@ class _ConcatRepeated:
 
     def __init__(self, sources: list[dict], root: str, snapshot=None) -> None:
         self.parts = []
+        self.renderers = []
         snapshot = snapshot or {}
         bounds = [0]
         for spec in sources:
             opts = dict(spec)
             name = opts.pop("name")
             repeat = float(opts.pop("repeat", 1))
+            # Resolved here, never per record: one callable per part.
+            render = opts.pop("renderer", None)
+            render_fn = build(render, RENDERER) if render else None
             if repeat <= 0:
                 continue
             if name in snapshot:
@@ -130,12 +154,15 @@ class _ConcatRepeated:
             whole, frac = int(repeat), repeat - int(repeat)
             for _ in range(whole):
                 self.parts.append(source)
+                self.renderers.append(render_fn)
                 bounds.append(bounds[-1] + len(source))
             if frac > 1e-9:
                 part = _Fraction(source, frac)
                 self.parts.append(part)
+                self.renderers.append(render_fn)
                 bounds.append(bounds[-1] + len(part))
         self.bounds = bounds
+        self.mixed = any(fn is not None for fn in self.renderers)
 
     def __len__(self) -> int:
         return self.bounds[-1]
@@ -144,7 +171,14 @@ class _ConcatRepeated:
         if index < 0:
             index += len(self)
         part = bisect.bisect_right(self.bounds, index) - 1
-        return self.parts[part][index - self.bounds[part]]
+        record = self.parts[part][index - self.bounds[part]]
+        render_fn = self.renderers[part]
+        if render_fn is None or record is None:
+            return record
+        # Copied, not mutated: a source may hand back a cached dict.
+        tagged = dict(record)
+        tagged[RENDER_KEY] = render_fn
+        return tagged
 
 
 def build_records(sources: list[dict], root: str = DEFAULT_ROOT, snapshot=None):
@@ -239,6 +273,10 @@ __all__ = [
     "CorpusRecords",
     "PlainRenderer",
     "build_records",
+    "ChatMLRenderer",
+    "QAChatMLRenderer",
+    "PerSourceRenderer",
+    "RENDER_KEY",
     "load_records",
     "DanbooruRecords",
     "PathKeyedRecords",
