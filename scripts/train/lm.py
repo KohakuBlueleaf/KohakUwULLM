@@ -136,7 +136,10 @@ BASE_DIM = 256
 # Scheduler (AnySchedule)
 # ===================================================================== #
 SCHEDULER_CONFIG = {"lr": {"mode": "cosine", "min_value": 0.1, "end": -1}}
+# Warmup is a fixed step count, not a fraction of the run: SCHED_WARMUP_STEPS
+# wins over the ratio. See docs/guides/training.md.
 SCHED_WARMUP_RATIO = 0.01
+SCHED_WARMUP_STEPS: int | None = None
 
 # ===================================================================== #
 # Runtime
@@ -306,7 +309,10 @@ def main():
     steps_per_epoch = _steps_per_epoch(train_loader, gpu_count)
     train_steps = steps_per_epoch * EPOCH if MAX_STEPS < 0 else MAX_STEPS
     autofill_schedule_steps(
-        SCHEDULER_CONFIG["lr"], train_steps, warmup_ratio=SCHED_WARMUP_RATIO
+        SCHEDULER_CONFIG["lr"],
+        train_steps,
+        warmup_ratio=SCHED_WARMUP_RATIO,
+        warmup_steps=SCHED_WARMUP_STEPS,
     )
 
     preset = None if PRESET in (None, "None") else PRESET

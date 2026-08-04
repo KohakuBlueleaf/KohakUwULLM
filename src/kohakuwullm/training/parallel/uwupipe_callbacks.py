@@ -6,17 +6,27 @@ a tokenizer or a sampler lives here. See docs/internals/pipeline.md.
 
 import time
 import warnings
+from collections import deque
 
 import torch
 import torch.distributed as dist
 from anyschedule.utils import get_scheduler
 from tqdm.auto import tqdm
 
-from kohakuwullm.data.renderers.chatml import TURN_END
+from kohakuwullm.data.preview import prompts_from_batch
+from kohakuwullm.data.renderers.chatml import (
+    ASSISTANT_OPEN,
+    TURN_CLOSE,
+    TURN_END,
+    TURN_OPEN,
+)
 from kohakuwullm.generation import LocalGenerator, build_generator
 from kohakuwullm.models import LMBackbone
 from kohakuwullm.training.parallel.pipeline_lightning import decode_stage
 from kohakuwupipe import Callback
+
+VALIDATE_PROMPT = TURN_OPEN.format(role="user") + "hello" + TURN_CLOSE + ASSISTANT_OPEN
+VALIDATE_TOKENS = 32
 
 
 class RouterBiasSchedule(Callback):
@@ -65,7 +75,9 @@ class SamplePreview(Callback):
         prompts: ``(name, text)`` pairs; each is sampled ``samples`` times.
         samples: rows generated per prompt, and the decode batch width.
         every_n_steps: cadence; 0 disables.
-        at_start: also preview on the first step, before any training.
+        at_start: run one throwaway prompt before any training, reported
+            nowhere: a decode path that is broken should say so in seconds
+            rather than at the first real preview.
         report: ``(step, rows) -> None`` on rank 0, where a row is
             ``(name, prompt, index, text)``. The text is never logged.
         local: gather the whole model and decode on one card. Off falls back to
@@ -125,6 +137,7 @@ class SamplePreview(Callback):
         self.prefix_tokens = prefix_tokens
         self.turns_only = turns_only
         self._batch_rows: list | None = None
+        self._pool: deque = deque(maxlen=max(2 * from_batch, 1))
         self._generator = None
         self._local_model = None
         self._stops: list[int] | None = None
@@ -133,29 +146,45 @@ class SamplePreview(Callback):
         first = self.at_start and batch_idx == 0
         if not first and (self.every_n_steps <= 0 or out.index % self.every_n_steps):
             return
-        self._batch_rows = None
-        if self.from_batch and batch is not None:
-            from kohakuwullm.data.preview import prompts_from_batch
+        if first:
+            self.preview(loop, out.index, validate=True)
+            return
+        self._batch_rows = self._take_rows(batch, out.index)
+        self.preview(loop, out.index)
 
+    def _take_rows(self, batch, step: int) -> list:
+        """``from_batch`` turn cuts, newest first, over a pool of leftovers.
+
+        The pool is topped up from this batch and drained from its newest end, so
+        a batch that yields fewer cuts than asked is covered by earlier ones
+        instead of shrinking the preview.
+        """
+        if not self.from_batch:
+            return []
+        if batch is not None:
             try:
-                self._batch_rows = prompts_from_batch(
-                    batch,
-                    self.tokenizer,
-                    count=self.from_batch,
-                    prefix_frac=self.prefix_frac,
-                    max_prefix_tokens=self.prefix_tokens,
-                    turns_only=self.turns_only,
-                    seed=out.index,
+                self._pool.extend(
+                    prompts_from_batch(
+                        batch,
+                        self.tokenizer,
+                        count=self._pool.maxlen,
+                        prefix_frac=self.prefix_frac,
+                        max_prefix_tokens=self.prefix_tokens,
+                        turns_only=self.turns_only,
+                        seed=step,
+                    )
                 )
             except Exception as exc:
                 warnings.warn(f"batch preview unavailable: {exc}", stacklevel=2)
-        self.preview(loop, out.index)
+        take = min(self.from_batch, len(self._pool))
+        return [self._pool.pop() for _ in range(take)]
 
-    def preview(self, loop, step: int) -> None:
+    def preview(self, loop, step: int, validate: bool = False) -> None:
         """Generate every prompt and report on rank 0. Collective; every rank calls.
 
         ``local`` decodes on rank 0 after one gather; otherwise every rank runs
-        one pipelined decode round per prompt. See docs/guides/generation.md.
+        one pipelined decode round per prompt. ``validate`` runs one throwaway
+        prompt and reports nothing. See docs/guides/generation.md.
         """
         began = time.perf_counter()
         was_training = loop.stage_module.training
@@ -164,14 +193,19 @@ class SamplePreview(Callback):
         stops: list[tuple[int, bool]] = []
         stop_ids = self._stop_ids()
         gathered = self._gathered(loop) if self.local else None
-        # Batch rows are turn cuts, so the fixed prompts stay: they are the only
-        # coverage of the TIPO half, which carries no turns.
-        rows_in = [(n, t, None) for n, t in self.prompts]
-        rows_in += [(n, t, i) for n, t, i, _ in self._batch_rows or []]
-        references = {n: r for n, _, _, r in self._batch_rows or []}
+        if validate:
+            rows_in = [("validate", VALIDATE_PROMPT, None)]
+            references = {}
+        else:
+            # Batch rows are turn cuts, so the fixed prompts stay: they are the
+            # only coverage of the TIPO half, which carries no turns.
+            rows_in = [(n, t, None) for n, t in self.prompts]
+            rows_in += [(n, t, i) for n, t, i, _ in self._batch_rows or []]
+            references = {n: r for n, _, _, r in self._batch_rows or []}
+        budget = VALIDATE_TOKENS if validate else self.max_new_tokens
         bar = tqdm(
             rows_in,
-            desc=f"preview@{step}",
+            desc=f"{'validate' if validate else 'preview'}@{step}",
             unit="prompt",
             leave=False,
             disable=None if self.ranks.rank == 0 else True,
@@ -185,7 +219,7 @@ class SamplePreview(Callback):
                 generator = gathered or self._build()
                 tokens = generator.generate(
                     prompt_ids.to(self.ranks.device),
-                    max_new_tokens=self.max_new_tokens,
+                    max_new_tokens=budget,
                     temperature=self.temperature,
                     top_p=self.top_p,
                     top_k=self.top_k,
@@ -212,13 +246,14 @@ class SamplePreview(Callback):
             lengths = [n for n, _ in stops]
             on_eos = sum(hit for _, hit in stops)
             print(
-                f"[preview@{step}] {time.perf_counter() - began:.2f}s "
+                f"[{'validate' if validate else 'preview'}@{step}] "
+                f"{time.perf_counter() - began:.2f}s "
                 f"local={self.local} rows={len(stops)} "
                 f"len min/med/max={min(lengths)}/{sorted(lengths)[len(lengths) // 2]}/"
                 f"{max(lengths)} eos={on_eos}/{len(stops)}",
                 flush=True,
             )
-        if self.ranks.rank == 0 and self.report is not None:
+        if self.ranks.rank == 0 and self.report is not None and not validate:
             self.report(step, rows)
 
     def _gathered(self, loop):
@@ -254,8 +289,14 @@ class SamplePreview(Callback):
         return row.unsqueeze(0).expand(self.samples, -1).contiguous()
 
     def _encode(self, text: str) -> torch.Tensor:
-        """Tokenize one prompt into the decode batch's shape."""
-        return self._rows(self.tokenizer(text)["input_ids"])
+        """Tokenize one prompt, with BOS, into the decode batch's shape.
+
+        Prepended here rather than left to ``add_bos_token``, which a fast
+        tokenizer with no template post-processor ignores.
+        """
+        ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
+        bos = self.tokenizer.bos_token_id
+        return self._rows(([bos] if bos is not None else []) + ids)
 
     def _stop_ids(self) -> list[int]:
         """Document terminator, plus the turn terminator when the vocab has one."""

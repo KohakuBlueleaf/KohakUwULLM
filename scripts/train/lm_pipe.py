@@ -121,7 +121,10 @@ GRAD_CLIP = 1.0
 GRAD_SCALER = "auto"
 GRAD_SCALER_INIT = 65536.0
 SCHEDULER_CONFIG: dict = {"lr": {"mode": "cosine", "min_value": 0.1, "end": -1}}
+# Warmup is a fixed step count, not a fraction of the run: SCHED_WARMUP_STEPS
+# wins over the ratio. See docs/guides/training.md.
 SCHED_WARMUP_RATIO = 0.02
+SCHED_WARMUP_STEPS: int | None = None
 MAX_STEPS = 32
 SEED = 20090220
 
@@ -429,7 +432,12 @@ def main() -> None:
 
     stream, loader = build_stream(ranks, tokenizer, ckpt_dir)
     schedule_config = {
-        key: autofill_schedule_steps(dict(sub), MAX_STEPS, SCHED_WARMUP_RATIO)
+        key: autofill_schedule_steps(
+            dict(sub),
+            MAX_STEPS,
+            SCHED_WARMUP_RATIO,
+            warmup_steps=optional_int(SCHED_WARMUP_STEPS),
+        )
         for key, sub in SCHEDULER_CONFIG.items()
     }
     module = LMPipelineModule(

@@ -49,15 +49,21 @@ def autofill_schedule_steps(
     warmup_ratio: float = 0.0,
     end_from_steps: bool = True,
     warmup_from_steps: bool = True,
+    warmup_steps: int | None = None,
 ) -> dict:
     """Fill AnySchedule ``end`` / ``warmup`` from a computed ``train_steps``.
 
+    ``warmup_steps`` is an absolute count and wins over ``warmup_ratio``.
     Mutates and returns the dict.
     """
     if end_from_steps:
         scheduler_config["end"] = train_steps
     if warmup_from_steps:
-        warmup = int(train_steps * warmup_ratio)
+        warmup = (
+            int(warmup_steps)
+            if warmup_steps is not None
+            else int(train_steps * warmup_ratio)
+        )
         # A composer takes its warmup on the first phase. See docs/guides/training.md.
         phases = scheduler_config.get("schedules")
         if scheduler_config.get("mode") == "composer" and phases:

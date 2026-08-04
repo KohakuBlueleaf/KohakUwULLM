@@ -17,6 +17,7 @@ from kohakuwullm.models.components.seqinfo import SeqInfo
 from kohakuwullm.utils import count_active_parameters, count_parameters
 from kohakuwupipe.parallel.plan import (
     StagePlan,
+    partition_v,
     plan_from_layers,
     plan_stages,
 )
@@ -147,6 +148,7 @@ def plan_for(
     head_scale: float | None = None,
     layers=None,
     costs=None,
+    style: str | None = None,
 ):
     """The stage split for ``config``.
 
@@ -170,6 +172,17 @@ def plan_for(
             raise ValueError(f"layers {counts} is not {num_stages} stages")
         return plan_from_layers(
             counts, layer_cost=layer_cost, head_cost=head_cost, plan_cls=LMStagePlan
+        )
+    embed_cost = getattr(costs, "embed", 0.0) if costs is not None else 0.0
+    if style == "v":
+        bounds = partition_v(
+            config.depth, num_stages // 2, layer_cost, head_cost, embed_cost=embed_cost
+        )
+        return plan_from_layers(
+            [bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1)],
+            layer_cost=layer_cost,
+            head_cost=head_cost,
+            plan_cls=LMStagePlan,
         )
     return plan_stages(
         depth=config.depth,

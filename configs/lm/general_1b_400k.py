@@ -100,14 +100,16 @@ SCHEDULER_CONFIG = {
         ],
     }
 }
-SCHED_WARMUP_RATIO = 0.02
+# Warmup is a fixed step count, not a fraction of the run; the 0.02 default would
+# be 8000 here. See docs/guides/training.md.
+SCHED_WARMUP_STEPS = 2000
 
 MAX_STEPS = 400_000
 SEED = 20090220
 
 CKPT_DIR = "out/ckpt/general-1b-400k"
 CKPT_INTERVAL = 2000
-NAME = "General-1B-400k"
+NAME = "KohakUwU-1B-A200M-general400k"
 WANDB_PROJECT = "KohakUwULLM"
 WANDB_OFFLINE = False
 
@@ -115,8 +117,8 @@ WANDB_OFFLINE = False
 # of its own loss mask: the prompt ends at <|im_start|>assistant and the
 # reference is that one reply.
 SAMPLE_INTERVAL = 2000
-SAMPLE_COUNT = 4
-SAMPLE_FROM_BATCH = 4
+SAMPLE_COUNT = 2
+SAMPLE_FROM_BATCH = 16
 SAMPLE_TURNS_ONLY = True
 SAMPLE_PREFIX_TOKENS = 1024
 SAMPLE_TOKENS = 256

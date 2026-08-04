@@ -99,6 +99,75 @@ def partition(
     return bounds
 
 
+def partition_v(
+    depth: int,
+    num_ranks: int,
+    layer_cost,
+    head_cost: float,
+    embed_cost: float = 0.0,
+    allow_empty: bool = True,
+) -> list[int]:
+    """Cut points for ``2 * num_ranks`` chunks placed in a V, balanced per rank.
+
+    A V pairs chunk ``i`` with chunk ``2 * num_ranks - 1 - i`` on one rank, so the
+    quantity to equalize is the pair's cost, not each chunk's. Rank 0 carries both
+    the embedding and the head and therefore holds the fewest layers.
+    See docs/kohakuwupipe/plan.md.
+    """
+    chunks = 2 * num_ranks
+    if depth < chunks and not allow_empty:
+        raise ValueError(f"cannot split {depth} layers across {chunks} chunks")
+    cost = _prefix(layer_cost, depth)
+    extra = [0.0] * num_ranks
+    extra[0] = head_cost + embed_cost
+
+    def counts_for(target: float) -> list[int] | None:
+        """Layers per rank under a per-rank ceiling, or ``None`` if it cannot hold."""
+        taken, at = [], 0
+        for rank in range(num_ranks):
+            budget = target - extra[rank]
+            if budget < 0:
+                return None
+            floor = 0 if allow_empty else 2
+            n = floor
+            while at + n < depth and cost[at + n + 1] - cost[at] <= budget:
+                n += 1
+            taken.append(n)
+            at += n
+        if at < depth:
+            return None
+        taken[-1] += depth - at
+        return taken
+
+    low, high = 0.0, cost[depth] + head_cost + embed_cost
+    for _ in range(64):
+        mid = (low + high) / 2
+        if counts_for(mid) is None:
+            low = mid
+        else:
+            high = mid
+    counts = counts_for(high)
+    if counts is None:
+        raise ValueError("no V split satisfies the per-rank ceiling")
+
+    # Each rank's layers split between its front chunk and its back chunk; the
+    # back one carries the head on rank 0, so the front takes the remainder.
+    # Rank 0's back chunk carries the head, so its layers go to the front chunk.
+    front, back = [], []
+    for rank, n in enumerate(counts):
+        half = n if rank == 0 else n // 2
+        front.append(half)
+        back.append(n - half)
+    bounds, at = [0], 0
+    for n in front:
+        at += n
+        bounds.append(at)
+    for n in reversed(back):
+        at += n
+        bounds.append(at)
+    return bounds
+
+
 def plan_stages(
     depth: int,
     num_stages: int,
