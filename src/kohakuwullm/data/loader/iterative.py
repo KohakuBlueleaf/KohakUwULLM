@@ -93,7 +93,7 @@ class TokenBudgetIterableDataset(data.IterableDataset):
     Args:
         records: record source (``__len__`` + ``__getitem__``), as in
             :mod:`kohakuwullm.data.sources.vault`.
-        renderer: callable ``(record, rng) -> (user_text, output_text)``.
+        renderer: callable ``(record, rng) -> `` rendered segments.
         tokenizer: a ``transformers`` tokenizer.
         k: per-batch token budget.
         m: "long content" threshold; also the bound on how far under ``k`` a
@@ -195,8 +195,8 @@ class TokenBudgetIterableDataset(data.IterableDataset):
             # Same derivation as RenderedDataset, so a given (seed, epoch,
             # index) renders the identical example in either path.
             rng = random.Random((self.seed * 1_000_003 + epoch) * 1_000_003 + index)
-            user, output = self.renderer(rec, rng=rng)
-            sample = encode_sample(self.tokenizer, user, output, self.ctx_max)
+            rendered = self.renderer(rec, rng=rng)
+            sample = encode_sample(self.tokenizer, rendered, self.ctx_max)
             if len(sample["input_ids"]) > 1:
                 sample["index"] = index
                 if outstanding is not None:

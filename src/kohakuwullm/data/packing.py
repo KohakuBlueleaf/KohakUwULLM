@@ -1,8 +1,9 @@
 """Tokenization, loss masking and varlen packing.
 
 Every sequence is concatenated into one flat token axis, with boundaries in a
-:class:`~kohakuwullm.models.components.seqinfo.SeqInfo`; nothing is padded. The
-user half of a sample is context, so its labels are ``-100``. See docs/internals/data.md.
+:class:`~kohakuwullm.models.components.seqinfo.SeqInfo`; nothing is padded. A
+renderer marks which spans carry loss, and the rest get ``-100``.
+See docs/internals/data.md.
 """
 
 import random
@@ -64,39 +65,72 @@ class PackedBatch:
         )
 
 
-def encode_sample(
+def as_segments(rendered) -> list[tuple[str, bool]]:
+    """A renderer's return value as ``[(text, is_target), ...]``.
+
+    Accepts the segment list itself, or the ``(user_text, output_text)`` pair
+    that the document renderers return.
+    """
+    if len(rendered) == 2 and isinstance(rendered[0], str):
+        user, output = rendered
+        return [(user, False), (output, True)]
+    return list(rendered)
+
+
+def nonempty_segments(rendered) -> list[tuple[str, bool]]:
+    """:func:`as_segments`, with the empty texts dropped."""
+    return [(text, bool(target)) for text, target in as_segments(rendered) if text]
+
+
+def assemble_sample(
     tokenizer,
-    user_text: str,
-    output_text: str,
+    segments: list[tuple[str, bool]],
+    pieces: list[list[int]],
     max_length: int = 2048,
     add_bos: bool = True,
     add_eos: bool = True,
 ) -> dict:
-    """Tokenize one ``(user, output)`` pair into ids + a loss mask.
+    """Concatenate pre-tokenized segments into ids + a per-token loss mask.
 
+    ``pieces`` holds the ids of each entry of ``segments``, in the same order.
     Returns ``input_ids`` and ``labels`` of equal length; ``labels`` is the
     **unshifted** target, and the shift happens at pack time.
     """
-    user_ids = (
-        tokenizer(user_text, add_special_tokens=False)["input_ids"] if user_text else []
-    )
-    out_ids = tokenizer(output_text, add_special_tokens=False)["input_ids"]
-
     ids: list[int] = []
+    labels: list[int] = []
     if add_bos and tokenizer.bos_token_id is not None:
         ids.append(tokenizer.bos_token_id)
-    prefix_len = len(ids) + len(user_ids)
-    ids.extend(user_ids)
-    ids.extend(out_ids)
+        labels.append(IGNORE_INDEX)
+    for (_, is_target), piece in zip(segments, pieces):
+        ids.extend(piece)
+        labels.extend(piece if is_target else [IGNORE_INDEX] * len(piece))
     if add_eos and tokenizer.eos_token_id is not None:
         ids.append(tokenizer.eos_token_id)
-    ids = ids[:max_length]
+        labels.append(tokenizer.eos_token_id)
+    return {"input_ids": ids[:max_length], "labels": labels[:max_length]}
 
-    labels = list(ids)
-    # The user half (and the BOS) is context: never a prediction target.
-    for i in range(min(prefix_len, len(labels))):
-        labels[i] = IGNORE_INDEX
-    return {"input_ids": ids, "labels": labels}
+
+def encode_sample(
+    tokenizer,
+    rendered,
+    max_length: int = 2048,
+    add_bos: bool = True,
+    add_eos: bool = True,
+) -> dict:
+    """Tokenize one rendered sample into ids + a per-token loss mask.
+
+    ``rendered`` is anything :func:`as_segments` accepts; each segment is
+    tokenized on its own, never sliced out of a whole-sample encoding.
+    """
+    segments = nonempty_segments(rendered)
+    pieces = (
+        tokenizer([text for text, _ in segments], add_special_tokens=False)["input_ids"]
+        if segments
+        else []
+    )
+    return assemble_sample(
+        tokenizer, segments, pieces, max_length, add_bos=add_bos, add_eos=add_eos
+    )
 
 
 class RenderedDataset(data.Dataset):
@@ -105,7 +139,8 @@ class RenderedDataset(data.Dataset):
     Args:
         records: any object with ``__len__`` and ``__getitem__`` returning a
             normalized record (see :mod:`kohakuwullm.data.sources.vault`).
-        renderer: callable ``(record, rng) -> (user_text, output_text)``.
+        renderer: callable ``(record, rng) -> `` anything :func:`as_segments`
+            accepts.
         tokenizer: a ``transformers`` tokenizer (used only to encode).
         max_length: truncate a single sample here.
         seed: base seed; the per-sample rng is derived from ``seed`` and the
@@ -144,8 +179,8 @@ class RenderedDataset(data.Dataset):
             # drops it.
             return {"input_ids": [], "labels": []}
         rng = random.Random((self.seed * 1_000_003 + self.epoch) * 1_000_003 + index)
-        user, output = self.renderer(rec, rng=rng)
-        return encode_sample(self.tokenizer, user, output, self.max_length)
+        rendered = self.renderer(rec, rng=rng)
+        return encode_sample(self.tokenizer, rendered, self.max_length)
 
 
 class WeightedConcatDataset(data.Dataset):

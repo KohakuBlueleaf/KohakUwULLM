@@ -14,9 +14,10 @@ import torch.utils.data as data
 
 from kohakuwullm.data.loader.padded import collate_padded
 from kohakuwullm.data.packing import (
-    IGNORE_INDEX,
     RenderedDataset,
+    assemble_sample,
     collate_packed,
+    nonempty_segments,
 )
 
 
@@ -28,7 +29,7 @@ class BatchRenderedDataset(data.Dataset):
 
     Args:
         records: record source (``__len__`` + ``__getitem__``).
-        renderer: ``(record, rng) -> (user, output)``.
+        renderer: ``(record, rng) -> `` rendered segments.
         tokenizer: a fast (Rust-backed) tokenizer.
         group_size: records rendered per item.
         max_length: truncation.
@@ -66,39 +67,39 @@ class BatchRenderedDataset(data.Dataset):
         return list(range(start, stop))
 
     def __getitem__(self, group: int) -> list[dict]:
-        """Render one group and encode it in two batched tokenizer calls."""
-        indices = self._indices(group)
-        users, outputs = [], []
-        for index in indices:
+        """Render one group and encode it in a single batched tokenizer call."""
+        rendered = []
+        for index in self._indices(group):
             rec = self.records[index]
             if rec is None:
                 continue
             rng = random.Random(
                 (self.seed * 1_000_003 + self.epoch) * 1_000_003 + index
             )
-            user, output = self.renderer(rec, rng=rng)
-            users.append(user)
-            outputs.append(output)
-        if not users:
+            rendered.append(nonempty_segments(self.renderer(rec, rng=rng)))
+        if not rendered:
             return []
 
-        # One batched call each, instead of two per sample.
-        user_ids = self.tokenizer(users, add_special_tokens=False)["input_ids"]
-        out_ids = self.tokenizer(outputs, add_special_tokens=False)["input_ids"]
+        # One batched call over every segment of the group, then regrouped.
+        texts = [text for segments in rendered for text, _ in segments]
+        pieces = (
+            self.tokenizer(texts, add_special_tokens=False)["input_ids"]
+            if texts
+            else []
+        )
 
-        bos = self.tokenizer.bos_token_id
-        eos = self.tokenizer.eos_token_id
-        samples = []
-        for u, o in zip(user_ids, out_ids):
-            ids = ([bos] if bos is not None else []) + u + o
-            if eos is not None:
-                ids = ids + [eos]
-            ids = ids[: self.max_length]
-            labels = list(ids)
-            prefix = (1 if bos is not None else 0) + len(u)
-            for i in range(min(prefix, len(labels))):
-                labels[i] = IGNORE_INDEX
-            samples.append({"input_ids": ids, "labels": labels})
+        samples, cursor = [], 0
+        for segments in rendered:
+            stop = cursor + len(segments)
+            samples.append(
+                assemble_sample(
+                    self.tokenizer,
+                    segments,
+                    pieces[cursor:stop],
+                    self.max_length,
+                )
+            )
+            cursor = stop
         return samples
 
 
