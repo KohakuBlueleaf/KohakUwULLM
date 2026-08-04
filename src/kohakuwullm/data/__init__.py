@@ -150,7 +150,8 @@ class _ConcatRepeated:
                 continue
             if name in snapshot:
                 opts["snapshot"] = snapshot[name]
-            source = load_records(name, root=root, **opts)
+            # A spec's own root wins: a corpus and a vault do not share one.
+            source = load_records(name, root=opts.pop("root", root), **opts)
             whole, frac = int(repeat), repeat - int(repeat)
             for _ in range(whole):
                 self.parts.append(source)

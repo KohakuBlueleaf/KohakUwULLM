@@ -1,9 +1,4 @@
-"""General-language pretrain on Kohaku-MoE-1B: 400k steps, ~105B tokens.
-
-The first general run. Code and math are deliberately absent -- both repos are
-gated, and outside guidance caps them near 1% of a general corpus anyway. See
-internal/general-pretrain-datasets.md for the mixture and
-internal/training-health-monitoring.md for what the metrics mean.
+"""General-language + TIPO pretrain on Kohaku-MoE-1B: 400k steps, ~104.6B tokens.
 
 Run::
 
@@ -14,31 +9,42 @@ Smoke, ten steps, no network::
     kogine run scripts/train/lm_pipe.py --config configs/lm/general_1b_400k.py \\
         --set MAX_STEPS=10 --set CKPT_INTERVAL=0 --set SAMPLE_INTERVAL=0
 
-Weights are derived by scripts/data/mixture.py from measured mean document
-length, so one pass delivers 104.9B tokens: en 68.1%, ja 22.7%, zh-TW 8.0%,
-stem 1.2%. Korean and the 15-language `multi` set are absent -- they had not
-finished converting, and this run validates the corpus path rather than the
-multilingual hypothesis. Re-derive after adding a source.
+General weights are derived by scripts/data/mixture.py against a 94.86B budget;
+TIPO adds 9.67B on top. Both DQA-shaped and TIPO sources render as ChatML, so
+16.9% of the run carries turn structure -- see internal/chat-template-design.md
+and internal/general-pretrain-datasets.md.
 """
 
 DATA_KIND = "corpus"
 DATA_ROOT = "/Iolite/text-dataset/_vault"
-RENDERER = "plain"
+# Per-source: a spec's own "renderer" wins, everything else falls back to plain.
+RENDERER = "per_source"
+# The TIPO vault does not live beside the text corpus.
+TIPO_ROOT = "/xg7/caption-datasets"
 
-# 400k steps x 262144 tokens = 104.9B; one pass over this list delivers it.
+# ChatML-rendered TIPO. The inner renderer must not fold its prompt into the
+# target, or the user turn renders empty.
+TIPO_CHAT = {
+    "name": "chatml",
+    "inner": {"name": "tipo", "train_on_input_prob": 0.0},
+}
+
+# 400k steps x 262144 tokens = 104.86B; one pass over this list delivers 104.57B.
 SOURCES = [
-    {"name": "en/nemotron-cc-v2.1-hq-syn", "repeat": 0.616},
     {"name": "en/nemotron-cc-v2.1-hq", "repeat": 1.000},
-    {"name": "ja/fineweb-2-edu-japanese-10bt", "repeat": 1.000},
-    {"name": "ja/fineweb-2-edu-japanese-extra", "repeat": 0.430},
-    {"name": "en/nemotron-cc-v2.1-hq-dqa", "repeat": 1.000},
+    {"name": "en/nemotron-cc-v2.1-hq-syn", "repeat": 0.256},
+    {"name": "multi/nemotron-cc-v2-trans-dqa", "repeat": 0.476},
+    {"name": "ja/fineweb-2-edu-japanese-10bt", "repeat": 0.601},
     {"name": "zh-tw/finepdfs-zh-zhtw", "repeat": 1.000},
     {"name": "zh-tw/ultra-fineweb-l3", "repeat": 1.000},
-    {"name": "en/nemotron-cc-v2.1-hq-trans", "repeat": 1.000},
-    {"name": "stem/nemotron-specialized", "repeat": 1.000},
     {"name": "zh-tw/wiki-zhtw", "repeat": 1.000},
-    {"name": "zh-tw/finepdfs-zh-zhtw-classical", "repeat": 1.000},
     {"name": "zh-tw/ptt-zhtw", "repeat": 1.000},
+    {"name": "en/nemotron-cc-v2.1-hq-dqa", "repeat": 1.000, "renderer": "qa_chatml"},
+    {"name": "ko/hplt3-kor-hang", "repeat": 0.191},
+    {"name": "stem/nemotron-specialized", "repeat": 1.000},
+    {"name": "danbooru", "repeat": 2, "renderer": TIPO_CHAT, "root": TIPO_ROOT},
+    {"name": "coyo11m", "repeat": 1, "renderer": TIPO_CHAT, "root": TIPO_ROOT},
+    {"name": "laion_coco", "repeat": 2, "renderer": TIPO_CHAT, "root": TIPO_ROOT},
 ]
 
 LOADER_KWARGS = {
@@ -60,20 +66,19 @@ ARCH_OVERRIDES = {
     "qk_norm": True,
     # A tied head cannot span two ranks; the stage would untie it and warn.
     "tie_embeddings": False,
-    # 1.21x throughput and half the peak memory at a fixed shape; the memory is
-    # what lets the microbatch below be 16384. See docs/internals/mxfp8.md.
-    "mxfp8": True,
+    # fp16 throughout: the fused 16-bit expert path beats MXFP8 end to end and
+    # carries no quantization error. See docs/internals/fused-moe-16bit.md.
+    "mxfp8": False,
 }
 # Aux-loss-free balancing carries the load; no head z-loss, which costs 1.59x
 # end to end. See docs/internals/moe-router-loss.md.
 AUX_LOSS_WEIGHT = 0.0
 ROUTER_Z_LOSS_WEIGHT = 0.0
 
-# 262144 tokens/step either way. Measured over 60 steps: 16384 x 16 runs at
-# 255.9k tok/s against 8192 x 32's 232.1k, the wider microbatch outweighing its
-# larger 1F1B bubble. Peak is 16.0 GiB of 31.4.
-MICRO_TOKENS = 16384
-NUM_MICROBATCHES = 16
+# 262144 tokens/step. Measured over 60 steps on 4x5090: 276.0k tok/s at 9.17 GiB
+# of 31.4, against 263.3k for 16384 x 16 and 184.0k for 4096 x 64.
+MICRO_TOKENS = 8192
+NUM_MICROBATCHES = 32
 LAYERS = []
 SCHEDULE = "1f1b"
 PARAM_DTYPE = "fp16"
