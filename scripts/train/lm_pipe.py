@@ -2,9 +2,9 @@
 
 Launched and configured by KohakuEngine; the script spawns its own ranks::
 
-    kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py
+    kogine run scripts/train/lm_pipe.py --config configs/lm/tipo/tipo_moe_1b_uwupipe.py
 
-    kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py \
+    kogine run scripts/train/lm_pipe.py --config configs/lm/tipo/tipo_moe_1b_uwupipe.py \
         --set MAX_STEPS=10 --set DATA_KIND=synthetic
 
 ``GPUS`` sets the rank count; the launcher stands down when ``RANK`` is already

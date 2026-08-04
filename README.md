@@ -21,7 +21,7 @@ uv pip install -e ".[dev,bench]"
 .venv/bin/python scripts/tokenizer/build_tokenizer.py --out models/tokenizer
 
 # smoke run: 25M model, one GPU, 50 steps
-kogine run scripts/train/lm.py --config configs/lm/debug.py
+kogine run scripts/train/lm.py --config configs/lm/smoke/debug.py
 ```
 
 That is a real training loop with packed varlen batches, token-exact gradient
@@ -29,8 +29,8 @@ accumulation and in-training sample previews. Swapping to a 1B sparse model is a
 different config file and nothing else:
 
 ```bash
-kogine run scripts/train/lm.py --config configs/lm/tipo_500m.py       # dense 546M
-kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py  # MoE 991M
+kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_500m.py       # dense 546M
+kogine run scripts/train/lm_pipe.py --config configs/lm/tipo/tipo_moe_1b_uwupipe.py  # MoE 991M
 ```
 
 The second one splits itself across every GPU it finds and measures the split
@@ -141,9 +141,9 @@ uv pip install -e ".[dev,bench]"
 ### 3. Train something
 
 ```bash
-kogine run scripts/train/lm.py --config configs/lm/debug.py        # 25M, one GPU
-kogine run scripts/train/lm.py --config configs/lm/tipo_500m.py    # dense 546M
-kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py
+kogine run scripts/train/lm.py --config configs/lm/smoke/debug.py        # 25M, one GPU
+kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_500m.py    # dense 546M
+kogine run scripts/train/lm_pipe.py --config configs/lm/tipo/tipo_moe_1b_uwupipe.py
 ```
 
 Every UPPER_CASE global in a train script is a knob a config may override, and
@@ -152,7 +152,7 @@ Every UPPER_CASE global in a train script is a knob a config may override, and
 ### 4. Sample, export, quantize
 
 ```bash
-kogine run scripts/tools/sample.py --config configs/lm/tipo_moe_1b_uwupipe.py \
+kogine run scripts/tools/sample.py --config configs/lm/tipo/tipo_moe_1b_uwupipe.py \
     --set CKPT=out/ckpt/.../step-50000.ckpt --set TEMPERATURE=1.0 --set MIN_P=0.1
 
 kogine run scripts/tools/to_gguf.py --config <same> --set CKPT=... --set OUT=model.gguf

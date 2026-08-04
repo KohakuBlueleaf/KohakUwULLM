@@ -171,9 +171,9 @@ overlap. `PipelinedLMTrainer.generate` passes `microbatches=1` for this reason.
 Run `scripts/dist/pp_generate_smoke.py`, which spawns its own two ranks, to
 check a split model generates, and `pp_generate_bench.py` to reproduce the table.
 
-### Four ranks, from `configs/lm/pipegen_bench.py`
+### Four ranks, from `configs/lm/smoke/pipegen_bench.py`
 
-`configs/lm/pipegen_bench.py` runs Kohaku-MoE-1B over four ranks with the
+`configs/lm/smoke/pipegen_bench.py` runs Kohaku-MoE-1B over four ranks with the
 pipelined preview selected — `SAMPLE_LOCAL = False`, `SAMPLE_FORWARD_ONLY =
 True` — so one short run reports both the decode path and what the training loop
 around it does.
@@ -238,7 +238,7 @@ Kohaku-MoE-1B at step 64000, fp16 parameters and fp16 autocast, MXFP8 **off**,
 | `mode="default"` | **8.66** | **923** | **4.1x** |
 
 ```bash
-kogine run scripts/tools/sample.py --config configs/lm/tipo_moe_1b_uwupipe.py \
+kogine run scripts/tools/sample.py --config configs/lm/tipo/tipo_moe_1b_uwupipe.py \
     --set CKPT=out/ckpt/tipo-moe-1b-uwupipe/step-64000.ckpt \
     --set SAMPLE_COUNT=8 --set BENCH_STEPS=64 --set MXFP8=False \
     --set COMPILE=default

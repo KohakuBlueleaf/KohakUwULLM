@@ -2,8 +2,8 @@
 
 Run with KohakuEngine, pointing at a config that overrides the globals below::
 
-    kogine run scripts/train/lm.py --config configs/lm/debug.py
-    kogine run scripts/train/lm.py --config configs/lm/tipo_500m.py --set LR=2e-4
+    kogine run scripts/train/lm.py --config configs/lm/smoke/debug.py
+    kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_500m.py --set LR=2e-4
 
 Every UPPER_CASE global here is a knob a config may override. The defaults form
 a runnable debug recipe (tiny model, danbooru only, one GPU) so the script works

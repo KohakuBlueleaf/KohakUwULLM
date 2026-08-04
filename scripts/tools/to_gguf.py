@@ -5,7 +5,7 @@ layers: RMSNorm, per-head Q/K norm, GQA + RoPE, SwiGLU, leading dense blocks,
 routed experts with a shared expert, and a router bias for aux-loss-free
 balancing. See docs/guides/gguf.md.
 
-    kogine run scripts/tools/to_gguf.py --config configs/lm/tipo_moe_1b_150k.py \
+    kogine run scripts/tools/to_gguf.py --config configs/lm/tipo/tipo_moe_1b_150k.py \
         --set CKPT=out/ckpt/tipo-moe-1b-150k/step-2000.ckpt \
         --set OUT=out/gguf/kohaku-moe-1b-f16.gguf
 
@@ -37,6 +37,8 @@ OUT_DTYPE = "f16"
 EXPAND_KV = True
 # Written as the EOT id when the tokenizer carries it.
 TURN_END_TOKEN = "<|im_end|>"
+# False exports a plain completion model: no chat template and no turn-stop token.
+WRITE_CHAT_TEMPLATE = True
 
 _FILE_TYPE = {
     "f32": gguf.LlamaFileType.ALL_F32,
@@ -138,9 +140,12 @@ def write_tokenizer(w: gguf.GGUFWriter, path: str) -> None:
         text = text.get("content") if isinstance(text, dict) else text
         if text in ids:
             adder(ids[text])
-    w.add_add_bos_token(False)
+    # Every training document starts with BOS. See docs/guides/gguf.md.
+    w.add_add_bos_token(True)
     w.add_add_eos_token(False)
 
+    if not WRITE_CHAT_TEMPLATE:
+        return
     template = conf.get("chat_template")
     if template:
         w.add_chat_template(template)

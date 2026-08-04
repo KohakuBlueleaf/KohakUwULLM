@@ -3,7 +3,7 @@
 Scripts live in `scripts/` and run under [KohakuEngine](https://github.com/KohakuBlueleaf/KohakuEngine):
 
 ```bash
-kogine run scripts/train/lm.py --config configs/lm/tipo_500m.py
+kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_500m.py
 ```
 
 A script declares its knobs as **module-level constants**. A config file is a plain

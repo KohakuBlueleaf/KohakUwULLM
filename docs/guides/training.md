@@ -18,15 +18,15 @@ See [pipeline.md](../internals/pipeline.md#running-one).
 ## Running one
 
 ```bash
-kogine run scripts/train/lm.py --config configs/lm/tipo_moe_1b.py
+kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_moe_1b.py
 
 # resume from a crash: weights, optimizer, schedule, RNG, data position.
 # CHECKPOINT_PATH alone loads weights only; TRAINER_RESUME is what continues the run.
-kogine run scripts/train/lm.py --config configs/lm/tipo_moe_1b.py \
+kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_moe_1b.py \
     --set CHECKPOINT_PATH=out/ckpt/TIPO-MoE-1B/last.ckpt --set TRAINER_RESUME=True
 
 # one knob, no file edit
-kogine run scripts/train/lm.py --config configs/lm/tipo_moe_1b.py --set LR=3e-4
+kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_moe_1b.py --set LR=3e-4
 ```
 
 The schedule half of a config, which is the part with the least obvious defaults:

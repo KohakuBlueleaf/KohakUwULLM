@@ -5,13 +5,13 @@ bare-style Python files. The training scripts use `ALL_CAPS` module-level
 globals, so a config is just a file that overrides them.
 
 ```bash
-kogine run scripts/train/lm.py --config configs/lm/tipo_500m.py
-kogine run scripts/train/lm.py --config configs/lm/debug.py --set LR=1e-3
-kogine config check scripts/train/lm.py --config configs/lm/debug.py
+kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_500m.py
+kogine run scripts/train/lm.py --config configs/lm/smoke/debug.py --set LR=1e-3
+kogine config check scripts/train/lm.py --config configs/lm/smoke/debug.py
 ```
 
 Set **only** what differs from the script's defaults; everything else falls
-through. `configs/lm/debug.py` is the CPU-cheap smoke test, `smoke_mxfp8.py` the
+through. `configs/lm/smoke/debug.py` is the CPU-cheap smoke test, `smoke_mxfp8.py` the
 smoke test for the *shipping* configuration, and `tipo_500m.py` /
 `tipo_moe_1b.py` are the production recipes.
 
@@ -24,7 +24,7 @@ set — `MICRO_TOKENS`, `NUM_MICROBATCHES`, `LAYERS`, `MXFP8`, `DATA_KIND`,
 spawns its own ranks, `GPUS` of them:
 
 ```bash
-kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py
+kogine run scripts/train/lm_pipe.py --config configs/lm/tipo/tipo_moe_1b_uwupipe.py
 ```
 
 `--set` coerces from the script's declared default and does **not** parse a list
@@ -100,8 +100,8 @@ weighting every production config uses, one pass is **20.890B raw, ~18.9B traine
 drives:
 
 ```bash
-kogine run scripts/train/lm.py --config configs/lm/tipo_500m.py --set LR=2e-4
-kogine config check scripts/train/lm.py --config configs/lm/tipo_500m.py
+kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_500m.py --set LR=2e-4
+kogine config check scripts/train/lm.py --config configs/lm/tipo/tipo_500m.py
 ```
 
 `config check` resolves the config and prints the effective values without

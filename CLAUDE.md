@@ -220,7 +220,7 @@ mistake. Run them after any kernel change:
 
 ```bash
 uv pip install -e ".[dev,bench]"
-kogine run scripts/train/lm.py --config configs/lm/debug.py
+kogine run scripts/train/lm.py --config configs/lm/smoke/debug.py
 ```
 
 Never use `sys.path` hacks in scripts; always import from the installed package.

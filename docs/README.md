@@ -96,20 +96,20 @@ uv pip install -e ".[dev,bench]"
 .venv/bin/python -m pytest tests/test_models.py -q
 
 # 40 steps of the full shipping path on one card: MXFP8, Muon, real corpus
-kogine run scripts/train/lm.py --config configs/lm/smoke_mxfp8.py
+kogine run scripts/train/lm.py --config configs/lm/smoke/smoke_mxfp8.py
 ```
 
 ## Train something
 
 ```bash
 # dense 500M, 4 cards
-kogine run scripts/train/lm.py --config configs/lm/tipo_500m.py
+kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_500m.py
 
 # sparse 1B, 4 cards
-kogine run scripts/train/lm.py --config configs/lm/tipo_moe_1b.py
+kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_moe_1b.py
 
 # ad-hoc override, no file edit
-kogine run scripts/train/lm.py --config configs/lm/tipo_500m.py --set LR=2e-4
+kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_500m.py --set LR=2e-4
 ```
 
 Configs are plain Python. A config names a **preset**, overrides architecture fields,

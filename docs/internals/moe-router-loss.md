@@ -60,7 +60,7 @@ nominal shape: that table is the Lightning loop, this one is kohakuwupipe. Only
 the deltas within this table mean anything.
 
 ```bash
-kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py \
+kogine run scripts/train/lm_pipe.py --config configs/lm/tipo/tipo_moe_1b_uwupipe.py \
     --set MAX_STEPS=24 --set AUX_LOSS_WEIGHT=1e-3
 ```
 

@@ -5,7 +5,7 @@ tokenizer, and the standalone modeling code, so the result loads with
 ``AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)`` on a
 machine that has never seen kohakuwullm.
 
-    kogine run scripts/tools/to_hf.py --config configs/lm/tipo_moe_1b_uwupipe.py \
+    kogine run scripts/tools/to_hf.py --config configs/lm/tipo/tipo_moe_1b_uwupipe.py \
         --set CKPT=out/ckpt/tipo-moe-1b-uwupipe/step-64000.ckpt \
         --set OUT=out/hf/kohaku-moe-1b
 

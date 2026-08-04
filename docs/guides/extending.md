@@ -193,7 +193,7 @@ holds for both packed and padded layouts.
 **5. Smoke it.** 40 steps on one card against the real corpus:
 
 ```bash
-kogine run scripts/train/lm.py --config configs/lm/smoke_mxfp8.py --set ARCH_OVERRIDES='{"mlp": "squared_relu"}'
+kogine run scripts/train/lm.py --config configs/lm/smoke/smoke_mxfp8.py --set ARCH_OVERRIDES='{"mlp": "squared_relu"}'
 ```
 
 **6. If it will run in fp8**, declare its matmul so the swap can account for it.

@@ -277,10 +277,10 @@ only exists once.
 one config file drives it and every knob is reachable:
 
 ```bash
-kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py
+kogine run scripts/train/lm_pipe.py --config configs/lm/tipo/tipo_moe_1b_uwupipe.py
 
 # ten steps, no network, synthetic data, one checkpoint
-kogine run scripts/train/lm_pipe.py --config configs/lm/tipo_moe_1b_uwupipe.py \
+kogine run scripts/train/lm_pipe.py --config configs/lm/tipo/tipo_moe_1b_uwupipe.py \
     --set MAX_STEPS=10 --set DATA_KIND=synthetic --set WANDB_PROJECT=
 ```
 

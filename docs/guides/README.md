@@ -17,10 +17,10 @@ Task-shaped. Each one answers "how do I do X", and assumes
 uv pip install -e ".[dev,bench]"
 
 # 40 steps of the full shipping path on one card: MXFP8, Muon, real corpus
-kogine run scripts/train/lm.py --config configs/lm/smoke_mxfp8.py
+kogine run scripts/train/lm.py --config configs/lm/smoke/smoke_mxfp8.py
 
 # dense 500M on 4 cards
-kogine run scripts/train/lm.py --config configs/lm/tipo_500m.py
+kogine run scripts/train/lm.py --config configs/lm/tipo/tipo_500m.py
 ```
 
 A config is plain Python: it names a preset, overrides architecture fields, lists

@@ -6,7 +6,7 @@ prints. Rows finish independently: a row that emits EOS is held there while the
 rest keep decoding, and the batch stops when all of them are done or the context
 is full.
 
-    kogine run scripts/tools/sample.py --config configs/lm/tipo_moe_1b_uwupipe.py \
+    kogine run scripts/tools/sample.py --config configs/lm/tipo/tipo_moe_1b_uwupipe.py \
         --set CKPT=out/ckpt/tipo-moe-1b-uwupipe/step-64000.ckpt \
         --set TEMPERATURE=1.0 --set MIN_P=0.1
 
