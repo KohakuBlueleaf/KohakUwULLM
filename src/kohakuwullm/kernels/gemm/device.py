@@ -41,6 +41,9 @@ class Device:
     ldsm_slope: float = 0.90
     sk_balance: float = 14.0
     uneven_k: float = 0.62
+    # Grouped MoE kernels only; see docs/internals/fused-moe-16bit.md.
+    moe_cta_tax: tuple[float, ...] = (0.68, 1.0)
+    moe_intensity_sat: float = 50.0
 
     @classmethod
     def query(cls, index: int = 0, **overrides) -> "Device":
