@@ -39,12 +39,22 @@ from kohakuwullm.data.packing import (
     PackedBatch,
     RenderedDataset,
     WeightedConcatDataset,
+    as_segments,
+    assemble_sample,
     collate_packed,
     encode_sample,
+    nonempty_segments,
     split_packed,
 )
-from kohakuwullm.data.renderers.chatml import ChatMLRenderer, QAChatMLRenderer
-from kohakuwullm.data.renderers.plain import ChatRenderer, PlainRenderer
+from kohakuwullm.data.renderers.chatml import (
+    CHAT_SPECIALS,
+    CHAT_TEMPLATE,
+    ChatMLRenderer,
+    ChatRenderer,
+    QAChatMLRenderer,
+    chat_segments,
+)
+from kohakuwullm.data.renderers.plain import PlainRenderer
 from kohakuwullm.data.renderers.tipo import SPECIAL_TOKENS, TIPORenderer
 from kohakuwullm.data.sources.corpus import CorpusRecords
 from kohakuwullm.data.sources.vault import (
@@ -102,7 +112,7 @@ class PerSourceRenderer:
     def __init__(self, default="plain") -> None:
         self.default = build(default, RENDERER)
 
-    def __call__(self, rec: dict, rng=None, **kwargs) -> tuple[str, str]:
+    def __call__(self, rec: dict, rng=None, **kwargs):
         render_fn = rec.get(RENDER_KEY, self.default)
         return render_fn(rec, rng=rng, **kwargs)
 
@@ -276,6 +286,9 @@ __all__ = [
     "build_records",
     "ChatMLRenderer",
     "QAChatMLRenderer",
+    "CHAT_SPECIALS",
+    "CHAT_TEMPLATE",
+    "chat_segments",
     "PerSourceRenderer",
     "RENDER_KEY",
     "load_records",
@@ -309,6 +322,9 @@ __all__ = [
     "split_padded",
     "padding_fraction",
     "encode_sample",
+    "as_segments",
+    "nonempty_segments",
+    "assemble_sample",
     "split_packed",
     "IGNORE_INDEX",
 ]

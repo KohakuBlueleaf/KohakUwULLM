@@ -26,7 +26,8 @@ import json
 import os
 import random
 
-from kohakuwullm.data.renderers.plain import CHAT_SPECIALS, CHAT_TEMPLATE
+from kohakuwullm.data.packing import nonempty_segments
+from kohakuwullm.data.renderers.chatml import CHAT_SPECIALS, CHAT_TEMPLATE
 from kohakuwullm.data.renderers.tipo import SPECIAL_TOKENS, TIPORenderer
 from kohakuwullm.tokenizer.prune import load_tokenizer_json, prune_bpe, summarize
 
@@ -56,6 +57,8 @@ def build(out_dir: str, source: str, keep: int, total: int) -> dict:
         "unk_token": "<|unk|>",
         "model_max_length": 131072,
         "clean_up_tokenization_spaces": False,
+        "add_bos_token": True,
+        "add_eos_token": False,
         "chat_template": CHAT_TEMPLATE,
     }
     with open(
@@ -90,8 +93,7 @@ def check_roundtrip(out_dir: str, source: str, n_samples: int, root: str) -> Non
         rec = records[rng.randrange(len(records))]
         if rec is None:
             continue
-        user, output = renderer(rec, rng=rng)
-        text = user + output
+        text = "".join(t for t, _ in nonempty_segments(renderer(rec, rng=rng)))
         a = original(text, add_special_tokens=False)["input_ids"]
         b = pruned(text, add_special_tokens=False)["input_ids"]
         before += len(a)
