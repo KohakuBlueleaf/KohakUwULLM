@@ -9,10 +9,10 @@ Smoke, ten steps, no network::
     kogine run scripts/train/lm_pipe.py --config configs/lm/general_1b_400k.py \\
         --set MAX_STEPS=10 --set CKPT_INTERVAL=0 --set SAMPLE_INTERVAL=0
 
-General weights are derived by scripts/data/mixture.py against a 95.19B budget;
-TIPO adds 9.67B on top. The DQA, STEM and SmolTalk sources render as ChatML with
-every user turn masked, so 10.1% of the run carries turn structure -- see
-internal/chat-template-design.md and internal/general-pretrain-datasets.md.
+General weights are derived by scripts/data/mixture.py against a 95.19B budget at
+ctx_max 4096; TIPO adds 9.67B on top. The DQA, STEM and SmolTalk sources render
+as ChatML with every user turn masked, so 9.5% of the run carries turn structure
+-- see internal/chat-template-design.md and internal/general-pretrain-datasets.md.
 """
 
 DATA_KIND = "corpus"
@@ -29,15 +29,15 @@ TIPO_RENDER = "tipo"
 # 400k steps x 262144 tokens = 104.86B; one pass over this list delivers 104.86B.
 SOURCES = [
     {"name": "en/nemotron-cc-v2.1-hq", "repeat": 1.000},
-    {"name": "en/nemotron-cc-v2.1-hq-syn", "repeat": 0.296},
+    {"name": "en/nemotron-cc-v2.1-hq-syn", "repeat": 0.275},
     {"name": "en/nemotron-cc-v2.1-mhq", "repeat": 0.720},
     {"name": "ja/fineweb-2-edu-japanese-10bt", "repeat": 0.560},
-    {"name": "zh-tw/finepdfs-zh-zhtw", "repeat": 1.000},
+    {"name": "zh-tw/finepdfs-zh-zhtw", "repeat": 0.576},
     {"name": "zh-tw/ultra-fineweb-l3", "repeat": 1.000},
     {"name": "zh-tw/wiki-zhtw", "repeat": 1.000},
     {"name": "zh-tw/ptt-zhtw", "repeat": 1.000},
     {"name": "en/nemotron-cc-v2.1-hq-dqa", "repeat": 0.966, "renderer": "qa_chatml"},
-    {"name": "ko/hplt3-kor-hang", "repeat": 0.186},
+    {"name": "ko/hplt3-kor-hang", "repeat": 0.130},
     {"name": "stem/nemotron-specialized", "repeat": 1.000, "renderer": "qa_chatml"},
     # JSON conversation rows, not document text. See scripts/data/to_vault_chat.py.
     {"name": "sft/smoltalk", "repeat": 1.000, "renderer": "chat", "schema": "json"},
@@ -52,7 +52,8 @@ LOADER_KWARGS = {
     "doc_filter": "ngram",
     "val_frac": 0.002,
     "split": "train",
-    "ctx_max": 2048,
+    # The model's trained context. Truncating below it throws away real length.
+    "ctx_max": 4096,
     "num_workers": 16,
     "prefetch_factor": 4,
     "batches_per_epoch": 400_000,

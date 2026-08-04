@@ -18,8 +18,10 @@ is unchanged. See docs/internals/pipeline.md and docs/guides/writing-configs.md.
 import math
 import os
 import sys
+import time
 
 import torch
+import torch.distributed as dist
 from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from kohakuwullm.bench import make_info, make_tokens
@@ -127,7 +129,10 @@ SEED = 20090220
 # Resume / logging
 # ===================================================================== #
 CHECKPOINT_PATH: str | None = None
+# Checkpoints and the corpus manifest land in CKPT_DIR/<run id>, so a new run
+# cannot inherit either from its predecessor. Set RUN_ID to continue one.
 CKPT_DIR = ""
+RUN_ID = ""
 CKPT_INTERVAL = 5000
 NAME = "lm-pipe"
 WANDB_PROJECT = ""
@@ -187,7 +192,7 @@ def synthetic_stream(vocab, micro, num_micro, lo, hi, device, seed=0, fresh=Fals
         step += 1
 
 
-def build_stream(ranks, tokenizer):
+def build_stream(ranks, tokenizer, ckpt_dir: str):
     """``(steps, loader)`` for the configured data source; loader is None if synthetic."""
     if DATA_KIND == "synthetic":
         stream = synthetic_stream(
@@ -207,15 +212,28 @@ def build_stream(ranks, tokenizer):
     # once and reused on resume. See docs/internals/data.md.
     snapshot = None
     if any("/" in spec["name"] for spec in SOURCES):
-        from kohakuwullm.data.sources.corpus import read_manifest, write_manifest
+        from kohakuwullm.data.sources.corpus import (
+            read_manifest,
+            snapshot_sources,
+            write_manifest,
+        )
 
-        path = os.path.join(CKPT_DIR, "corpus-manifest.json") if CKPT_DIR else ""
-        if path and os.path.exists(path):
-            snapshot = read_manifest(path)["sources"]
-            log.info("corpus manifest reused", path=path, sources=len(snapshot))
-        elif path and ranks.rank == 0:
-            snapshot = write_manifest(SOURCES, path)["sources"]
-            log.info("corpus manifest written", path=path, sources=len(snapshot))
+        path = os.path.join(ckpt_dir, "corpus-manifest.json") if ckpt_dir else ""
+        # Rank 0 resolves the view and hands it out. Ranks resolving their own
+        # would disagree about document indices if a shard landed mid-startup.
+        handle = [None]
+        if ranks.rank == 0:
+            if path and os.path.exists(path):
+                handle[0] = read_manifest(path)["sources"]
+                log.info("corpus manifest reused", path=path, sources=len(handle[0]))
+            elif path:
+                handle[0] = write_manifest(SOURCES, path, root=DATA_ROOT)["sources"]
+                log.info("corpus manifest written", path=path, sources=len(handle[0]))
+            else:
+                handle[0] = snapshot_sources(SOURCES, root=DATA_ROOT)
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast_object_list(handle, src=0)
+        snapshot = handle[0]
 
     # rank/world_size describe the *data-parallel* group; a pure pipeline has
     # none, so every rank iterates the identical stream.
@@ -238,21 +256,44 @@ def build_stream(ranks, tokenizer):
     return corpus_steps(loader, ranks.device), loader
 
 
-def build_reporter(name: str):
+def init_run():
+    """The W&B run, on rank 0 only. Resumes ``RUN_ID`` when one is named."""
+    if not WANDB_PROJECT:
+        return None
+    import wandb
+
+    return wandb.init(
+        project=WANDB_PROJECT,
+        name=NAME,
+        mode="offline" if WANDB_OFFLINE else "online",
+        id=RUN_ID or None,
+        resume="must" if RUN_ID else None,
+    )
+
+
+def run_directory(ranks, run) -> str:
+    """``CKPT_DIR/<run id>``, agreed across ranks. Collective.
+
+    Rank 0 owns the id: ``RUN_ID``, else W&B's, else a UTC stamp. Every rank
+    writes its stage's checkpoint into the one directory.
+    """
+    if not CKPT_DIR:
+        return ""
+    handle = [None]
+    if ranks.rank == 0:
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        handle[0] = RUN_ID or (run.id if run is not None else stamp)
+    if dist.is_available() and dist.is_initialized():
+        dist.broadcast_object_list(handle, src=0)
+    return os.path.join(CKPT_DIR, str(handle[0]))
+
+
+def build_reporter(run):
     """A metrics sink for rank 0: W&B every call, the log on ``CONSOLE_INTERVAL``.
 
     The progress bar owns stdout, so the log line is what survives in the file
     and is deliberately rarer than the W&B point.
     """
-    run = None
-    if WANDB_PROJECT:
-        import wandb
-
-        run = wandb.init(
-            project=WANDB_PROJECT,
-            name=name,
-            mode="offline" if WANDB_OFFLINE else "online",
-        )
 
     def report(row: dict) -> None:
         step = int(row.get("step", 0))
@@ -347,6 +388,10 @@ def _worker(overrides: dict) -> None:
 def main() -> None:
     ranks = init_pipeline()
     torch.manual_seed(SEED)
+    run = init_run() if ranks.rank == 0 else None
+    ckpt_dir = run_directory(ranks, run)
+    if ranks.rank == 0 and ckpt_dir:
+        log.info("run directory", path=ckpt_dir, resumed=bool(RUN_ID))
     tokenizer = None
     if DATA_KIND == "corpus" or SAMPLE_INTERVAL > 0:
         from transformers import AutoTokenizer
@@ -382,7 +427,7 @@ def main() -> None:
     if ranks.rank == 0:
         log.info("stage split\n%s", describe(plans))
 
-    stream, loader = build_stream(ranks, tokenizer)
+    stream, loader = build_stream(ranks, tokenizer, ckpt_dir)
     schedule_config = {
         key: autofill_schedule_steps(dict(sub), MAX_STEPS, SCHED_WARMUP_RATIO)
         for key, sub in SCHEDULER_CONFIG.items()
@@ -403,7 +448,7 @@ def main() -> None:
         loader=loader,
     )
 
-    report, report_samples = build_reporter(NAME) if ranks.rank == 0 else (None, None)
+    report, report_samples = build_reporter(run) if ranks.rank == 0 else (None, None)
     callbacks = [
         Throughput(every_n_steps=THROUGHPUT_INTERVAL, warmup_steps=8, report=report),
         LossLog(every_n_steps=LOG_INTERVAL, report=report),
@@ -416,10 +461,10 @@ def main() -> None:
                 module, autofill_schedule_steps(dict(BIAS_SCHEDULE), MAX_STEPS)
             )
         )
-    if CKPT_DIR:
+    if ckpt_dir:
         callbacks.append(
             Checkpoint(
-                CKPT_DIR,
+                ckpt_dir,
                 plans[ranks.rank].start_layer,
                 CKPT_INTERVAL,
                 block_attr=module.block_prefix,
