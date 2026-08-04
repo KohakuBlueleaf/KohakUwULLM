@@ -9,6 +9,7 @@ See docs/guides/training.md.
 import random
 
 from kohakuwullm.data.packing import IGNORE_INDEX
+from kohakuwullm.data.renderers.chatml import ASSISTANT_OPEN
 from kohakuwullm.data.sources.corpus import CorpusRecords
 
 FILLER_MIN_TOKENS = 32
@@ -76,17 +77,30 @@ def _trained_spans(labels) -> list[tuple[int, int]]:
 
 def _pick_turn(
     spans: list[tuple[int, int]],
+    tokens,
+    header: list[int] | None,
     max_prefix_tokens: int,
     min_prompt_tokens: int,
     min_reference_tokens: int,
 ) -> tuple[int, int] | None:
-    """The deepest trained span whose context still fits the prompt cap."""
-    fits = [
-        (start, stop)
-        for start, stop in spans
-        if min_prompt_tokens <= start <= max_prefix_tokens
-        and stop - start >= min_reference_tokens
-    ]
+    """The deepest trained span whose context fits the prompt cap.
+
+    With ``header``, a span also has to open an assistant turn: the ids right
+    before it must be ``<|im_start|>assistant\\n``. Without it, any span whose
+    context is long enough qualifies, which includes a masked TIPO prompt.
+    """
+    fits = []
+    for start, stop in spans:
+        if not min_prompt_tokens <= start <= max_prefix_tokens:
+            continue
+        if stop - start < min_reference_tokens:
+            continue
+        if header is not None and (
+            start < len(header)
+            or tokens[start - len(header) : start].tolist() != header
+        ):
+            continue
+        fits.append((start, stop))
     return fits[-1] if fits else None
 
 
@@ -105,16 +119,21 @@ def prompts_from_batch(
 ) -> list[tuple[str, str, list[int], str]]:
     """``[(name, prompt, prompt_ids, reference)]`` cut from the batch being trained on.
 
-    The cut lands on the first token of a trained span, so the prompt is the
-    document's own context up to and including ``<|im_start|>assistant\\n`` and
-    the reference is that one turn rather than the document remainder. A
-    document whose loss covers every token carries no boundary and is skipped;
-    with ``turns_only`` off it is cut at ``prefix_frac`` instead.
+    With ``turns_only`` the cut lands on the first token after an
+    ``<|im_start|>assistant\\n`` header, so the prompt is the document's own
+    context and the reference is that one reply rather than the document
+    remainder. Documents with no such header are skipped. Without it, any
+    mask boundary qualifies and a document with none is cut at ``prefix_frac``.
     """
     docs = _documents(batch)
     rng = random.Random(seed) if seed is not None else random
     order = list(range(len(docs)))
     rng.shuffle(order)
+    header = (
+        tokenizer(ASSISTANT_OPEN, add_special_tokens=False)["input_ids"]
+        if turns_only
+        else None
+    )
 
     rows: list[tuple[str, str, list[int], str]] = []
     for index in order:
@@ -124,6 +143,8 @@ def prompts_from_batch(
         length = int(tokens.numel())
         turn = _pick_turn(
             _trained_spans(labels),
+            tokens,
+            header,
             max_prefix_tokens,
             min_prompt_tokens,
             min_reference_tokens,

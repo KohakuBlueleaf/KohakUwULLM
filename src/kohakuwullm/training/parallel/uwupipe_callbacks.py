@@ -164,14 +164,11 @@ class SamplePreview(Callback):
         stops: list[tuple[int, bool]] = []
         stop_ids = self._stop_ids()
         gathered = self._gathered(loop) if self.local else None
-        rows_in = (
-            [(n, t, i) for n, t, i, _ in self._batch_rows]
-            if self._batch_rows
-            else [(n, t, None) for n, t in self.prompts]
-        )
-        references = (
-            {n: r for n, _, _, r in self._batch_rows} if self._batch_rows else {}
-        )
+        # Batch rows are turn cuts, so the fixed prompts stay: they are the only
+        # coverage of the TIPO half, which carries no turns.
+        rows_in = [(n, t, None) for n, t in self.prompts]
+        rows_in += [(n, t, i) for n, t, i, _ in self._batch_rows or []]
+        references = {n: r for n, _, _, r in self._batch_rows or []}
         bar = tqdm(
             rows_in,
             desc=f"preview@{step}",
