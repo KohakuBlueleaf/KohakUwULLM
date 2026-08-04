@@ -33,6 +33,33 @@ from kohakuwullm.tokenizer.prune import load_tokenizer_json, prune_bpe, summariz
 
 SOURCE = "deepseek-ai/DeepSeek-V4-Flash"
 CORE_SPECIALS = ["<|bos|>", "<|eos|>", "<|pad|>", "<|unk|>"]
+BOS = "<|bos|>"
+
+
+def bos_post_processor(spec: dict, bos_id: int) -> dict:
+    """The existing post-processor, sequenced with one that prepends BOS.
+
+    ``add_bos_token`` in ``tokenizer_config.json`` is a slow-tokenizer knob and
+    does nothing on its own; the template is what a fast tokenizer acts on.
+    """
+    template = {
+        "type": "TemplateProcessing",
+        "single": [
+            {"SpecialToken": {"id": BOS, "type_id": 0}},
+            {"Sequence": {"id": "A", "type_id": 0}},
+        ],
+        "pair": [
+            {"SpecialToken": {"id": BOS, "type_id": 0}},
+            {"Sequence": {"id": "A", "type_id": 0}},
+            {"SpecialToken": {"id": BOS, "type_id": 1}},
+            {"Sequence": {"id": "B", "type_id": 1}},
+        ],
+        "special_tokens": {BOS: {"id": BOS, "ids": [bos_id], "tokens": [BOS]}},
+    }
+    existing = spec.get("post_processor")
+    if existing is None:
+        return template
+    return {"type": "Sequence", "processors": [existing, template]}
 
 
 def build(out_dir: str, source: str, keep: int, total: int) -> dict:
@@ -45,6 +72,8 @@ def build(out_dir: str, source: str, keep: int, total: int) -> dict:
         reserved_slots=total - keep - len(named),
         total_size=total,
     )
+    bos_id = next(t["id"] for t in pruned["added_tokens"] if t["content"] == BOS)
+    pruned["post_processor"] = bos_post_processor(pruned, bos_id)
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "tokenizer.json"), "w", encoding="utf-8") as handle:
         json.dump(pruned, handle, ensure_ascii=False)

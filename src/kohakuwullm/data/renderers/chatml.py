@@ -21,7 +21,10 @@ CHAT_SPECIALS = [
     "<|/tool_result|>",
 ]
 
+# The leading <|bos|> is the template's own: apply_chat_template tokenizes with
+# add_special_tokens=False, so nothing else would supply one.
 CHAT_TEMPLATE = (
+    "{{ '<|bos|>' }}"
     "{% for m in messages %}"
     "{{ '<|im_start|>' + m['role'] + '\n' + m['content'] + '<|im_end|>' + '\n' }}"
     "{% endfor %}"
