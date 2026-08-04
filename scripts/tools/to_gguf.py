@@ -35,6 +35,8 @@ OUT_DTYPE = "f16"
 # Replicate each KV head to one per query head. dots1 builds K and V at
 # n_head, not n_head_kv, so a GQA model only loads once expanded.
 EXPAND_KV = True
+# Written as the EOT id when the tokenizer carries it.
+TURN_END_TOKEN = "<|im_end|>"
 
 _FILE_TYPE = {
     "f32": gguf.LlamaFileType.ALL_F32,
@@ -138,6 +140,13 @@ def write_tokenizer(w: gguf.GGUFWriter, path: str) -> None:
             adder(ids[text])
     w.add_add_bos_token(False)
     w.add_add_eos_token(False)
+
+    template = conf.get("chat_template")
+    if template:
+        w.add_chat_template(template)
+    # EOT joins EOS as end-of-generation. See docs/guides/gguf.md.
+    if TURN_END_TOKEN in ids:
+        w.add_eot_token_id(ids[TURN_END_TOKEN])
 
 
 def expand_kv(weight: torch.Tensor, config) -> torch.Tensor:
