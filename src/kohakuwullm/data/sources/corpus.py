@@ -58,6 +58,9 @@ class CorpusRecords:
         root: directory holding the shards.
         field: key the rendered record exposes the document text under.
         snapshot: ``[(shard basename, document count)]`` to use verbatim.
+        schema: ``"text"`` for a UTF-8 document per key, ``"json"`` for a JSON
+            object whose fields become the record's (see
+            ``scripts/data/to_vault_chat.py``).
     """
 
     def __init__(
@@ -66,10 +69,14 @@ class CorpusRecords:
         root: str = DEFAULT_ROOT,
         field: str = "text",
         snapshot: list | None = None,
+        schema: str = "text",
     ) -> None:
+        if schema not in ("text", "json"):
+            raise ValueError(f"schema must be 'text' or 'json', got {schema!r}")
         self.name = name
         self.field = field
         self.root = root
+        self.schema = schema
         if snapshot:
             self.paths = [os.path.join(root, base) for base, _ in snapshot]
             missing = [p for p in self.paths if not os.path.exists(p)]
@@ -116,6 +123,8 @@ class CorpusRecords:
         blob = self._vaults()[shard].get(offset.to_bytes(8, "big"))
         if not blob:
             return None
+        if self.schema == "json":
+            return {**json.loads(blob), "source": self.name}
         return {self.field: blob.decode("utf-8", "replace"), "source": self.name}
 
 
