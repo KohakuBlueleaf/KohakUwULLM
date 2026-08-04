@@ -8,8 +8,8 @@ The pipeline is three stages, each swappable on its own:
 
 ```
 sources/vault.py     KohakuVault db  ->  normalized record dict
-renderers/tipo.py    record          ->  (user_text, output_text)
-packing.py           text            ->  tokens + loss mask  ->  packed batch
+renderers/tipo.py    record          ->  [(text, is_target), ...]
+packing.py           segments        ->  tokens + loss mask  ->  packed batch
 loader/              the four registered loaders over all of it
 ```
 
@@ -151,11 +151,13 @@ order.
 
 ## 4. Tokenization and loss masking
 
-`encode_sample(tokenizer, user_text, output_text, max_length)` returns `input_ids`
-and `labels` of equal length. Three rules:
+`encode_sample(tokenizer, rendered, max_length)` returns `input_ids` and `labels`
+of equal length. `rendered` is a **segment list** `[(text, is_target), ...]`, and
+a renderer that returns the older `(user_text, output_text)` pair is promoted to
+`[(user, False), (output, True)]` by `as_segments`. Rules:
 
-- the user half **and the BOS** are context, not targets: their labels are `-100`
-  (`IGNORE_INDEX`);
+- a segment marked `is_target` carries loss on every one of its tokens; the rest,
+  **and the BOS**, get `-100` (`IGNORE_INDEX`);
 - `labels` is the *unshifted* target — the shift happens once, at pack time;
 - truncation is applied to the concatenated ids, so a long caption loses its tail
   rather than its prompt.
@@ -163,6 +165,28 @@ and `labels` of equal length. Three rules:
 The shift is deferred deliberately. Doing it at pack time is what makes it a shift
 **inside each document**, so the last position of a document never predicts the first
 token of its neighbour.
+
+### Why a segment list rather than one split point
+
+A single split point can only express "prefix is context, suffix is target",
+which supervises the *last* assistant turn of a conversation and nothing else.
+Round-based masking needs one mask region per turn, and the number of regions is
+a property of the record. Nothing downstream had to change: packing, `cu_seqlens`
+and the loss already consume a per-token `labels` array and do not care how many
+mask regions produced it.
+
+**Each segment is tokenized on its own and the pieces concatenated.** Tokenizing
+the whole rendering and slicing at character offsets is wrong: a BPE merge can
+span a segment boundary and put the join token in the wrong region, shifting
+every later index. This is not hypothetical — with the pruned DeepSeek-V4 merges,
+an assistant reply beginning with a newline merges `\n` + `\n` into one `\n\n`
+token across the `<|im_start|>assistant\n` boundary. Renderers therefore also
+strip message content, so the training rendering matches what a chat template
+produces at inference.
+
+**The assistant's `<|im_end|>` must stay inside the target.** Mask it and the
+model is never trained to stop, which reads as a fluent model that will not end
+a turn.
 
 ---
 
@@ -551,8 +575,25 @@ The checklist:
 5. **If it is expensive to index, cache the index next to the db**, written through a
    temp file and `os.replace`.
 
-A renderer is a callable `(record, rng) -> (user_text, output_text)`. One rule, and it
-is not optional: **take all randomness from the injected `rng`.** The dataset seeds it
-from `(seed, epoch, index)`, which is what makes a repeated record render differently
-each pass while the run stays reproducible. A renderer that calls the global `random`
-module breaks both properties.
+A renderer is a callable `(record, rng) -> [(text, is_target), ...]`. Returning the
+older `(user_text, output_text)` pair is still valid and means "mask the first,
+train the second". One rule, and it is not optional: **take all randomness from the
+injected `rng`.** The dataset seeds it from `(seed, epoch, index)`, which is what
+makes a repeated record render differently each pass while the run stays
+reproducible. A renderer that calls the global `random` module breaks both
+properties.
+
+### Conversation sources
+
+A vault whose values are JSON rather than document text is read with
+`CorpusRecords(name, schema="json")`, which merges the parsed object into the
+record. `scripts/data/to_vault_chat.py` writes that shape from a parquet dataset
+with a `messages` column, and the `chat` renderer turns it into ChatML segments.
+In a config it is one spec:
+
+```python
+{"name": "sft/smoltalk", "repeat": 1.0, "renderer": "chat", "schema": "json"}
+```
+
+The `ngram` document filter reads `rec["text"]`, which a conversation record does
+not have, so it passes such rows through unfiltered.

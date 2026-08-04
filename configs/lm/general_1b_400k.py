@@ -9,10 +9,10 @@ Smoke, ten steps, no network::
     kogine run scripts/train/lm_pipe.py --config configs/lm/general_1b_400k.py \\
         --set MAX_STEPS=10 --set CKPT_INTERVAL=0 --set SAMPLE_INTERVAL=0
 
-General weights are derived by scripts/data/mixture.py against a 94.86B budget;
-TIPO adds 9.67B on top. Both DQA-shaped and TIPO sources render as ChatML, so
-16.9% of the run carries turn structure -- see internal/chat-template-design.md
-and internal/general-pretrain-datasets.md.
+General weights are derived by scripts/data/mixture.py against a 95.19B budget;
+TIPO adds 9.67B on top. The DQA, STEM and SmolTalk sources render as ChatML with
+every user turn masked, so 10.1% of the run carries turn structure -- see
+internal/chat-template-design.md and internal/general-pretrain-datasets.md.
 """
 
 DATA_KIND = "corpus"
@@ -22,29 +22,28 @@ RENDERER = "per_source"
 # The TIPO vault does not live beside the text corpus.
 TIPO_ROOT = "/xg7/caption-datasets"
 
-# ChatML-rendered TIPO. The inner renderer must not fold its prompt into the
-# target, or the user turn renders empty.
-TIPO_CHAT = {
-    "name": "chatml",
-    "inner": {"name": "tipo", "train_on_input_prob": 0.0},
-}
+# TIPO is a continuation format, not a turn structure, and its renderer trains on
+# the prompt half by design. See internal/chat-template-design.md.
+TIPO_RENDER = "tipo"
 
-# 400k steps x 262144 tokens = 104.86B; one pass over this list delivers 104.57B.
+# 400k steps x 262144 tokens = 104.86B; one pass over this list delivers 104.86B.
 SOURCES = [
     {"name": "en/nemotron-cc-v2.1-hq", "repeat": 1.000},
-    {"name": "en/nemotron-cc-v2.1-hq-syn", "repeat": 0.256},
-    {"name": "multi/nemotron-cc-v2-trans-dqa", "repeat": 0.476},
-    {"name": "ja/fineweb-2-edu-japanese-10bt", "repeat": 0.601},
+    {"name": "en/nemotron-cc-v2.1-hq-syn", "repeat": 0.296},
+    {"name": "en/nemotron-cc-v2.1-mhq", "repeat": 0.720},
+    {"name": "ja/fineweb-2-edu-japanese-10bt", "repeat": 0.560},
     {"name": "zh-tw/finepdfs-zh-zhtw", "repeat": 1.000},
     {"name": "zh-tw/ultra-fineweb-l3", "repeat": 1.000},
     {"name": "zh-tw/wiki-zhtw", "repeat": 1.000},
     {"name": "zh-tw/ptt-zhtw", "repeat": 1.000},
-    {"name": "en/nemotron-cc-v2.1-hq-dqa", "repeat": 1.000, "renderer": "qa_chatml"},
-    {"name": "ko/hplt3-kor-hang", "repeat": 0.191},
-    {"name": "stem/nemotron-specialized", "repeat": 1.000},
-    {"name": "danbooru", "repeat": 2, "renderer": TIPO_CHAT, "root": TIPO_ROOT},
-    {"name": "coyo11m", "repeat": 1, "renderer": TIPO_CHAT, "root": TIPO_ROOT},
-    {"name": "laion_coco", "repeat": 2, "renderer": TIPO_CHAT, "root": TIPO_ROOT},
+    {"name": "en/nemotron-cc-v2.1-hq-dqa", "repeat": 0.966, "renderer": "qa_chatml"},
+    {"name": "ko/hplt3-kor-hang", "repeat": 0.186},
+    {"name": "stem/nemotron-specialized", "repeat": 1.000, "renderer": "qa_chatml"},
+    # JSON conversation rows, not document text. See scripts/data/to_vault_chat.py.
+    {"name": "sft/smoltalk", "repeat": 1.000, "renderer": "chat", "schema": "json"},
+    {"name": "danbooru", "repeat": 2, "renderer": TIPO_RENDER, "root": TIPO_ROOT},
+    {"name": "coyo11m", "repeat": 1, "renderer": TIPO_RENDER, "root": TIPO_ROOT},
+    {"name": "laion_coco", "repeat": 2, "renderer": TIPO_RENDER, "root": TIPO_ROOT},
 ]
 
 LOADER_KWARGS = {
@@ -111,12 +110,14 @@ NAME = "General-1B-400k"
 WANDB_PROJECT = "KohakUwULLM"
 WANDB_OFFLINE = False
 
-# Previews are cut from the batch being trained on, so every step shows
-# different real documents against their true continuations.
+# Previews are cut from the batch being trained on, at a turn boundary read out
+# of its own loss mask: the prompt ends at <|im_start|>assistant and the
+# reference is that one reply.
 SAMPLE_INTERVAL = 2000
 SAMPLE_COUNT = 4
 SAMPLE_FROM_BATCH = 4
-SAMPLE_PREFIX_FRAC = 0.25
+SAMPLE_TURNS_ONLY = True
+SAMPLE_PREFIX_TOKENS = 1024
 SAMPLE_TOKENS = 256
 SAMPLE_TEMPERATURE = 1.0
 SAMPLE_MIN_P = 0.1

@@ -15,11 +15,13 @@ import sys
 # internal/general-pretrain-datasets.md section 2.
 # Source that soaks up any shortfall from a too-small dataset.
 ABSORB = "en/nemotron-cc-v2.1-hq-syn"
+# Sources whose vault rows are JSON conversations, not document text.
+CHAT_SOURCES = {"sft/smoltalk"}
 
 TARGET = {
     "en/nemotron-cc-v2.1-hq": 26.0e9,
-    "en/nemotron-cc-v2.1-hq-syn": 14.0e9,
-    "multi/nemotron-cc-v2-trans-dqa": 18.0e9,
+    "en/nemotron-cc-v2.1-hq-syn": 21.0e9,
+    "en/nemotron-cc-v2.1-mhq": 13.0e9,
     "ja/fineweb-2-edu-japanese-10bt": 10.0e9,
     "zh-tw/finepdfs-zh-zhtw": 5.0e9,
     "zh-tw/ultra-fineweb-l3": 3.0e9,
@@ -28,18 +30,28 @@ TARGET = {
     "en/nemotron-cc-v2.1-hq-dqa": 8.0e9,
     "ko/hplt3-kor-hang": 5.0e9,
     "stem/nemotron-specialized": 4.0e9,
+    "sft/smoltalk": 1.0e9,
 }
 
 
 def mean_tokens(
     source: str, tokenizer, sample: int, seed: int = 0
 ) -> tuple[float, int]:
-    """``(mean tokens per document, document count)`` from a bounded sample."""
+    """``(mean tokens per rendered document, document count)`` from a bounded sample.
+
+    Measured after rendering, so a ChatML source is counted with its turn
+    overhead included.
+    """
     import random
 
+    from kohakuwullm.data.packing import nonempty_segments
+    from kohakuwullm.data.renderers.chatml import ChatRenderer
+    from kohakuwullm.data.renderers.plain import PlainRenderer
     from kohakuwullm.data.sources.corpus import CorpusRecords
 
-    records = CorpusRecords(source)
+    chat = source in CHAT_SOURCES
+    records = CorpusRecords(source, schema="json" if chat else "text")
+    render = ChatRenderer() if chat else PlainRenderer()
     total = len(records)
     rng = random.Random(seed)
     texts = []
@@ -47,8 +59,11 @@ def mean_tokens(
         if len(texts) >= sample:
             break
         rec = records[rng.randrange(total)]
-        if rec and rec["text"]:
-            texts.append(rec["text"])
+        if not rec:
+            continue
+        text = "".join(t for t, _ in nonempty_segments(render(rec)))
+        if text:
+            texts.append(text)
     if not texts:
         return 0.0, total
     ids = tokenizer(texts, add_special_tokens=False)["input_ids"]
