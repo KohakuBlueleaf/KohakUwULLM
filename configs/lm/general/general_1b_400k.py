@@ -76,8 +76,7 @@ ARCH_OVERRIDES = {
 AUX_LOSS_WEIGHT = 0.0
 ROUTER_Z_LOSS_WEIGHT = 0.0
 
-# 262144 tokens/step. Measured over 60 steps on 4x5090: 276.0k tok/s at 9.17 GiB
-# of 31.4, against 263.3k for 16384 x 16 and 184.0k for 4096 x 64.
+# 262144 tokens/step. See docs/internals/pipeline.md for why this shape.
 MICRO_TOKENS = 8192
 NUM_MICROBATCHES = 32
 LAYERS = []

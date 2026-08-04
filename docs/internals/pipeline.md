@@ -316,6 +316,28 @@ MoE layer is overhead-bound at 8192 (6.69 ms) and gets relatively cheaper at
 16384 (7.87 ms for twice the work) while the head scales linearly (12.84 ->
 25.69 ms), so the balance point moves. No constant can be right at both.
 
+### The shape the production run uses
+
+That table is bf16 at `ctx_max` 2048. The general pretrain runs fp16 with the
+fused 16-bit expert path, where the ranking inverts and 8192x32 wins:
+
+| shape, fp16 fused, ctx_max 2048 | tok/s | peak GiB |
+|---|---|---|
+| **8192 x 32, 1F1B** | **276.0k** | **9.17** |
+| 16384 x 16, 1F1B | 263.3k | 16.07 |
+| 16384 x 16, MXFP8 | 255.9k | 16.03 |
+| 8192 x 32, DualPipeV | 245.2k | 12.31 |
+| 8192 x 32, eager experts | 192.4k | 18.75 |
+| 4096 x 64, 1F1B | 184.0k | 5.72 |
+
+**Raising `ctx_max` to 4096 costs about 3.5%.** Attention work per step, the
+`sum(len^2)` the varlen kernel pays, rises 1.52x (0.298e9 -> 0.454e9) because
+the same token budget is spread over fewer, longer documents. At dim 768 and
+depth 16 against a 200M-active MoE, attention is a small share of total FLOPs,
+so the end-to-end cost is far less than that ratio: `configs/lm/general/`
+measures **265.5k tok/s, 987 ms/step, 22.94 B/day** at 4096 against 276.0k at
+2048. Worth it, because 4096 is what the model is trained to.
+
 **1F1B pays for the spread, not just the maximum.** In isolation `5/4/4/3` moved
 the slowest stage only 31.55 -> 30.67 ms (2.8%) at 8192, but end to end it was
 worth 13%. Rank a candidate with the measured model; do not quote its predicted
