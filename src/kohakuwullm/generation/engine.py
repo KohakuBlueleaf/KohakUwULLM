@@ -81,12 +81,17 @@ def token_budget(max_new_tokens: int | None, prompt_len: int, max_position: int)
 def advance(tokens, nxt, finished, eos_token_id):
     """Append one sampled token per row, holding already-finished rows at EOS.
 
-    Returns ``(tokens, finished)``. ``eos_token_id=None`` appends without ever
-    marking a row finished. See docs/guides/generation.md.
+    Returns ``(tokens, finished)``. ``eos_token_id`` is an id or a collection of
+    them -- a turn ends on ``<|im_end|>`` and a document on ``<|eos|>``, so a
+    stop condition is a set. ``None`` appends without ever marking a row
+    finished. See docs/guides/generation.md.
     """
     if eos_token_id is not None:
-        nxt = torch.where(finished, torch.full_like(nxt, eos_token_id), nxt)
-        finished = finished | (nxt == eos_token_id)
+        stops = [eos_token_id] if isinstance(eos_token_id, int) else list(eos_token_id)
+        if stops:
+            nxt = torch.where(finished, torch.full_like(nxt, stops[0]), nxt)
+            for stop in stops:
+                finished = finished | (nxt == stop)
     return torch.cat([tokens, nxt], dim=1), finished
 
 
