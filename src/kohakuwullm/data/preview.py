@@ -1,9 +1,9 @@
 """Preview prompts drawn from real corpus documents.
 
-Takes a fixed sample of documents, cuts each at a token fraction, and returns
-the prefixes as prompts plus the true continuations. The draw is seeded, so the
-same documents appear at every preview and progress across a run is visible on
-identical inputs. See docs/guides/training.md.
+Two sources: :func:`prompts_from_batch` cuts the batch being trained on at a
+turn boundary read out of its own loss mask, and :func:`corpus_prompts` cuts
+held-out documents at a token fraction. Both draws are seeded.
+See docs/guides/training.md.
 """
 
 import random
@@ -54,52 +54,100 @@ def _documents(batch):
     return out
 
 
+def _trained_spans(labels) -> list[tuple[int, int]]:
+    """``[(start, stop)]`` per run of trained tokens, in unshifted positions.
+
+    ``labels`` is a document's shifted row, where a target at position ``i``
+    means token ``i + 1`` is the one being predicted.
+    """
+    flags = (labels != IGNORE_INDEX).tolist()
+    spans: list[tuple[int, int]] = []
+    start = None
+    for i, trained in enumerate(flags):
+        if trained and start is None:
+            start = i
+        elif not trained and start is not None:
+            spans.append((start + 1, i + 1))
+            start = None
+    if start is not None:
+        spans.append((start + 1, len(flags)))
+    return spans
+
+
+def _pick_turn(
+    spans: list[tuple[int, int]],
+    max_prefix_tokens: int,
+    min_prompt_tokens: int,
+    min_reference_tokens: int,
+) -> tuple[int, int] | None:
+    """The deepest trained span whose context still fits the prompt cap."""
+    fits = [
+        (start, stop)
+        for start, stop in spans
+        if min_prompt_tokens <= start <= max_prefix_tokens
+        and stop - start >= min_reference_tokens
+    ]
+    return fits[-1] if fits else None
+
+
 def prompts_from_batch(
     batch,
     tokenizer,
     count: int = 4,
     prefix_frac: float = 0.25,
-    max_prefix_tokens: int = 256,
+    max_prefix_tokens: int = 768,
     max_reference_tokens: int = 256,
     min_doc_tokens: int = 64,
+    min_prompt_tokens: int = 16,
+    min_reference_tokens: int = 8,
+    turns_only: bool = True,
     seed: int | None = None,
-) -> list[tuple[str, str, str]]:
-    """``[(name, prompt, reference)]`` reconstructed from the batch being trained on.
+) -> list[tuple[str, str, list[int], str]]:
+    """``[(name, prompt, prompt_ids, reference)]`` cut from the batch being trained on.
 
-    Cuts each document at its loss-mask boundary when it has one, so a chat
-    example is prompted with its real context and compared against its real
-    reply; otherwise at ``prefix_frac`` of the document. Fully-masked filler
-    documents are skipped.
+    The cut lands on the first token of a trained span, so the prompt is the
+    document's own context up to and including ``<|im_start|>assistant\\n`` and
+    the reference is that one turn rather than the document remainder. A
+    document whose loss covers every token carries no boundary and is skipped;
+    with ``turns_only`` off it is cut at ``prefix_frac`` instead.
     """
     docs = _documents(batch)
     rng = random.Random(seed) if seed is not None else random
     order = list(range(len(docs)))
     rng.shuffle(order)
 
-    rows: list[tuple[str, str, str]] = []
+    rows: list[tuple[str, str, list[int], str]] = []
     for index in order:
         if len(rows) >= count:
             break
         tokens, labels = docs[index]
         length = int(tokens.numel())
-        if length < min_doc_tokens:
-            continue
-        trained = labels != IGNORE_INDEX
-        if int(trained.sum()) < FILLER_MIN_TOKENS:
-            continue
-        # A masked prefix is the example's own context; use it verbatim.
-        first = int(trained.nonzero()[0]) if bool(trained.any()) else 0
-        cut = (
-            first
-            if first >= 16
-            else min(max(int(length * prefix_frac), 16), max_prefix_tokens)
+        turn = _pick_turn(
+            _trained_spans(labels),
+            max_prefix_tokens,
+            min_prompt_tokens,
+            min_reference_tokens,
         )
-        cut = min(cut, length - 8)
-        prompt = tokenizer.decode(tokens[:cut].tolist(), skip_special_tokens=False)
-        reference = tokenizer.decode(
-            tokens[cut : cut + max_reference_tokens].tolist(), skip_special_tokens=True
+        if turn is None:
+            if turns_only or length < min_doc_tokens:
+                continue
+            if int((labels != IGNORE_INDEX).sum()) < FILLER_MIN_TOKENS:
+                continue
+            cut = min(max(int(length * prefix_frac), 16), max_prefix_tokens, length - 8)
+            turn = (cut, length)
+        start, stop = turn
+        prompt_ids = tokens[:start].tolist()
+        rows.append(
+            (
+                f"batch[{index}]",
+                tokenizer.decode(prompt_ids, skip_special_tokens=False),
+                prompt_ids,
+                tokenizer.decode(
+                    tokens[start : min(stop, start + max_reference_tokens)].tolist(),
+                    skip_special_tokens=True,
+                ),
+            )
         )
-        rows.append((f"batch[{index}]", prompt, reference))
     return rows
 
 

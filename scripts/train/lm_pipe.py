@@ -51,7 +51,7 @@ from kohakuwupipe import (
     init_pipeline,
     shutdown,
 )
-from kohakuwupipe.training.trainer import stages_per_rank
+from kohakuwupipe.training.trainer import stage_style, stages_per_rank
 
 torch.set_float32_matmul_precision("high")
 log = get_logger("lm_pipe")
@@ -143,7 +143,10 @@ SAMPLE_INTERVAL = 0
 SAMPLE_PROMPTS: list | None = None
 # Cut previews from the batch under training instead of fixed prompts.
 SAMPLE_FROM_BATCH = 0
+# Cut a batch preview at a turn boundary; off falls back to SAMPLE_PREFIX_FRAC.
+SAMPLE_TURNS_ONLY = True
 SAMPLE_PREFIX_FRAC = 0.25
+SAMPLE_PREFIX_TOKENS = 768
 SAMPLE_COUNT = 16
 # None runs every row to EOS or to the model's context limit.
 SAMPLE_TOKENS: int | None = None
@@ -374,6 +377,7 @@ def main() -> None:
         seq_len=MICRO_TOKENS,
         layers=LAYERS or None,
         costs=costs,
+        style=stage_style(SCHEDULE),
     )
     if ranks.rank == 0:
         log.info("stage split\n%s", describe(plans))
@@ -430,6 +434,8 @@ def main() -> None:
                 prompts=build_sample_prompts(),
                 from_batch=SAMPLE_FROM_BATCH,
                 prefix_frac=SAMPLE_PREFIX_FRAC,
+                prefix_tokens=SAMPLE_PREFIX_TOKENS,
+                turns_only=SAMPLE_TURNS_ONLY,
                 every_n_steps=SAMPLE_INTERVAL,
                 samples=SAMPLE_COUNT,
                 report=report_samples,

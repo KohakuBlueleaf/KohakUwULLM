@@ -12,6 +12,7 @@ import torch.distributed as dist
 from anyschedule.utils import get_scheduler
 from tqdm.auto import tqdm
 
+from kohakuwullm.data.renderers.chatml import TURN_END
 from kohakuwullm.generation import LocalGenerator, build_generator
 from kohakuwullm.models import LMBackbone
 from kohakuwullm.training.parallel.pipeline_lightning import decode_stage
@@ -71,6 +72,11 @@ class SamplePreview(Callback):
             pipelined decode, which costs one pipeline traversal per token.
         forward_only: drive pipelined decode with a plain send/recv forward
             rather than a training schedule.
+        from_batch: preview this many documents cut out of the batch just
+            trained on, in place of ``prompts``.
+        prefix_tokens: cap on a batch-drawn prompt.
+        turns_only: draw only documents carrying a turn boundary; off falls
+            back to a ``prefix_frac`` cut of the document.
         max_new_tokens / temperature / top_p / top_k / min_p: sampling
             controls. ``max_new_tokens=None`` fills the model's context.
     """
@@ -94,6 +100,8 @@ class SamplePreview(Callback):
         forward_only: bool = True,
         from_batch: int = 0,
         prefix_frac: float = 0.25,
+        prefix_tokens: int = 768,
+        turns_only: bool = True,
     ) -> None:
         self.module = module
         self.tokenizer = tokenizer
@@ -114,9 +122,12 @@ class SamplePreview(Callback):
         self.forward_only = forward_only
         self.from_batch = from_batch
         self.prefix_frac = prefix_frac
+        self.prefix_tokens = prefix_tokens
+        self.turns_only = turns_only
         self._batch_rows: list | None = None
         self._generator = None
         self._local_model = None
+        self._stops: list[int] | None = None
 
     def on_train_batch_end(self, loop, out, batch=None, batch_idx=0) -> None:
         first = self.at_start and batch_idx == 0
@@ -132,6 +143,8 @@ class SamplePreview(Callback):
                     self.tokenizer,
                     count=self.from_batch,
                     prefix_frac=self.prefix_frac,
+                    max_prefix_tokens=self.prefix_tokens,
+                    turns_only=self.turns_only,
                     seed=out.index,
                 )
             except Exception as exc:
@@ -149,13 +162,16 @@ class SamplePreview(Callback):
         loop.stage_module.eval()
         rows = []
         stops: list[tuple[int, bool]] = []
+        stop_ids = self._stop_ids()
         gathered = self._gathered(loop) if self.local else None
         rows_in = (
-            [(n, t) for n, t, _ in self._batch_rows]
+            [(n, t, i) for n, t, i, _ in self._batch_rows]
             if self._batch_rows
-            else self.prompts
+            else [(n, t, None) for n, t in self.prompts]
         )
-        references = {n: r for n, _, r in self._batch_rows} if self._batch_rows else {}
+        references = (
+            {n: r for n, _, _, r in self._batch_rows} if self._batch_rows else {}
+        )
         bar = tqdm(
             rows_in,
             desc=f"preview@{step}",
@@ -164,11 +180,11 @@ class SamplePreview(Callback):
             disable=None if self.ranks.rank == 0 else True,
         )
         try:
-            for name, text in bar:
+            for name, text, ids in bar:
                 # Gathered decode runs on rank 0 alone; the others are done.
                 if self.local and self.ranks.rank:
                     break
-                prompt_ids = self._encode(text)
+                prompt_ids = self._encode(text) if ids is None else self._rows(ids)
                 generator = gathered or self._build()
                 tokens = generator.generate(
                     prompt_ids.to(self.ranks.device),
@@ -177,17 +193,16 @@ class SamplePreview(Callback):
                     top_p=self.top_p,
                     top_k=self.top_k,
                     min_p=self.min_p,
-                    eos_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=stop_ids or None,
                 )
                 if self.ranks.rank:
                     continue
-                eos = self.tokenizer.eos_token_id
                 prompt_len = prompt_ids.shape[1]
                 for index, row in enumerate(tokens):
                     body = row[prompt_len:].tolist()
-                    hit = eos is not None and eos in body
-                    kept = body[: body.index(eos)] if hit else body
-                    stops.append((len(kept), hit))
+                    at = next((i for i, t in enumerate(body) if t in stop_ids), None)
+                    kept = body if at is None else body[:at]
+                    stops.append((len(kept), at is not None))
                     generated = self.tokenizer.decode(kept, skip_special_tokens=True)
                     reference = references.get(name)
                     if reference is not None:
@@ -236,10 +251,27 @@ class SamplePreview(Callback):
         self._local_model.eval()
         return LocalGenerator(self._local_model)
 
-    def _encode(self, text: str) -> torch.Tensor:
+    def _rows(self, ids) -> torch.Tensor:
         """One prompt repeated ``samples`` times, the decode batch's shape."""
-        ids = self.tokenizer(text, return_tensors="pt")["input_ids"][0]
-        return ids.unsqueeze(0).expand(self.samples, -1).contiguous()
+        row = torch.as_tensor(ids, dtype=torch.long)
+        return row.unsqueeze(0).expand(self.samples, -1).contiguous()
+
+    def _encode(self, text: str) -> torch.Tensor:
+        """Tokenize one prompt into the decode batch's shape."""
+        return self._rows(self.tokenizer(text)["input_ids"])
+
+    def _stop_ids(self) -> list[int]:
+        """Document terminator, plus the turn terminator when the vocab has one."""
+        if self._stops is None:
+            unk = self.tokenizer.unk_token_id
+            candidates = (
+                self.tokenizer.eos_token_id,
+                self.tokenizer.convert_tokens_to_ids(TURN_END),
+            )
+            self._stops = [
+                t for t in dict.fromkeys(candidates) if t is not None and t != unk
+            ]
+        return self._stops
 
     def _build(self):
         """The decode-shaped generator, built once."""
