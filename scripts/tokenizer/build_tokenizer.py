@@ -26,6 +26,7 @@ import json
 import os
 import random
 
+from kohakuwullm.data.renderers.plain import CHAT_SPECIALS, CHAT_TEMPLATE
 from kohakuwullm.data.renderers.tipo import SPECIAL_TOKENS, TIPORenderer
 from kohakuwullm.tokenizer.prune import load_tokenizer_json, prune_bpe, summarize
 
@@ -35,7 +36,7 @@ CORE_SPECIALS = ["<|bos|>", "<|eos|>", "<|pad|>", "<|unk|>"]
 
 def build(out_dir: str, source: str, keep: int, total: int) -> dict:
     spec = load_tokenizer_json(source)
-    named = CORE_SPECIALS + SPECIAL_TOKENS
+    named = CORE_SPECIALS + SPECIAL_TOKENS + CHAT_SPECIALS
     pruned = prune_bpe(
         spec,
         keep=keep,
@@ -55,6 +56,7 @@ def build(out_dir: str, source: str, keep: int, total: int) -> dict:
         "unk_token": "<|unk|>",
         "model_max_length": 131072,
         "clean_up_tokenization_spaces": False,
+        "chat_template": CHAT_TEMPLATE,
     }
     with open(
         os.path.join(out_dir, "tokenizer_config.json"), "w", encoding="utf-8"

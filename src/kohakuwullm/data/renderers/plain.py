@@ -9,6 +9,25 @@ from kohakuwullm.registry import RENDERER
 
 DEFAULT_ROLES = {"system": "system", "user": "user", "assistant": "assistant"}
 
+# Assigned contiguously from 64017. See internal/chat-template-design.md section 4.
+CHAT_SPECIALS = [
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|think|>",
+    "<|/think|>",
+    "<|tool_call|>",
+    "<|/tool_call|>",
+    "<|tool_result|>",
+    "<|/tool_result|>",
+]
+
+CHAT_TEMPLATE = (
+    "{% for m in messages %}"
+    "{{ '<|im_start|>' + m['role'] + '\n' + m['content'] + '<|im_end|>' + '\n' }}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+)
+
 
 @RENDERER.register("plain")
 class PlainRenderer:
