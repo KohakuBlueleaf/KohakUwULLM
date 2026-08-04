@@ -8,6 +8,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from kohakuwullm.kernels.moe.fused_moe import fused_moe_experts
 from kohakuwullm.kernels.moe.grouped_gemm import grouped_gemm
 from kohakuwullm.kernels.moe.moe_dispatch import combine_routed, expert_sort
 from kohakuwullm.kernels.moe.router import fused_router
@@ -264,6 +265,8 @@ class MoEMLP(nn.Module):
         router_dim: width the router reads; ``None`` uses ``dim``.
         dense_fallback: use a loop of per-expert GEMMs instead of the grouped
             Triton kernel. Same numerics, far slower; the test reference.
+        expert_path: 16-bit routed path -- ``"fused"`` or ``"eager"``. Ignored once
+            ``enable_mxfp8`` rebinds the path.
     """
 
     def __init__(
@@ -279,6 +282,7 @@ class MoEMLP(nn.Module):
         router="topk",
         router_dim: int | None = None,
         dense_fallback: bool = False,
+        expert_path: str = "fused",
         **router_kwargs,
     ) -> None:
         super().__init__()
@@ -314,7 +318,16 @@ class MoEMLP(nn.Module):
         )
         self.num_shared = num_shared
         # The routed path, rebound once by `enable_mxfp8`.
-        self._routed = self._routed_eager
+        match expert_path:
+            case "fused":
+                self._routed = self._routed_fused
+            case "eager":
+                self._routed = self._routed_eager
+            case other:
+                raise ValueError(
+                    f"unknown expert_path {other!r}; expected 'fused' or 'eager'"
+                )
+        self.expert_path = expert_path
         self._packed: MXFP8ExpertWeights | None = None
         # Which MXFP8 expert path `enable_mxfp8` installs: "fused" or "unfused".
         self.mxfp8_expert_path = "fused"
@@ -418,6 +431,21 @@ class MoEMLP(nn.Module):
             token_of,
             flat.shape[0],
             offsets[self.num_experts : self.num_experts + 1],
+        )
+
+    def _routed_fused(self, flat, topk_weight, order, token_of, offsets):
+        """The same arithmetic as :meth:`_routed_eager`, as four 16-bit kernels."""
+        if self.dense_fallback:
+            return self._routed_eager(flat, topk_weight, order, token_of, offsets)
+        x = flat.to(compute_dtype(flat))
+        return fused_moe_experts(
+            x,
+            self.w_in.to(x.dtype),
+            self.w_out.to(x.dtype),
+            topk_weight.reshape(-1).to(x.dtype),
+            token_of,
+            order,
+            offsets[: self.num_experts + 1],
         )
 
     def _routed_mxfp8(self, flat, topk_weight, order, token_of, offsets):

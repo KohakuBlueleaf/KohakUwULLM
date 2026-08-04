@@ -218,6 +218,11 @@ def fused_moe_experts(
         )
     if x.dtype not in TL_DTYPE:
         raise ValueError(f"x.dtype={x.dtype} is not one of {tuple(TL_DTYPE)}")
+    if w_in.dtype != x.dtype or w_out.dtype != x.dtype or gate.dtype != x.dtype:
+        raise ValueError(
+            f"every operand must share x.dtype={x.dtype}; got w_in {w_in.dtype}, "
+            f"w_out {w_out.dtype}, gate {gate.dtype}"
+        )
 
     num_experts = w_in.shape[0]
     plans = tuned_plans(token_of.numel(), x.shape[1], hidden, num_experts, x.dtype)
